@@ -1,0 +1,6 @@
+{
+  "name": "Fűtésvezérlés Firmware — Nano + ESP32-C3",
+  "description": "Kétcsomópontos fűtésvezérlő firmware (Arduino Nano kazánvezérlő + ESP32-C3 szobai termosztát és MQTT TLS gateway) NRF24L01+ híddal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
