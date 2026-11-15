@@ -28,12 +28,25 @@ export interface PumpConfig {
   pumpStartSensor: PumpStartSensor;
 }
 
+export interface AlarmConfig {
+  overheatTemp: number;
+  alarmEnabled: boolean;
+}
+
+export type AlarmReason = 'none' | 'overheat' | 'sensor_fail' | 'nrf_fail';
+
+export interface AlarmState {
+  active: boolean;
+  reason: AlarmReason;
+}
+
 export interface HeatingCommand {
   targetTemp: number;
   mode: HeatingMode;
   manualHeating: boolean;
   kimenetek: HeatingOutputs;
   pumpConfig: PumpConfig;
+  alarmConfig: AlarmConfig;
 }
 
 export interface HeatingTemperatures {
@@ -54,6 +67,8 @@ export interface HeatingStatusPayload {
   kazan_status: number[];
   pumpConfig: PumpConfig;
   pumpState: PumpState;
+  alarmConfig: AlarmConfig;
+  alarmState: AlarmState;
   nrf24_ok: boolean;
   error: string | null;
   manualHeating?: boolean;
@@ -69,6 +84,8 @@ export interface StoredDeviceState {
   lastStatusAt: number | null;
   lastTelemetryAt: number | null;
   lastUpdatedAt: number;
+  alarmConfig?: AlarmConfig | null;
+  alarmState?: AlarmState | null;
 }
 
 export interface HeatingUpdateEvent {

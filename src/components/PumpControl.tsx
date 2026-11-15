@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Flame, PauseCircle } from 'lucide-react';
 import type {
+  AlarmConfig,
   PumpConfig,
   PumpMode,
   PumpStartSensor,
@@ -10,6 +11,7 @@ import type {
 interface PumpControlProps {
   pumpConfig: PumpConfig;
   pumpState: PumpState;
+  alarmConfig: AlarmConfig;
   kazanTemp: number | null;
   sending: boolean;
   onSendPumpConfig: (config: PumpConfig) => Promise<void>;
@@ -38,6 +40,7 @@ function hasHysteresisError(startTemp: number, stopTemp: number): boolean {
 export function PumpControl({
   pumpConfig,
   pumpState,
+  alarmConfig,
   kazanTemp,
   sending,
   onSendPumpConfig,
@@ -101,11 +104,12 @@ export function PumpControl({
   };
 
   const isOverheat =
+    alarmConfig.alarmEnabled &&
     kazanTemp !== null &&
     kazanTemp !== undefined &&
     !Number.isNaN(kazanTemp) &&
     kazanTemp > -120 &&
-    kazanTemp >= 85;
+    kazanTemp >= alarmConfig.overheatTemp;
 
   const isPumpRunning = pumpState === 'futes';
 

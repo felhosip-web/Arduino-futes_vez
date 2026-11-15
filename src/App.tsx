@@ -3,8 +3,11 @@ import { io } from 'socket.io-client';
 import { AlertTriangle, RefreshCw, Wifi, WifiOff } from 'lucide-react';
 import { API_URL, DEVICE_ID } from './config';
 import {
+  DEFAULT_ALARM_CONFIG,
+  DEFAULT_ALARM_STATE,
   DEFAULT_OUTPUTS,
   DEFAULT_PUMP_CONFIG,
+  type AlarmConfig,
   type HeatingCommandPayload,
   type HeatingMode,
   type HeatingStatusPayload,
@@ -16,6 +19,7 @@ import {
 import { HeatingControl } from './components/HeatingControl';
 import { Temperatures } from './components/Temperatures';
 import { PumpControl } from './components/PumpControl';
+import { AlarmControl } from './components/AlarmControl';
 import { BoilerControl } from './components/BoilerControl';
 import { BoilerStatus } from './components/BoilerStatus';
 
@@ -49,6 +53,7 @@ export default function App() {
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [sendingCommand, setSendingCommand] = useState<boolean>(false);
   const [sendingPump, setSendingPump] = useState<boolean>(false);
+  const [sendingAlarm, setSendingAlarm] = useState<boolean>(false);
   const [pendingOutputKey, setPendingOutputKey] = useState<OutputKey | null>(null);
   const [waitingForEsp, setWaitingForEsp] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -60,6 +65,8 @@ export default function App() {
         ...candidate,
         pumpConfig: candidate.pumpConfig ?? DEFAULT_PUMP_CONFIG,
         pumpState: candidate.pumpState ?? (candidate.kimenetek.szivattyu ? 'futes' : 'varakozas'),
+        alarmConfig: candidate.alarmConfig ?? DEFAULT_ALARM_CONFIG,
+        alarmState: candidate.alarmState ?? DEFAULT_ALARM_STATE,
       });
       setLastUpdatedAt(deviceState?.lastUpdatedAt ?? Date.now());
       setWaitingForEsp(false);
@@ -136,6 +143,7 @@ export default function App() {
         manualHeating: patch.manualHeating ?? status.manualHeating ?? false,
         kimenetek: status.kimenetek ?? DEFAULT_OUTPUTS,
         pumpConfig: status.pumpConfig ?? DEFAULT_PUMP_CONFIG,
+        alarmConfig: status.alarmConfig ?? DEFAULT_ALARM_CONFIG,
       };
 
       try {
@@ -189,6 +197,32 @@ export default function App() {
     }
   }, []);
 
+  const handleSendAlarmConfig = useCallback(async (alarmConfig: AlarmConfig) => {
+    setSendingAlarm(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/alarm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alarmConfig }),
+      });
+      if (res.status === 409) {
+        setWaitingForEsp(true);
+        return;
+      }
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error || `Riasztás beállítási hiba (HTTP ${res.status})`);
+      }
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Hiba a riasztás beállításakor.';
+      setErrorMsg(message);
+    } finally {
+      setSendingAlarm(false);
+    }
+  }, []);
+
   const handleToggleOutput = useCallback(async (nev: OutputKey, ertek: boolean) => {
     setPendingOutputKey(nev);
     setErrorMsg(null);
@@ -238,18 +272,30 @@ export default function App() {
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={() => void fetchInitialState()}
-            disabled={isRefreshing}
-            className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-sm font-medium text-slate-200 whitespace-nowrap shrink-0 transition-colors hover:bg-slate-800 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
-          >
-            <RefreshCw
-              className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`}
-              aria-hidden="true"
-            />
-            <span>Frissítés</span>
-          </button>
+          <div className="flex items-center gap-3">
+            {status?.alarmState?.active && (
+              <div
+                role="alert"
+                className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-red-500 bg-red-950/80 px-3.5 py-2 text-xs font-bold text-red-100 whitespace-nowrap shrink-0 animate-pulse"
+              >
+                <span className="inline-block h-2.5 w-2.5 rounded-full bg-red-500" aria-hidden="true" />
+                <span>RIASZTÁS</span>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => void fetchInitialState()}
+              disabled={isRefreshing}
+              className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-sm font-medium text-slate-200 whitespace-nowrap shrink-0 transition-colors hover:bg-slate-800 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
+            >
+              <RefreshCw
+                className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`}
+                aria-hidden="true"
+              />
+              <span>Frissítés</span>
+            </button>
+          </div>
         </header>
 
         {/* Hibák és figyelmeztetések */}
@@ -316,9 +362,18 @@ export default function App() {
             <PumpControl
               pumpConfig={status.pumpConfig ?? DEFAULT_PUMP_CONFIG}
               pumpState={status.pumpState ?? 'varakozas'}
+              alarmConfig={status.alarmConfig ?? DEFAULT_ALARM_CONFIG}
               kazanTemp={status.homersekletek?.kazan ?? null}
               sending={sendingPump}
               onSendPumpConfig={handleSendPumpConfig}
+            />
+
+            <AlarmControl
+              alarmConfig={status.alarmConfig ?? DEFAULT_ALARM_CONFIG}
+              alarmState={status.alarmState ?? DEFAULT_ALARM_STATE}
+              kazanTemp={status.homersekletek?.kazan ?? null}
+              sending={sendingAlarm}
+              onSendAlarmConfig={handleSendAlarmConfig}
             />
 
             <BoilerControl

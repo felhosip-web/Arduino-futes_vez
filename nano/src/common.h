@@ -3,11 +3,11 @@
 #include <stdint.h>
 
 // ============================================================================
-// KÖZÖS NRF24L01+ SZERZŐDÉS V4 - PONTOSAN 32 BYTE MINDKÉT OLDALON
+// KÖZÖS NRF24L01+ SZERZŐDÉS V4 (+ ALARM EXTENSION) - PONTOSAN 32 BYTE
 // ============================================================================
 // Nano (8-bit AVR) és ESP32-C3 (32-bit RISC-V) közötti bináris kompatibilitás
 // érdekében fix méretű típusokat és __attribute__((packed)) union csomagot
-// használunk, így minden V4 mező natív típusban fér el 32 byte-ban.
+// használunk, így minden V4 + riasztási mező elfér 32 byte-ban.
 
 constexpr uint8_t PKT_TYPE_ESP_TO_NANO = 0xA1;
 constexpr uint8_t PKT_TYPE_NANO_TO_ESP = 0xB2;
@@ -41,6 +41,14 @@ enum PumpState : uint8_t {
     PUMP_STATE_FUTES     = 1
 };
 
+// Riasztási okok
+enum AlarmReason : uint8_t {
+    ALARM_REASON_NONE        = 0,
+    ALARM_REASON_OVERHEAT    = 1,
+    ALARM_REASON_SENSOR_FAIL = 2,
+    ALARM_REASON_NRF_FAIL    = 3
+};
+
 // ESP -> NANO kimeneti bitmaszk bitek
 constexpr uint8_t OUT_BIT_SZIVATTYU = 0; // bit0 -> D7 relé
 constexpr uint8_t OUT_BIT_LED_ZOLD  = 1; // bit1 -> D5
@@ -58,24 +66,35 @@ struct __attribute__((packed)) PumpConfigPacked {
     uint8_t pumpStartSensor; // PumpStartSensor (0=kazan, 1=eloremeno, 2=max)
 };
 
+struct __attribute__((packed)) AlarmConfigPacked {
+    float   overheatTemp;    // 70.0 - 90.0 °C (alap: 85.0)
+    uint8_t alarmEnabled;    // 0 = false (nincs riasztás/villogás), 1 = true
+};
+
+struct __attribute__((packed)) AlarmStatePacked {
+    uint8_t active;          // 0 = false, 1 = true
+    uint8_t reason;          // AlarmReason (0=none, 1=overheat, 2=sensor_fail, 3=nrf_fail)
+};
+
 struct __attribute__((packed)) EspToNanoPayload {
-    uint8_t          outputsMask;    // bit0: szivattyu, bit1: led_zold, bit2: led_piros, bit3-7: tartalek1-5
-    float            targetTemp;     // Célhőmérséklet (°C)
-    uint8_t          mode;           // HeatingMode (0=auto, 1=manual, 2=off)
-    uint8_t          manualHeating;  // 0 = false, 1 = true
-    PumpConfigPacked pumpConfig;     // 10 byte
-    uint8_t          reserved[14];   // Kitöltés 31 byte-ra
+    uint8_t           outputsMask;    // bit0: szivattyu, bit1: led_zold, bit2: led_piros, bit3-7: tartalek1-5
+    float             targetTemp;     // Célhőmérséklet (°C)
+    uint8_t           mode;           // HeatingMode (0=auto, 1=manual, 2=off)
+    uint8_t           manualHeating;  // 0 = false, 1 = true
+    PumpConfigPacked  pumpConfig;     // 10 byte
+    AlarmConfigPacked alarmConfig;    // 5 byte
+    uint8_t           reserved[9];    // Kitöltés 31 byte-ra
 };
 
 struct __attribute__((packed)) NanoToEspPayload {
-    float    eloremeno;       // Előremenő vízhőfok (°C), -127.0f hiba esetén
-    float    visszatero;      // Visszatérő vízhőfok (°C), -127.0f hiba esetén
-    float    kazan;           // Kazán hőfok (°C), -127.0f hiba esetén
-    float    kulteri;         // Kültéri hőfok (°C), -127.0f hiba esetén
-    uint8_t  kazan_status[8]; // 8 byte tartalék státusz tömb (egyelőre mind 0)
-    uint32_t counter;         // Növekvő válaszcsomag számláló
-    uint8_t  sensorValidMask; // bit0: eloremeno, bit1: visszatero, bit2: kazan, bit3: kulteri
-    uint8_t  reserved[2];     // Kitöltés 31 byte-ra
+    float            eloremeno;       // Előremenő vízhőfok (°C), -127.0f hiba esetén
+    float            visszatero;      // Visszatérő vízhőfok (°C), -127.0f hiba esetén
+    float            kazan;           // Kazán hőfok (°C), -127.0f hiba esetén
+    float            kulteri;         // Kültéri hőfok (°C), -127.0f hiba esetén
+    uint8_t          kazan_status[8]; // 8 byte tartalék státusz tömb (egyelőre mind 0)
+    uint32_t         counter;         // Növekvő válaszcsomag számláló
+    uint8_t          sensorValidMask; // bit0: eloremeno, bit1: visszatero, bit2: kazan, bit3: kulteri
+    AlarmStatePacked alarmState;      // 2 byte (active + reason)
 };
 
 struct __attribute__((packed)) NrfPacket {
@@ -86,10 +105,12 @@ struct __attribute__((packed)) NrfPacket {
     };
 };
 
-static_assert(sizeof(PumpConfigPacked) == 10, "PumpConfigPacked merete 10 byte kell legyen!");
-static_assert(sizeof(EspToNanoPayload) == 31, "EspToNanoPayload merete 31 byte kell legyen!");
-static_assert(sizeof(NanoToEspPayload) == 31, "NanoToEspPayload merete 31 byte kell legyen!");
-static_assert(sizeof(NrfPacket) == 32, "NrfPacket meretenek pontosan 32 byte-nak kell lennie!");
+static_assert(sizeof(PumpConfigPacked)  == 10, "PumpConfigPacked merete 10 byte kell legyen!");
+static_assert(sizeof(AlarmConfigPacked) == 5,  "AlarmConfigPacked merete 5 byte kell legyen!");
+static_assert(sizeof(AlarmStatePacked)  == 2,  "AlarmStatePacked merete 2 byte kell legyen!");
+static_assert(sizeof(EspToNanoPayload)  == 31, "EspToNanoPayload merete 31 byte kell legyen!");
+static_assert(sizeof(NanoToEspPayload)  == 31, "NanoToEspPayload merete 31 byte kell legyen!");
+static_assert(sizeof(NrfPacket)         == 32, "NrfPacket meretenek pontosan 32 byte-nak kell lennie!");
 
 // Közös RF24 rádió csatorna és cím (5 byte)
 constexpr uint8_t NRF_CHANNEL = 108;

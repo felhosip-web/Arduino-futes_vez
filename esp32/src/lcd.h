@@ -5,12 +5,19 @@
 #include <LiquidCrystal_I2C.h>
 #include <math.h>
 #include "config.h"
+#include "../../nano/src/common.h"
 
 // ============================================================================
-// 2x20 I2C LCD KEZELŐ (0x27) - V4
+// 2x20 I2C LCD KEZELŐ (0x27) - V4 + RIASZTÁS KIJELZÉS
 // ============================================================================
 // 1. sor (20 kar): "Szoba 20.8C Cel21.5C"
-// 2. sor (20 kar): "Kaz 52C Sziv: BE   A"  vagy hiba esetén: "NRF HIBA!"
+// 2. sor (20 kar):
+//   - Normál:  "Kaz 52C Sziv: BE   A"
+//   - Riasztás (villogva váltakozva 500ms-enként):
+//       overheat:    "RIASZTAS! Kaz 87C"  <-> "ALARM! Kaz 87C"
+//       sensor_fail: "RIASZTAS! SZENZOR!" <-> "ALARM! KAZAN HIBA!"
+//       nrf_fail:    "RIASZTAS! NRF HIBA" <-> "NRF HIBA!"
+//   - NRF hiba alarmEnabled=false mellett: "NRF HIBA!"
 
 class HeatingLcd {
 public:
@@ -26,7 +33,9 @@ public:
     }
 
     void update(float roomTemp, float targetTemp, float boilerTemp,
-                bool pumpOn, uint8_t mode, bool nrfOk) {
+                bool pumpOn, uint8_t mode, bool nrfOk,
+                bool alarmActive = false, uint8_t alarmReason = ALARM_REASON_NONE,
+                bool blinkPhase = true) {
         char line1[LCD_COLS + 1];
         char line2[LCD_COLS + 1];
 
@@ -44,16 +53,43 @@ public:
 
         // --- 2. sor ---
         char rawLine2[32];
-        if (!nrfOk) {
+        char kazStr[6];
+        if (isnan(boilerTemp) || boilerTemp <= -120.0f) {
+            snprintf(kazStr, sizeof(kazStr), "--");
+        } else {
+            snprintf(kazStr, sizeof(kazStr), "%d", static_cast<int>(lroundf(boilerTemp)));
+        }
+
+        if (alarmActive) {
+            switch (alarmReason) {
+                case ALARM_REASON_OVERHEAT:
+                    if (blinkPhase) {
+                        snprintf(rawLine2, sizeof(rawLine2), "RIASZTAS! Kaz %sC", kazStr);
+                    } else {
+                        snprintf(rawLine2, sizeof(rawLine2), "ALARM! Kaz %sC", kazStr);
+                    }
+                    break;
+
+                case ALARM_REASON_SENSOR_FAIL:
+                    if (blinkPhase) {
+                        snprintf(rawLine2, sizeof(rawLine2), "RIASZTAS! SZENZOR!");
+                    } else {
+                        snprintf(rawLine2, sizeof(rawLine2), "ALARM! KAZAN HIBA!");
+                    }
+                    break;
+
+                case ALARM_REASON_NRF_FAIL:
+                default:
+                    if (blinkPhase) {
+                        snprintf(rawLine2, sizeof(rawLine2), "RIASZTAS! NRF HIBA!");
+                    } else {
+                        snprintf(rawLine2, sizeof(rawLine2), "NRF HIBA!");
+                    }
+                    break;
+            }
+        } else if (!nrfOk) {
             snprintf(rawLine2, sizeof(rawLine2), "NRF HIBA!");
         } else {
-            char kazStr[6];
-            if (isnan(boilerTemp) || boilerTemp <= -120.0f) {
-                snprintf(kazStr, sizeof(kazStr), "--");
-            } else {
-                snprintf(kazStr, sizeof(kazStr), "%d", static_cast<int>(lroundf(boilerTemp)));
-            }
-
             char modeChar = 'A';
             if (mode == 1) modeChar = 'M';
             else if (mode == 2) modeChar = 'O';

@@ -48,6 +48,8 @@ export function mergeHeatingStatus(
     homersekletek: mergeDefined(prevStatus.homersekletek, parsed.homersekletek)!,
     kimenetek: mergeDefined(prevStatus.kimenetek, parsed.kimenetek)!,
     pumpConfig: mergeDefined(prevStatus.pumpConfig, parsed.pumpConfig)!,
+    alarmConfig: mergeDefined(prevStatus.alarmConfig, parsed.alarmConfig)!,
+    alarmState: mergeDefined(prevStatus.alarmState, parsed.alarmState)!,
   };
 }
 
@@ -68,7 +70,7 @@ export function isFullEspPayload(parsed: Partial<HeatingStatusPayload>): boolean
     return false;
   }
 
-  return (
+  const pumpValid =
     typeof pc.pumpMode === 'string' &&
     (VALID_PUMP_MODES as readonly string[]).includes(pc.pumpMode) &&
     typeof pc.pumpStartTemp === 'number' &&
@@ -76,7 +78,21 @@ export function isFullEspPayload(parsed: Partial<HeatingStatusPayload>): boolean
     typeof pc.pumpStopTemp === 'number' &&
     Number.isFinite(pc.pumpStopTemp) &&
     typeof pc.pumpStartSensor === 'string' &&
-    (VALID_PUMP_SENSORS as readonly string[]).includes(pc.pumpStartSensor)
+    (VALID_PUMP_SENSORS as readonly string[]).includes(pc.pumpStartSensor);
+
+  if (!pumpValid) {
+    return false;
+  }
+
+  const ac = parsed.alarmConfig;
+  if (!ac || typeof ac !== 'object' || Array.isArray(ac)) {
+    return false;
+  }
+
+  return (
+    typeof ac.overheatTemp === 'number' &&
+    Number.isFinite(ac.overheatTemp) &&
+    typeof ac.alarmEnabled === 'boolean'
   );
 }
 
@@ -179,6 +195,8 @@ export class HeatingMqttBridge {
       lastStatusAt: fullPayload ? nowMs : (prev?.lastStatusAt ?? null),
       lastTelemetryAt: messageType === 'telemetry' ? nowMs : (prev?.lastTelemetryAt ?? null),
       lastUpdatedAt: nowMs,
+      alarmConfig: mergedStatus.alarmConfig ?? prev?.alarmConfig ?? null,
+      alarmState: mergedStatus.alarmState ?? prev?.alarmState ?? null,
     };
 
     this.states.set(deviceId, nextState);

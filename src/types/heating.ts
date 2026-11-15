@@ -25,6 +25,18 @@ export interface PumpConfig {
   pumpStartSensor: PumpStartSensor;
 }
 
+export interface AlarmConfig {
+  overheatTemp: number;
+  alarmEnabled: boolean;
+}
+
+export type AlarmReason = 'none' | 'overheat' | 'sensor_fail' | 'nrf_fail';
+
+export interface AlarmState {
+  active: boolean;
+  reason: AlarmReason;
+}
+
 export interface HeatingTemperatures {
   eloremeno: number | null;
   visszatero: number | null;
@@ -43,6 +55,8 @@ export interface HeatingStatusPayload {
   kazan_status: number[];
   pumpConfig: PumpConfig;
   pumpState: PumpState;
+  alarmConfig: AlarmConfig;
+  alarmState: AlarmState;
   nrf24_ok: boolean;
   error: string | null;
   manualHeating?: boolean;
@@ -55,6 +69,7 @@ export interface HeatingCommandPayload {
   manualHeating: boolean;
   kimenetek: HeatingOutputs;
   pumpConfig: PumpConfig;
+  alarmConfig: AlarmConfig;
 }
 
 export interface StoredDeviceState {
@@ -66,6 +81,8 @@ export interface StoredDeviceState {
   lastStatusAt: number | null;
   lastTelemetryAt: number | null;
   lastUpdatedAt: number;
+  alarmConfig?: AlarmConfig | null;
+  alarmState?: AlarmState | null;
 }
 
 export interface HeatingUpdateEvent {
@@ -93,6 +110,16 @@ export const DEFAULT_PUMP_CONFIG: PumpConfig = {
   pumpStartTemp: 40.0,
   pumpStopTemp: 30.0,
   pumpStartSensor: 'kazan',
+};
+
+export const DEFAULT_ALARM_CONFIG: AlarmConfig = {
+  overheatTemp: 85.0,
+  alarmEnabled: true,
+};
+
+export const DEFAULT_ALARM_STATE: AlarmState = {
+  active: false,
+  reason: 'none',
 };
 
 export const OUTPUT_ITEMS: ReadonlyArray<{ key: OutputKey; label: string; bit: number }> = [

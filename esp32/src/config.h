@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 // ============================================================================
-// ESP32-C3 KONFIGURÁCIÓ (V4): WIFI, MQTT, PIN-EK, LCD, LM35, KAZÁNVÉDELEM
+// ESP32-C3 KONFIGURÁCIÓ (V4 + RIASZTÁS): WIFI, MQTT, PIN-EK, LCD, LM35
 // ============================================================================
 
 // --- WiFi beállítások ---
@@ -24,7 +24,7 @@ constexpr const char* TOPIC_TELEMETRY = "futes/haz-futes/telemetry"; // 30 mp-en
 
 // --- PIN-ek (ESP32-C3, ütközésmentes kiosztás) ---
 // Megjegyzés: GPIO 0/2/8/9 strapping pinek; GPIO 18/19 az USB CDC (D-/D+) miatt foglaltak.
-// A PIN_NRF_CE ezért a szabad, nem-strapping GPIO 20 (U0RXD) lábra került.
+// A PIN_NRF_CE a szabad GPIO 20 lábon, az új riasztó piros LED a szabad GPIO 11 lábon van.
 constexpr uint8_t PIN_LM35      = 2;  // ADC1_CH2
 
 constexpr uint8_t PIN_ENC_CLK   = 5;
@@ -42,6 +42,8 @@ constexpr uint8_t PIN_NRF_CSN   = 1;
 constexpr uint8_t PIN_NRF_MISO  = 3;
 constexpr uint8_t PIN_NRF_SCK   = 4;
 constexpr uint8_t PIN_NRF_MOSI  = 10;
+
+constexpr uint8_t PIN_ALARM_LED = 11; // Riasztó piros LED (GPIO11, 500ms villogás aktív riasztásnál)
 
 // --- LM35 Kalibráció és szobai hiszterézis ---
 constexpr float   LM35_OFFSET         = 0.0f;
@@ -65,8 +67,14 @@ constexpr float PUMP_STOP_TEMP_MIN      = 20.0f;
 constexpr float PUMP_STOP_TEMP_MAX      = 40.0f;
 constexpr float PUMP_MIN_HYSTERESIS_GAP = 5.0f;  // pumpStopTemp < pumpStartTemp - 5
 
-constexpr float BOILER_OVERHEAT_TEMP    = 85.0f; // >= 85°C -> szivattyú MINDIG BE
+constexpr float BOILER_OVERHEAT_TEMP        = 85.0f; // Alap túlmelegedési küszöb (°C)
+constexpr float ALARM_OVERHEAT_TEMP_DEFAULT = 85.0f;
+constexpr float ALARM_OVERHEAT_TEMP_MIN     = 70.0f;
+constexpr float ALARM_OVERHEAT_TEMP_MAX     = 90.0f;
+constexpr bool  ALARM_ENABLED_DEFAULT       = true;
+
 constexpr uint32_t PUMP_MANUAL_OFF_TIMEOUT_MS = 600000UL; // 10 perc -> vissza auto-ra
+constexpr uint32_t ALARM_BLINK_INTERVAL_MS    = 500UL;    // 500ms BE / 500ms KI villogás
 
 // --- Időzítések (ms) ---
 constexpr uint32_t NRF_PING_INTERVAL_MS   = 2000UL;  // 2 mp-enként ping

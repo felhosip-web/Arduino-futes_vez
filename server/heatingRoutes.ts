@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import type { HeatingMqttBridge } from './mqttBridge.ts';
 import {
+  buildAlarmUpdateCommand,
   buildPumpUpdateCommand,
   buildSingleOutputCommand,
   hasValidEspStatus,
@@ -169,6 +170,55 @@ export function createHeatingRouter(bridge: HeatingMqttBridge): Router {
         ok: true,
         topic: `futes/${id}/cmd`,
         pumpConfig: result.command.pumpConfig,
+        command: result.command,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'MQTT küldési hiba.';
+      res.status(503).json({ error: message });
+    }
+  });
+
+  // POST /api/heating/:id/alarm - csak az alarmConfig módosítása, a többi mező a frissebb forrásból
+  router.post('/:id/alarm', async (req, res) => {
+    const { id } = req.params;
+
+    if (
+      !req.body ||
+      typeof req.body !== 'object' ||
+      Array.isArray(req.body) ||
+      !(req.body as Record<string, unknown>).alarmConfig ||
+      typeof (req.body as Record<string, unknown>).alarmConfig !== 'object' ||
+      Array.isArray((req.body as Record<string, unknown>).alarmConfig)
+    ) {
+      res.status(400).json({ error: 'A kérés törzsének tartalmaznia kell egy érvényes alarmConfig objektumot.' });
+      return;
+    }
+
+    try {
+      const result = await withDeviceLock(id, async () => {
+        const current = bridge.getDeviceState(id);
+        if (!hasValidEspStatus(current)) {
+          return { status: 409 as const, error: 'Nincs még ESP állapot' };
+        }
+
+        const built = buildAlarmUpdateCommand(current, req.body);
+        if (!built.ok) {
+          return { status: 400 as const, error: built.error };
+        }
+
+        await bridge.publishCommand(id, built.value);
+        return { status: 200 as const, command: built.value };
+      });
+
+      if (result.status !== 200) {
+        res.status(result.status).json({ error: result.error });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        topic: `futes/${id}/cmd`,
+        alarmConfig: result.command.alarmConfig,
         command: result.command,
       });
     } catch (err) {

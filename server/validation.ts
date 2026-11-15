@@ -1,5 +1,6 @@
 import { OUTPUT_KEYS } from './types.ts';
 import type {
+  AlarmConfig,
   HeatingCommand,
   HeatingMode,
   HeatingOutputs,
@@ -14,12 +15,18 @@ const VALID_MODES: readonly HeatingMode[] = ['auto', 'manual', 'off'];
 const VALID_PUMP_MODES: readonly PumpMode[] = ['auto', 'manual_on', 'manual_off'];
 const VALID_PUMP_SENSORS: readonly PumpStartSensor[] = ['kazan', 'eloremeno', 'max'];
 const PUMP_CONFIG_KEYS = ['pumpMode', 'pumpStartTemp', 'pumpStopTemp', 'pumpStartSensor'] as const;
+const ALARM_CONFIG_KEYS = ['overheatTemp', 'alarmEnabled'] as const;
 
 export const DEFAULT_PUMP_CONFIG: PumpConfig = {
   pumpMode: 'auto',
   pumpStartTemp: 40.0,
   pumpStopTemp: 30.0,
   pumpStartSensor: 'kazan',
+};
+
+export const DEFAULT_ALARM_CONFIG: AlarmConfig = {
+  overheatTemp: 85.0,
+  alarmEnabled: true,
 };
 
 export interface ValidationResult<T> {
@@ -42,6 +49,7 @@ export interface FreshCommandBase {
   manualHeating?: boolean;
   kimenetek?: HeatingOutputs;
   pumpConfig?: PumpConfig;
+  alarmConfig?: AlarmConfig;
 }
 
 export function resolveFreshBase(state?: StoredDeviceState): FreshCommandBase {
@@ -58,6 +66,7 @@ export function resolveFreshBase(state?: StoredDeviceState): FreshCommandBase {
       manualHeating: state.lastCommand.manualHeating,
       kimenetek: state.lastCommand.kimenetek,
       pumpConfig: state.lastCommand.pumpConfig,
+      alarmConfig: state.lastCommand.alarmConfig,
     };
   }
 
@@ -68,6 +77,7 @@ export function resolveFreshBase(state?: StoredDeviceState): FreshCommandBase {
     manualHeating: src?.manualHeating ?? state.lastCommand?.manualHeating ?? false,
     kimenetek: src?.kimenetek,
     pumpConfig: src?.pumpConfig,
+    alarmConfig: src?.alarmConfig,
   };
 }
 
@@ -193,6 +203,69 @@ function validateResolvedPumpConfig(cfg: PumpConfig): ValidationResult<PumpConfi
   return { ok: true, value: cfg };
 }
 
+export function validateAlarmConfig(
+  rawAlarmConfig: unknown,
+  fallbackAlarmConfig?: Partial<AlarmConfig>
+): ValidationResult<AlarmConfig> | ValidationError {
+  const base: AlarmConfig = {
+    overheatTemp: fallbackAlarmConfig?.overheatTemp ?? DEFAULT_ALARM_CONFIG.overheatTemp,
+    alarmEnabled: fallbackAlarmConfig?.alarmEnabled ?? DEFAULT_ALARM_CONFIG.alarmEnabled,
+  };
+
+  if (rawAlarmConfig === undefined) {
+    return validateResolvedAlarmConfig(base);
+  }
+
+  if (!rawAlarmConfig || typeof rawAlarmConfig !== 'object' || Array.isArray(rawAlarmConfig)) {
+    return { ok: false, error: 'Az alarmConfig mezőnek érvényes JSON objektumnak kell lennie.' };
+  }
+
+  const raw = rawAlarmConfig as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!(ALARM_CONFIG_KEYS as readonly string[]).includes(key)) {
+      return { ok: false, error: `Ismeretlen alarmConfig kulcs: "${key}".` };
+    }
+  }
+
+  let overheatTemp: number;
+  if (raw.overheatTemp === undefined) {
+    overheatTemp = base.overheatTemp;
+  } else if (typeof raw.overheatTemp !== 'number' || !Number.isFinite(raw.overheatTemp)) {
+    return { ok: false, error: 'Az alarmConfig.overheatTemp mezőnek véges számnak kell lennie.' };
+  } else {
+    overheatTemp = Math.round(raw.overheatTemp * 10) / 10;
+  }
+
+  let alarmEnabled: boolean;
+  if (raw.alarmEnabled === undefined) {
+    alarmEnabled = base.alarmEnabled;
+  } else if (typeof raw.alarmEnabled !== 'boolean') {
+    return { ok: false, error: 'Az alarmConfig.alarmEnabled mező csak boolean lehet.' };
+  } else {
+    alarmEnabled = raw.alarmEnabled;
+  }
+
+  return validateResolvedAlarmConfig({
+    overheatTemp,
+    alarmEnabled,
+  });
+}
+
+function validateResolvedAlarmConfig(cfg: AlarmConfig): ValidationResult<AlarmConfig> | ValidationError {
+  if (typeof cfg.overheatTemp !== 'number' || !Number.isFinite(cfg.overheatTemp)) {
+    return { ok: false, error: 'Az alarmConfig.overheatTemp mezőnek véges számnak kell lennie.' };
+  }
+  if (cfg.overheatTemp < 70 || cfg.overheatTemp > 90) {
+    return { ok: false, error: 'Az alarmConfig.overheatTemp értéke 70 és 90 °C között lehet.' };
+  }
+
+  if (typeof cfg.alarmEnabled !== 'boolean') {
+    return { ok: false, error: 'Az alarmConfig.alarmEnabled mező csak boolean lehet.' };
+  }
+
+  return { ok: true, value: cfg };
+}
+
 export function validateHeatingCommand(
   body: unknown,
   currentState?: StoredDeviceState
@@ -279,6 +352,11 @@ export function validateHeatingCommand(
     return pumpValidation;
   }
 
+  const alarmValidation = validateAlarmConfig(raw.alarmConfig, freshBase.alarmConfig);
+  if (!alarmValidation.ok) {
+    return alarmValidation;
+  }
+
   return {
     ok: true,
     value: {
@@ -287,6 +365,7 @@ export function validateHeatingCommand(
       manualHeating,
       kimenetek: normalizedOutputs,
       pumpConfig: pumpValidation.value,
+      alarmConfig: alarmValidation.value,
     },
   };
 }
@@ -362,6 +441,9 @@ export function buildSingleOutputCommand(
     pumpConfig: {
       ...(fresh.pumpConfig ?? latest.pumpConfig ?? DEFAULT_PUMP_CONFIG),
     },
+    alarmConfig: {
+      ...(fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG),
+    },
   };
 }
 
@@ -399,6 +481,50 @@ export function buildPumpUpdateCommand(
         ...(fresh.kimenetek ?? latest.kimenetek),
       },
       pumpConfig: pumpValidation.value,
+      alarmConfig: {
+        ...(fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG),
+      },
+    },
+  };
+}
+
+export function buildAlarmUpdateCommand(
+  state: StoredDeviceState,
+  body: unknown
+): ValidationResult<HeatingCommand> | ValidationError {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: 'A kérés törzsének JSON objektumnak kell lennie.' };
+  }
+
+  const raw = body as Record<string, unknown>;
+  if (!raw.alarmConfig || typeof raw.alarmConfig !== 'object' || Array.isArray(raw.alarmConfig)) {
+    return { ok: false, error: 'Az alarmConfig objektum kötelező.' };
+  }
+
+  const fresh = resolveFreshBase(state);
+  const latest = state.lastStatus ?? state.status;
+
+  const alarmValidation = validateAlarmConfig(
+    raw.alarmConfig,
+    fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG
+  );
+  if (!alarmValidation.ok) {
+    return alarmValidation;
+  }
+
+  return {
+    ok: true,
+    value: {
+      targetTemp: fresh.targetTemp ?? latest.targetTemp,
+      mode: fresh.mode ?? latest.mode,
+      manualHeating: fresh.manualHeating ?? false,
+      kimenetek: {
+        ...(fresh.kimenetek ?? latest.kimenetek),
+      },
+      pumpConfig: {
+        ...(fresh.pumpConfig ?? latest.pumpConfig ?? DEFAULT_PUMP_CONFIG),
+      },
+      alarmConfig: alarmValidation.value,
     },
   };
 }
