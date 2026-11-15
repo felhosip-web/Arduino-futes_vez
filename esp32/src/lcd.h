@@ -44,6 +44,7 @@ public:
     void begin() {
         Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
         _lcd.init();
+        _lcd.backlight();
 
         uint8_t charPumpOff[8] = {
             0b01110,
@@ -113,7 +114,6 @@ public:
         _lcd.createChar(ICON_WIFI_OK,   charWifiOk);
         _lcd.createChar(ICON_WIFI_ERR,  charWifiErr);
 
-        _lcd.backlight();
         _lcd.clear();
 
         memset(_lastLine1, 0xFF, sizeof(_lastLine1));
