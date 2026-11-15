@@ -5,13 +5,86 @@ import type {
   HeatingCommand,
   HeatingStatusPayload,
   HeatingUpdateEvent,
+  PumpMode,
+  PumpStartSensor,
   StoredDeviceState,
 } from './types.ts';
+
+const VALID_PUMP_MODES: readonly PumpMode[] = ['auto', 'manual_on', 'manual_off'];
+const VALID_PUMP_SENSORS: readonly PumpStartSensor[] = ['kazan', 'eloremeno', 'max'];
+
+function mergeDefined<T extends object>(
+  base: T | undefined,
+  patch: Partial<T> | undefined
+): T | undefined {
+  if (!patch) return base;
+  const cleanPatch: Partial<T> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) {
+      (cleanPatch as Record<string, unknown>)[key] = value;
+    }
+  }
+  return base ? { ...base, ...cleanPatch } : (cleanPatch as T);
+}
+
+export function mergeHeatingStatus(
+  prevStatus: HeatingStatusPayload | null | undefined,
+  parsed: HeatingStatusPayload
+): HeatingStatusPayload {
+  if (!prevStatus) {
+    return parsed;
+  }
+
+  const cleanTop: Partial<HeatingStatusPayload> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (value !== undefined) {
+      (cleanTop as Record<string, unknown>)[key] = value;
+    }
+  }
+
+  return {
+    ...prevStatus,
+    ...cleanTop,
+    homersekletek: mergeDefined(prevStatus.homersekletek, parsed.homersekletek)!,
+    kimenetek: mergeDefined(prevStatus.kimenetek, parsed.kimenetek)!,
+    pumpConfig: mergeDefined(prevStatus.pumpConfig, parsed.pumpConfig)!,
+  };
+}
+
+export function isFullEspPayload(parsed: Partial<HeatingStatusPayload>): boolean {
+  if (
+    typeof parsed.targetTemp !== 'number' ||
+    !Number.isFinite(parsed.targetTemp) ||
+    typeof parsed.mode !== 'string' ||
+    !parsed.kimenetek ||
+    typeof parsed.kimenetek !== 'object' ||
+    Array.isArray(parsed.kimenetek)
+  ) {
+    return false;
+  }
+
+  const pc = parsed.pumpConfig;
+  if (!pc || typeof pc !== 'object' || Array.isArray(pc)) {
+    return false;
+  }
+
+  return (
+    typeof pc.pumpMode === 'string' &&
+    (VALID_PUMP_MODES as readonly string[]).includes(pc.pumpMode) &&
+    typeof pc.pumpStartTemp === 'number' &&
+    Number.isFinite(pc.pumpStartTemp) &&
+    typeof pc.pumpStopTemp === 'number' &&
+    Number.isFinite(pc.pumpStopTemp) &&
+    typeof pc.pumpStartSensor === 'string' &&
+    (VALID_PUMP_SENSORS as readonly string[]).includes(pc.pumpStartSensor)
+  );
+}
 
 export class HeatingMqttBridge {
   private client: MqttClient | null = null;
   private readonly io: SocketIOServer;
   private readonly states = new Map<string, StoredDeviceState>();
+  private readonly lastCommands = new Map<string, { command: HeatingCommand; sentAt: number }>();
   private connected = false;
 
   constructor(io: SocketIOServer) {
@@ -19,13 +92,17 @@ export class HeatingMqttBridge {
   }
 
   public connect(): void {
-    const brokerUrl = process.env.MQTT_BROKER_URL?.trim();
-    const username = process.env.MQTT_USERNAME?.trim();
-    const password = process.env.MQTT_PASSWORD?.trim();
+    const mqttHost = process.env.MQTT_HOST?.trim();
+    const mqttPort = Number(process.env.MQTT_PORT || 8883);
+    const brokerUrl =
+      process.env.MQTT_BROKER_URL?.trim() ||
+      (mqttHost ? `mqtts://${mqttHost}:${mqttPort}` : '');
+    const username = process.env.MQTT_USER?.trim() || process.env.MQTT_USERNAME?.trim();
+    const password = process.env.MQTT_PASS?.trim() || process.env.MQTT_PASSWORD?.trim();
     const clientId = process.env.MQTT_CLIENT_ID?.trim() || 'backend-futes';
 
     if (!brokerUrl || brokerUrl.includes('your-cluster-id')) {
-      console.warn('[MQTT] MQTT_BROKER_URL nincs beállítva (.env) — az MQTT híd várakozik.');
+      console.warn('[MQTT] MQTT_HOST / MQTT_BROKER_URL nincs beállítva (.env) — az MQTT híd várakozik.');
       return;
     }
 
@@ -86,16 +163,22 @@ export class HeatingMqttBridge {
       return;
     }
 
-    const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
     const prev = this.states.get(deviceId);
+    const fullPayload = isFullEspPayload(parsed);
+    const savedCmd = this.lastCommands.get(deviceId);
+    const mergedStatus = mergeHeatingStatus(prev?.lastStatus, parsed);
 
-    // Az ESP32-től érkező status/telemetry a mérvadó (soha nem írja felül a backend lokális parancsból)
+    // Az ESP32-től érkező status/telemetry a mérvadó (a backend soha nem írja felül lokális parancsból)
     const nextState: StoredDeviceState = {
       id: deviceId,
-      status: prev ? { ...prev.status, ...parsed } : parsed,
-      lastStatusAt: messageType === 'status' ? nowIso : (prev?.lastStatusAt ?? null),
-      lastTelemetryAt: messageType === 'telemetry' ? nowIso : (prev?.lastTelemetryAt ?? null),
-      lastUpdatedAt: nowIso,
+      lastStatus: mergedStatus,
+      status: mergedStatus,
+      lastCommand: savedCmd?.command ?? prev?.lastCommand ?? null,
+      lastCommandAt: savedCmd?.sentAt ?? prev?.lastCommandAt ?? null,
+      lastStatusAt: fullPayload ? nowMs : (prev?.lastStatusAt ?? null),
+      lastTelemetryAt: messageType === 'telemetry' ? nowMs : (prev?.lastTelemetryAt ?? null),
+      lastUpdatedAt: nowMs,
     };
 
     this.states.set(deviceId, nextState);
@@ -104,7 +187,7 @@ export class HeatingMqttBridge {
       id: deviceId,
       type: messageType,
       topic,
-      receivedAt: nowIso,
+      receivedAt: new Date(nowMs).toISOString(),
       data: parsed,
       state: nextState,
     };
@@ -127,6 +210,13 @@ export class HeatingMqttBridge {
         if (err) {
           reject(err);
           return;
+        }
+        const sentAt = Date.now();
+        this.lastCommands.set(deviceId, { command, sentAt });
+        const existing = this.states.get(deviceId);
+        if (existing) {
+          existing.lastCommand = command;
+          existing.lastCommandAt = sentAt;
         }
         resolve();
       });

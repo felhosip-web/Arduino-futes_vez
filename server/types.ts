@@ -1,5 +1,11 @@
 export type HeatingMode = 'auto' | 'manual' | 'off';
 
+export type PumpMode = 'auto' | 'manual_on' | 'manual_off';
+
+export type PumpStartSensor = 'kazan' | 'eloremeno' | 'max';
+
+export type PumpState = 'varakozas' | 'futes';
+
 export const OUTPUT_KEYS = [
   'szivattyu',
   'led_zold',
@@ -15,11 +21,19 @@ export type OutputKey = (typeof OUTPUT_KEYS)[number];
 
 export type HeatingOutputs = Record<OutputKey, boolean>;
 
+export interface PumpConfig {
+  pumpMode: PumpMode;
+  pumpStartTemp: number;
+  pumpStopTemp: number;
+  pumpStartSensor: PumpStartSensor;
+}
+
 export interface HeatingCommand {
   targetTemp: number;
   mode: HeatingMode;
   manualHeating: boolean;
   kimenetek: HeatingOutputs;
+  pumpConfig: PumpConfig;
 }
 
 export interface HeatingTemperatures {
@@ -38,17 +52,23 @@ export interface HeatingStatusPayload {
   homersekletek: HeatingTemperatures;
   kimenetek: HeatingOutputs;
   kazan_status: number[];
+  pumpConfig: PumpConfig;
+  pumpState: PumpState;
   nrf24_ok: boolean;
   error: string | null;
+  manualHeating?: boolean;
   nanoCounter?: number;
 }
 
 export interface StoredDeviceState {
   id: string;
+  lastStatus: HeatingStatusPayload | null;
   status: HeatingStatusPayload;
-  lastStatusAt: string | null;
-  lastTelemetryAt: string | null;
-  lastUpdatedAt: string;
+  lastCommand: HeatingCommand | null;
+  lastCommandAt: number | null;
+  lastStatusAt: number | null;
+  lastTelemetryAt: number | null;
+  lastUpdatedAt: number;
 }
 
 export interface HeatingUpdateEvent {

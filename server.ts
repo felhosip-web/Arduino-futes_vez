@@ -48,12 +48,14 @@ async function startServer(): Promise<void> {
   io.on('connection', (socket) => {
     // Új kliens csatlakozásakor átküldjük az ismert eszközök aktuális ESP státuszát
     for (const state of mqttBridge.getAllStates()) {
+      const statusData = state.lastStatus ?? state.status;
+      if (!statusData) continue;
       socket.emit('heating-update', {
         id: state.id,
         type: 'status',
         topic: `futes/${state.id}/status`,
-        receivedAt: state.lastUpdatedAt,
-        data: state.status,
+        receivedAt: new Date(state.lastUpdatedAt).toISOString(),
+        data: statusData,
         state,
       });
     }

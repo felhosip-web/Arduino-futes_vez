@@ -9,57 +9,12 @@
 
 #include "config.h"
 #include "lcd.h"
-
-#if __has_include("../../nano/src/common.h")
 #include "../../nano/src/common.h"
-#else
-#include <stdint.h>
-constexpr uint8_t PKT_TYPE_ESP_TO_NANO = 0xA1;
-constexpr uint8_t PKT_TYPE_NANO_TO_ESP = 0xB2;
-enum HeatingMode : uint8_t { MODE_AUTO = 0, MODE_MANUAL = 1, MODE_OFF = 2 };
-constexpr uint8_t OUT_BIT_SZIVATTYU = 0;
-constexpr uint8_t OUT_BIT_LED_ZOLD  = 1;
-constexpr uint8_t OUT_BIT_LED_PIROS = 2;
-constexpr uint8_t OUT_BIT_TARTALEK1 = 3;
-constexpr uint8_t OUT_BIT_TARTALEK2 = 4;
-constexpr uint8_t OUT_BIT_TARTALEK3 = 5;
-constexpr uint8_t OUT_BIT_TARTALEK4 = 6;
-constexpr uint8_t OUT_BIT_TARTALEK5 = 7;
-constexpr uint8_t SENS_VALID_ELOREMENO  = 0;
-constexpr uint8_t SENS_VALID_VISSZATERO = 1;
-constexpr uint8_t SENS_VALID_KAZAN      = 2;
-constexpr uint8_t SENS_VALID_KULTERI    = 3;
-struct __attribute__((packed)) NrfPacket {
-    uint8_t packetType;
-    uint8_t outputsMask;
-    float targetTemp;
-    uint8_t mode;
-    uint8_t manualHeating;
-    float eloremeno;
-    float visszatero;
-    float kazan;
-    float kulteri;
-    uint8_t kazan_status;
-    uint8_t sensorValidMask;
-    uint8_t nrf24_ok;
-    uint8_t reserved;
-    uint32_t counter;
-};
-static_assert(sizeof(NrfPacket) == 32, "NrfPacket must be 32 bytes");
-constexpr uint8_t NRF_CHANNEL = 108;
-constexpr uint8_t NRF_ADDR_PIPE[6] = "FUTES";
-inline bool getBit(uint8_t mask, uint8_t bitIndex) { return (mask & (1U << bitIndex)) != 0; }
-inline void setBit(uint8_t& mask, uint8_t bitIndex, bool value) {
-    if (value) mask |= static_cast<uint8_t>(1U << bitIndex);
-    else mask &= static_cast<uint8_t>(~(1U << bitIndex));
-}
-#endif
 
 // ============================================================================
-// ESP32-C3 - SZOBA OLDALI TERMOSZTÁT ÉS MQTT GATEWAY
+// ESP32-C3 - SZOBA OLDALI TERMOSZTÁT, KAZÁNVÉDELEM ÉS MQTT GATEWAY (V4)
 // ============================================================================
 
-// --- Globális példányok ---
 SPIClass spiNrf(FSPI);
 RF24 radio(PIN_NRF_CE, PIN_NRF_CSN);
 HeatingLcd lcd;
@@ -69,23 +24,39 @@ PubSubClient mqtt(wifiSecureClient);
 
 // --- Rendszer állapot ---
 struct SystemState {
-    float currentTemp   = 20.0f;
-    float targetTemp    = TARGET_TEMP_DEFAULT;
-    bool  heatingOn     = false;
-    uint8_t mode        = MODE_AUTO;
-    bool  manualHeating = false;
+    // Szobatermosztát (csak jelzés + encoder)
+    float   currentTemp   = 20.0f;
+    float   targetTemp    = TARGET_TEMP_DEFAULT;
+    bool    heatingOn     = false;
+    uint8_t mode          = MODE_AUTO;
+    bool    manualHeating = false;
 
-    uint8_t outputsMask = 0; // bit0..7 (szivattyu..tartalek5)
+    // Kimenetek (bit0-t a kazánvédelmi állapotgép + biztonsági szabályok vezérlik)
+    uint8_t outputsMask   = 0;
+    bool    userLedPiros  = false;
 
-    // Nano felől érkező adatok
-    float eloremeno     = NAN;
-    float visszatero    = NAN;
-    float kazan         = NAN;
-    float kulteri       = NAN;
-    uint8_t kazanStatus = 0;
-    uint8_t sensorValidMask = 0;
-    bool  nrf24Ok       = false;
-    uint32_t nanoCounter = 0;
+    // Nano felől érkező adatok (-127.0f ha szenzorhiba)
+    float    eloremeno       = SENSOR_DISCONNECTED_VAL;
+    float    visszatero      = SENSOR_DISCONNECTED_VAL;
+    float    kazan           = SENSOR_DISCONNECTED_VAL;
+    float    kulteri         = SENSOR_DISCONNECTED_VAL;
+    uint8_t  kazanStatus[8]  = { 0 };
+    uint32_t nanoCounter     = 0;
+    uint8_t  sensorValidMask = 0;
+    bool     nrf24Ok         = false;
+
+    // Kazánvédelem (szivattyú állapotgép)
+    PumpConfigPacked pumpConfig = {
+        PUMP_MODE_AUTO,
+        PUMP_START_TEMP_DEFAULT,
+        PUMP_STOP_TEMP_DEFAULT,
+        PUMP_SENSOR_KAZAN
+    };
+    uint8_t  pumpState         = PUMP_STATE_VARAKOZAS;
+    bool     pumpOn            = false;
+    uint32_t manualOffStartMs  = 0;
+    bool     safetyOverheat    = false;
+    bool     safetySensorFault = false;
 } state;
 
 // --- Időzítők ---
@@ -95,22 +66,20 @@ uint32_t lastNrfAckMs    = 0;
 uint32_t lastTelemetryMs = 0;
 uint32_t lastWifiTryMs   = 0;
 uint32_t lastMqttTryMs   = 0;
-bool     mqttConnectedOnce = false;
 
-// --- Rotary Encoder ISR állapot (Gray-code tábla + debounce) ---
-volatile int8_t  encStepAccum = 0;
-volatile uint8_t encPrevState = 0;
-volatile bool    btnPressedEvent = false;
-volatile uint32_t lastBtnIsrMs = 0;
+// --- Rotary Encoder ISR állapot (Gray-kód tábla + debounce) ---
+volatile int8_t   encStepAccum    = 0;
+volatile uint8_t  encPrevState    = 0;
+volatile bool     btnPressedEvent = false;
+volatile uint32_t lastBtnIsrMs    = 0;
+volatile int8_t   encQuarterAccum = 0;
 
-// Quadrature state lookup table (0 = no change, +1 = CW, -1 = CCW)
 static const int8_t QEM_TABLE[16] = {
      0, -1,  1,  0,
      1,  0,  0, -1,
     -1,  0,  0,  1,
      0,  1, -1,  0
 };
-volatile int8_t encQuarterAccum = 0;
 
 void IRAM_ATTR isrEncoderRotate() {
     uint8_t msb = static_cast<uint8_t>(digitalRead(PIN_ENC_CLK));
@@ -143,8 +112,16 @@ void IRAM_ATTR isrEncoderButton() {
 }
 
 // ============================================================================
-// SEGÉDFÜGGVÉNYEK
+// SEGÉDFÜGGVÉNYEK ÉS KONVERZIÓK
 // ============================================================================
+inline bool isSensorValid(float t) {
+    return !isnan(t) && t > -120.0f && t <= 125.0f;
+}
+
+float round1(float v) {
+    return roundf(v * 10.0f) / 10.0f;
+}
+
 const char* modeToStr(uint8_t mode) {
     switch (mode) {
         case MODE_AUTO:   return "auto";
@@ -161,8 +138,57 @@ uint8_t strToMode(const char* s) {
     return MODE_AUTO;
 }
 
-float round1(float v) {
-    return roundf(v * 10.0f) / 10.0f;
+const char* pumpModeToStr(uint8_t pm) {
+    switch (pm) {
+        case PUMP_MODE_AUTO:       return "auto";
+        case PUMP_MODE_MANUAL_ON:  return "manual_on";
+        case PUMP_MODE_MANUAL_OFF: return "manual_off";
+        default:                   return "auto";
+    }
+}
+
+uint8_t strToPumpMode(const char* s) {
+    if (!s) return PUMP_MODE_AUTO;
+    if (strcmp(s, "manual_on") == 0)  return PUMP_MODE_MANUAL_ON;
+    if (strcmp(s, "manual_off") == 0) return PUMP_MODE_MANUAL_OFF;
+    return PUMP_MODE_AUTO;
+}
+
+const char* pumpSensorToStr(uint8_t ps) {
+    switch (ps) {
+        case PUMP_SENSOR_KAZAN:     return "kazan";
+        case PUMP_SENSOR_ELOREMENO: return "eloremeno";
+        case PUMP_SENSOR_MAX:       return "max";
+        default:                    return "kazan";
+    }
+}
+
+uint8_t strToPumpSensor(const char* s) {
+    if (!s) return PUMP_SENSOR_KAZAN;
+    if (strcmp(s, "eloremeno") == 0) return PUMP_SENSOR_ELOREMENO;
+    if (strcmp(s, "max") == 0)       return PUMP_SENSOR_MAX;
+    return PUMP_SENSOR_KAZAN;
+}
+
+const char* pumpStateToStr(uint8_t ps) {
+    return (ps == PUMP_STATE_FUTES) ? "futes" : "varakozas";
+}
+
+void sanitizePumpConfig(PumpConfigPacked& cfg) {
+    if (cfg.pumpStartTemp < PUMP_START_TEMP_MIN) cfg.pumpStartTemp = PUMP_START_TEMP_MIN;
+    if (cfg.pumpStartTemp > PUMP_START_TEMP_MAX) cfg.pumpStartTemp = PUMP_START_TEMP_MAX;
+
+    if (cfg.pumpStopTemp < PUMP_STOP_TEMP_MIN) cfg.pumpStopTemp = PUMP_STOP_TEMP_MIN;
+    if (cfg.pumpStopTemp > PUMP_STOP_TEMP_MAX) cfg.pumpStopTemp = PUMP_STOP_TEMP_MAX;
+
+    // MINDIG pumpStopTemp < pumpStartTemp - 5 kell legyen
+    float maxAllowedStop = cfg.pumpStartTemp - PUMP_MIN_HYSTERESIS_GAP;
+    if (cfg.pumpStopTemp >= maxAllowedStop) {
+        cfg.pumpStopTemp = maxAllowedStop - 0.5f;
+        if (cfg.pumpStopTemp < PUMP_STOP_TEMP_MIN) {
+            cfg.pumpStopTemp = PUMP_STOP_TEMP_MIN;
+        }
+    }
 }
 
 // ============================================================================
@@ -174,42 +200,115 @@ float readRoomTempLM35() {
         sumMv += analogReadMilliVolts(PIN_LM35);
     }
     float avgMv = static_cast<float>(sumMv) / static_cast<float>(LM35_SAMPLE_COUNT);
-    // Map: 0-3300mV = 0-100°C + kalibrációs offset
     float tempC = (avgMv / 3300.0f) * 100.0f + LM35_OFFSET;
     return round1(tempC);
 }
 
 // ============================================================================
-// FŰTÉSVEZÉRLÉSI LOGIKA (AZ ESP HOZZA A DÖNTÉST, A NANO VÉGREHAJTJA)
+// SZOBAFŰTÉS HISZTERÉZIS (CSAK JELZÉS A FRONTENDNEK, NEM VEZÉRLI A SZIVATTYÚT)
 // ============================================================================
-void evaluateControlLogic() {
+void evaluateRoomHeatingIndicator() {
     if (state.mode == MODE_OFF) {
         state.heatingOn = false;
-        state.outputsMask = 0; // Minden kimenet KI
         return;
     }
-
-    if (state.mode == MODE_AUTO) {
-        // Hiszterézis 0.5°C: BE ha currentTemp < target - 0.3, KI ha > target + 0.3
-        if (state.currentTemp < (state.targetTemp - HYST_LOW_OFFSET)) {
-            state.heatingOn = true;
-        } else if (state.currentTemp > (state.targetTemp + HYST_HIGH_OFFSET)) {
-            state.heatingOn = false;
-        }
-
-        setBit(state.outputsMask, OUT_BIT_SZIVATTYU, state.heatingOn);
-        setBit(state.outputsMask, OUT_BIT_LED_ZOLD,  state.heatingOn);
-        setBit(state.outputsMask, OUT_BIT_LED_PIROS, false);
-        // A tartalek1-5 bitek változatlanok maradnak AUTO módban
-        return;
-    }
-
     if (state.mode == MODE_MANUAL) {
         state.heatingOn = state.manualHeating;
-        setBit(state.outputsMask, OUT_BIT_SZIVATTYU, state.manualHeating);
-        setBit(state.outputsMask, OUT_BIT_LED_ZOLD,  state.manualHeating);
-        setBit(state.outputsMask, OUT_BIT_LED_PIROS, false);
+        return;
     }
+    // MODE_AUTO: BE ha currentTemp < target - 0.3, KI ha > target + 0.3
+    if (state.currentTemp < (state.targetTemp - HYST_LOW_OFFSET)) {
+        state.heatingOn = true;
+    } else if (state.currentTemp > (state.targetTemp + HYST_HIGH_OFFSET)) {
+        state.heatingOn = false;
+    }
+}
+
+// ============================================================================
+// KAZÁNVÉDELEM ÁLLAPOTGÉP + BIZTONSÁGI SZABÁLYOK (EZ VEZÉRLI A SZIVATTYÚT!)
+// ============================================================================
+bool getSelectedStartSensorTemp(float& outTemp) {
+    bool kOk = isSensorValid(state.kazan);
+    bool eOk = isSensorValid(state.eloremeno);
+
+    switch (state.pumpConfig.pumpStartSensor) {
+        case PUMP_SENSOR_ELOREMENO:
+            if (!eOk) return false;
+            outTemp = state.eloremeno;
+            return true;
+
+        case PUMP_SENSOR_MAX:
+            if (kOk && eOk) {
+                outTemp = fmaxf(state.kazan, state.eloremeno);
+                return true;
+            }
+            if (kOk) { outTemp = state.kazan; return true; }
+            if (eOk) { outTemp = state.eloremeno; return true; }
+            return false;
+
+        case PUMP_SENSOR_KAZAN:
+        default:
+            if (!kOk) return false;
+            outTemp = state.kazan;
+            return true;
+    }
+}
+
+// Visszatér true-val, ha manual_off 10 perc után automatikusan visszaállt auto-ra
+bool evaluateBoilerPumpProtection(uint32_t now) {
+    bool modeAutoRestored = false;
+
+    // 0. 10 perces manual_off automatikus visszaállás ellenőrzése
+    if (state.pumpConfig.pumpMode == PUMP_MODE_MANUAL_OFF) {
+        if (now - state.manualOffStartMs >= PUMP_MANUAL_OFF_TIMEOUT_MS) {
+            state.pumpConfig.pumpMode = PUMP_MODE_AUTO;
+            modeAutoRestored = true;
+            Serial.println(F("[PUMP] 10 perc letelt: manual_off automatikusan visszaallt auto-ra."));
+        }
+    }
+
+    // 1. Állapotgép (pumpMode == "auto") vagy manuális felülbírálás
+    bool desiredPump = false;
+    if (state.pumpConfig.pumpMode == PUMP_MODE_AUTO) {
+        if (state.pumpState == PUMP_STATE_VARAKOZAS) {
+            float startTemp = 0.0f;
+            if (getSelectedStartSensorTemp(startTemp) && startTemp >= state.pumpConfig.pumpStartTemp) {
+                state.pumpState = PUMP_STATE_FUTES;
+            }
+        } else {
+            // PUMP_STATE_FUTES: hűlésnél CSAK az eloremeno <= pumpStopTemp feltételt figyeljük!
+            if (isSensorValid(state.eloremeno) && state.eloremeno <= state.pumpConfig.pumpStopTemp) {
+                state.pumpState = PUMP_STATE_VARAKOZAS;
+            }
+        }
+        desiredPump = (state.pumpState == PUMP_STATE_FUTES);
+    } else if (state.pumpConfig.pumpMode == PUMP_MODE_MANUAL_ON) {
+        desiredPump = true;
+        state.pumpState = PUMP_STATE_FUTES;
+    } else { // PUMP_MODE_MANUAL_OFF
+        desiredPump = false;
+        state.pumpState = PUMP_STATE_VARAKOZAS;
+    }
+
+    // 2. BIZTONSÁGI SZABÁLYOK (minden mást felülírnak, még a manual_off-ot is!)
+    bool kazanValid = isSensorValid(state.kazan);
+    state.safetySensorFault = !kazanValid;
+    state.safetyOverheat    = kazanValid && (state.kazan >= BOILER_OVERHEAT_TEMP);
+
+    if (state.safetyOverheat || state.safetySensorFault) {
+        desiredPump = true;
+        state.pumpState = PUMP_STATE_FUTES;
+    }
+
+    state.pumpOn = desiredPump;
+
+    // Kimeneti bitmaszk szinkronizálása: bit0 mindig a kazánvédelmi döntés!
+    setBit(state.outputsMask, OUT_BIT_SZIVATTYU, state.pumpOn);
+    setBit(state.outputsMask, OUT_BIT_LED_ZOLD,  state.pumpOn);
+    setBit(state.outputsMask, OUT_BIT_LED_PIROS,
+           state.safetyOverheat || state.safetySensorFault || state.userLedPiros);
+
+    return modeAutoRestored;
 }
 
 // ============================================================================
@@ -217,11 +316,12 @@ void evaluateControlLogic() {
 // ============================================================================
 bool sendToNanoAndReadAck() {
     NrfPacket tx{};
-    tx.packetType    = PKT_TYPE_ESP_TO_NANO;
-    tx.outputsMask   = state.outputsMask;
-    tx.targetTemp    = state.targetTemp;
-    tx.mode          = state.mode;
-    tx.manualHeating = state.manualHeating ? 1 : 0;
+    tx.packetType        = PKT_TYPE_ESP_TO_NANO;
+    tx.esp.outputsMask   = state.outputsMask;
+    tx.esp.targetTemp    = state.targetTemp;
+    tx.esp.mode          = state.mode;
+    tx.esp.manualHeating = state.manualHeating ? 1 : 0;
+    tx.esp.pumpConfig    = state.pumpConfig;
 
     bool ok = radio.write(&tx, sizeof(tx));
     if (ok) {
@@ -235,13 +335,13 @@ bool sendToNanoAndReadAck() {
             NrfPacket rx{};
             radio.read(&rx, sizeof(rx));
             if (rx.packetType == PKT_TYPE_NANO_TO_ESP) {
-                state.sensorValidMask = rx.sensorValidMask;
-                state.eloremeno       = getBit(rx.sensorValidMask, SENS_VALID_ELOREMENO)  ? rx.eloremeno  : NAN;
-                state.visszatero      = getBit(rx.sensorValidMask, SENS_VALID_VISSZATERO) ? rx.visszatero : NAN;
-                state.kazan           = getBit(rx.sensorValidMask, SENS_VALID_KAZAN)      ? rx.kazan      : NAN;
-                state.kulteri         = getBit(rx.sensorValidMask, SENS_VALID_KULTERI)    ? rx.kulteri    : NAN;
-                state.kazanStatus     = rx.kazan_status;
-                state.nanoCounter     = rx.counter;
+                state.eloremeno   = rx.nano.eloremeno;
+                state.visszatero  = rx.nano.visszatero;
+                state.kazan       = rx.nano.kazan;
+                state.kulteri     = rx.nano.kulteri;
+                memcpy(state.kazanStatus, rx.nano.kazan_status, 8);
+                state.nanoCounter     = rx.nano.counter;
+                state.sensorValidMask = rx.nano.sensorValidMask;
             }
         }
     }
@@ -249,7 +349,7 @@ bool sendToNanoAndReadAck() {
 }
 
 // ============================================================================
-// MQTT JSON STATUS & TELEMETRY PUBLISH
+// MQTT JSON STATUS & TELEMETRY PUBLISH (V4)
 // ============================================================================
 void buildStatusJson(JsonDocument& doc) {
     doc["currentTemp"] = round1(state.currentTemp);
@@ -259,10 +359,10 @@ void buildStatusJson(JsonDocument& doc) {
     doc["online"]      = true;
 
     JsonObject temps = doc["homersekletek"].to<JsonObject>();
-    if (isnan(state.eloremeno))  temps["eloremeno"]  = nullptr; else temps["eloremeno"]  = round1(state.eloremeno);
-    if (isnan(state.visszatero)) temps["visszatero"] = nullptr; else temps["visszatero"] = round1(state.visszatero);
-    if (isnan(state.kazan))      temps["kazan"]      = nullptr; else temps["kazan"]      = round1(state.kazan);
-    if (isnan(state.kulteri))    temps["kulteri"]    = nullptr; else temps["kulteri"]    = round1(state.kulteri);
+    if (!isSensorValid(state.eloremeno))  temps["eloremeno"]  = nullptr; else temps["eloremeno"]  = round1(state.eloremeno);
+    if (!isSensorValid(state.visszatero)) temps["visszatero"] = nullptr; else temps["visszatero"] = round1(state.visszatero);
+    if (!isSensorValid(state.kazan))      temps["kazan"]      = nullptr; else temps["kazan"]      = round1(state.kazan);
+    if (!isSensorValid(state.kulteri))    temps["kulteri"]    = nullptr; else temps["kulteri"]    = round1(state.kulteri);
 
     JsonObject outs = doc["kimenetek"].to<JsonObject>();
     outs["szivattyu"] = getBit(state.outputsMask, OUT_BIT_SZIVATTYU);
@@ -276,14 +376,26 @@ void buildStatusJson(JsonDocument& doc) {
 
     JsonArray kStat = doc["kazan_status"].to<JsonArray>();
     for (uint8_t i = 0; i < 8; i++) {
-        kStat.add(getBit(state.kazanStatus, i) ? 1 : 0);
+        kStat.add(state.kazanStatus[i]);
     }
 
-    doc["nrf24_ok"] = state.nrf24Ok;
-    if (state.nrf24Ok) {
-        doc["error"] = nullptr;
-    } else {
+    JsonObject pCfg = doc["pumpConfig"].to<JsonObject>();
+    pCfg["pumpMode"]        = pumpModeToStr(state.pumpConfig.pumpMode);
+    pCfg["pumpStartTemp"]   = round1(state.pumpConfig.pumpStartTemp);
+    pCfg["pumpStopTemp"]    = round1(state.pumpConfig.pumpStopTemp);
+    pCfg["pumpStartSensor"] = pumpSensorToStr(state.pumpConfig.pumpStartSensor);
+
+    doc["pumpState"] = pumpStateToStr(state.pumpState);
+    doc["nrf24_ok"]  = state.nrf24Ok;
+
+    if (!state.nrf24Ok) {
         doc["error"] = "NRF24 kommunikacios hiba (10s timeout)";
+    } else if (state.safetyOverheat) {
+        doc["error"] = "Kazan tulmelegedes (>= 85C) - szivattyu kenyszeritett BE";
+    } else if (state.safetySensorFault) {
+        doc["error"] = "Kazan szenzor hiba (-127) - szivattyu biztonsagi BE";
+    } else {
+        doc["error"] = nullptr;
     }
 }
 
@@ -291,7 +403,7 @@ void publishMqttStatus() {
     if (!mqtt.connected()) return;
     JsonDocument doc;
     buildStatusJson(doc);
-    char payload[768];
+    char payload[1024];
     size_t n = serializeJson(doc, payload, sizeof(payload));
     if (n > 0) {
         mqtt.publish(TOPIC_STATUS, reinterpret_cast<const uint8_t*>(payload), n, true); // retained = true
@@ -303,7 +415,7 @@ void publishMqttTelemetry() {
     JsonDocument doc;
     buildStatusJson(doc);
     doc["nanoCounter"] = state.nanoCounter;
-    char payload[768];
+    char payload[1024];
     size_t n = serializeJson(doc, payload, sizeof(payload));
     if (n > 0) {
         mqtt.publish(TOPIC_TELEMETRY, reinterpret_cast<const uint8_t*>(payload), n, false);
@@ -339,9 +451,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         state.manualHeating = doc["manualHeating"].as<bool>();
     }
 
-    bool hasKimenetek = doc["kimenetek"].is<JsonObject>();
-    if (hasKimenetek) {
+    if (doc["kimenetek"].is<JsonObject>()) {
         JsonObject k = doc["kimenetek"].as<JsonObject>();
+        // bit0 (szivattyu) védelmi állapotgép alá tartozik, a többi bit állítható
+        if (k["led_zold"].is<bool>())  setBit(state.outputsMask, OUT_BIT_LED_ZOLD,  k["led_zold"].as<bool>());
+        if (k["led_piros"].is<bool>()) state.userLedPiros = k["led_piros"].as<bool>();
         if (k["tartalek1"].is<bool>()) setBit(state.outputsMask, OUT_BIT_TARTALEK1, k["tartalek1"].as<bool>());
         if (k["tartalek2"].is<bool>()) setBit(state.outputsMask, OUT_BIT_TARTALEK2, k["tartalek2"].as<bool>());
         if (k["tartalek3"].is<bool>()) setBit(state.outputsMask, OUT_BIT_TARTALEK3, k["tartalek3"].as<bool>());
@@ -349,24 +463,32 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (k["tartalek5"].is<bool>()) setBit(state.outputsMask, OUT_BIT_TARTALEK5, k["tartalek5"].as<bool>());
     }
 
-    evaluateControlLogic();
-
-    // MANUAL módban a kimenetek objektum felülírhatja a szivattyú/LED biteket is
-    if (state.mode == MODE_MANUAL && hasKimenetek) {
-        JsonObject k = doc["kimenetek"].as<JsonObject>();
-        if (k["szivattyu"].is<bool>()) {
-            bool pump = k["szivattyu"].as<bool>();
-            setBit(state.outputsMask, OUT_BIT_SZIVATTYU, pump);
-            state.manualHeating = pump;
-            state.heatingOn = pump;
+    if (doc["pumpConfig"].is<JsonObject>()) {
+        JsonObject pc = doc["pumpConfig"].as<JsonObject>();
+        if (pc["pumpMode"].is<const char*>()) {
+            uint8_t nextPumpMode = strToPumpMode(pc["pumpMode"].as<const char*>());
+            if (nextPumpMode == PUMP_MODE_MANUAL_OFF && state.pumpConfig.pumpMode != PUMP_MODE_MANUAL_OFF) {
+                state.manualOffStartMs = millis();
+            }
+            state.pumpConfig.pumpMode = nextPumpMode;
         }
-        if (k["led_zold"].is<bool>())  setBit(state.outputsMask, OUT_BIT_LED_ZOLD,  k["led_zold"].as<bool>());
-        if (k["led_piros"].is<bool>()) setBit(state.outputsMask, OUT_BIT_LED_PIROS, k["led_piros"].as<bool>());
+        if (pc["pumpStartTemp"].is<float>() || pc["pumpStartTemp"].is<int>()) {
+            state.pumpConfig.pumpStartTemp = pc["pumpStartTemp"].as<float>();
+        }
+        if (pc["pumpStopTemp"].is<float>() || pc["pumpStopTemp"].is<int>()) {
+            state.pumpConfig.pumpStopTemp = pc["pumpStopTemp"].as<float>();
+        }
+        if (pc["pumpStartSensor"].is<const char*>()) {
+            state.pumpConfig.pumpStartSensor = strToPumpSensor(pc["pumpStartSensor"].as<const char*>());
+        }
+        sanitizePumpConfig(state.pumpConfig);
     }
 
+    evaluateRoomHeatingIndicator();
+    evaluateBoilerPumpProtection(millis());
     sendToNanoAndReadAck();
     lcd.update(state.currentTemp, state.targetTemp, state.kazan,
-               state.heatingOn, state.mode, state.nrf24Ok);
+               state.pumpOn, state.mode, state.nrf24Ok);
     publishMqttStatus();
 }
 
@@ -381,7 +503,7 @@ void maintainConnectivity(uint32_t now) {
             WiFi.disconnect(false);
             WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         }
-        return; // Ha nincs WiFi, ne próbálkozzunk MQTT-vel, menjen tovább a lokális szabályzás!
+        return;
     }
 
     if (!mqtt.connected()) {
@@ -394,7 +516,6 @@ void maintainConnectivity(uint32_t now) {
                 Serial.println(F("SIKERES!"));
                 mqtt.subscribe(TOPIC_CMD);
                 publishMqttStatus();
-                mqttConnectedOnce = true;
             } else {
                 Serial.print(F("HIBA, rc="));
                 Serial.println(mqtt.state());
@@ -408,7 +529,7 @@ void maintainConnectivity(uint32_t now) {
 // ============================================================================
 // ENCODER ÉS NYOMÓGOMB KEZELÉS
 // ============================================================================
-void handleEncoderEvents() {
+void handleEncoderEvents(uint32_t now) {
     int8_t steps = 0;
     bool btnClicked = false;
 
@@ -432,24 +553,20 @@ void handleEncoderEvents() {
         if (fabsf(nextTarget - state.targetTemp) >= 0.01f) {
             state.targetTemp = nextTarget;
             changed = true;
-            Serial.print(F("[ENC] Uj celhomerseklet: "));
-            Serial.println(state.targetTemp, 1);
         }
     }
 
     if (btnClicked) {
-        // Mód váltás: AUTO -> MANUAL -> OFF -> AUTO
-        state.mode = (state.mode + 1) % 3;
+        state.mode = (state.mode + 1) % 3; // AUTO -> MANUAL -> OFF -> AUTO
         changed = true;
-        Serial.print(F("[ENC] Uj mod: "));
-        Serial.println(modeToStr(state.mode));
     }
 
     if (changed) {
-        evaluateControlLogic();
+        evaluateRoomHeatingIndicator();
+        evaluateBoilerPumpProtection(now);
         sendToNanoAndReadAck();
         lcd.update(state.currentTemp, state.targetTemp, state.kazan,
-                   state.heatingOn, state.mode, state.nrf24Ok);
+                   state.pumpOn, state.mode, state.nrf24Ok);
         publishMqttStatus();
     }
 }
@@ -460,14 +577,12 @@ void handleEncoderEvents() {
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println(F("\n[ESP32-C3] Szobai termosztat & Gateway inditas..."));
+    Serial.println(F("\n[ESP32-C3 V4] Szobai termosztat & Kazanvedelmi Gateway inditas..."));
 
-    // ADC beállítás LM35-höz
     analogReadResolution(12);
     analogSetPinAttenuation(PIN_LM35, ADC_11db);
     state.currentTemp = readRoomTempLM35();
 
-    // Encoder lábak és megszakítások
     pinMode(PIN_ENC_CLK, INPUT_PULLUP);
     pinMode(PIN_ENC_DT,  INPUT_PULLUP);
     pinMode(PIN_ENC_SW,  INPUT_PULLUP);
@@ -477,10 +592,8 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_DT),  isrEncoderRotate, CHANGE);
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_SW),  isrEncoderButton, FALLING);
 
-    // 2x20 I2C LCD
     lcd.begin();
 
-    // NRF24L01+ inicializálás
     spiNrf.begin(PIN_NRF_SCK, PIN_NRF_MISO, PIN_NRF_MOSI, PIN_NRF_CSN);
     if (!radio.begin(&spiNrf)) {
         Serial.println(F("[ESP] HIBA: NRF24L01+ nem talalhato!"));
@@ -496,25 +609,25 @@ void setup() {
         Serial.println(F("[ESP] NRF24L01+ keszenletben."));
     }
 
-    // Első szabályozási kiértékelés és kijelzés WiFi-tól függetlenül
-    evaluateControlLogic();
-    lastNrfAckMs = millis();
+    uint32_t now = millis();
+    lastNrfAckMs = now;
+    evaluateRoomHeatingIndicator();
+    evaluateBoilerPumpProtection(now);
     sendToNanoAndReadAck();
+    evaluateBoilerPumpProtection(now);
     lcd.update(state.currentTemp, state.targetTemp, state.kazan,
-               state.heatingOn, state.mode, state.nrf24Ok);
+               state.pumpOn, state.mode, state.nrf24Ok);
 
-    // WiFi + HiveMQ Cloud TLS (nem-blokkoló indítás)
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    lastWifiTryMs = millis();
+    lastWifiTryMs = now;
 
-    // HiveMQ Cloud TLS (éles rendszerben érdemes beágyazott Root CA tanúsítvánnyal használni)
     wifiSecureClient.setInsecure();
     wifiSecureClient.setTimeout(3);
 
     mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-    mqtt.setBufferSize(1024);
+    mqtt.setBufferSize(1536);
     mqtt.setCallback(mqttCallback);
 }
 
@@ -522,31 +635,35 @@ void loop() {
     uint32_t now = millis();
 
     // 1. Encoder és gomb események azonnali feldolgozása
-    handleEncoderEvents();
+    handleEncoderEvents(now);
 
-    // 2. LM35 szobai hőmérséklet mérés és hiszterézis szabályozás
+    // 2. LM35 szobai hőmérséklet mérés és szobafűtés-jelzés frissítése
     if (now - lastLm35Ms >= LM35_READ_INTERVAL_MS) {
         lastLm35Ms = now;
         float prevTemp = state.currentTemp;
-        bool prevHeat = state.heatingOn;
+        bool prevHeat  = state.heatingOn;
+        bool prevPump  = state.pumpOn;
 
         state.currentTemp = readRoomTempLM35();
-        evaluateControlLogic();
+        evaluateRoomHeatingIndicator();
+        bool modeRestored = evaluateBoilerPumpProtection(now);
 
         lcd.update(state.currentTemp, state.targetTemp, state.kazan,
-                   state.heatingOn, state.mode, state.nrf24Ok);
+                   state.pumpOn, state.mode, state.nrf24Ok);
 
-        if (prevHeat != state.heatingOn || fabsf(prevTemp - state.currentTemp) >= 0.2f) {
+        if (modeRestored || prevHeat != state.heatingOn || prevPump != state.pumpOn ||
+            fabsf(prevTemp - state.currentTemp) >= 0.2f) {
             sendToNanoAndReadAck();
             publishMqttStatus();
         }
     }
 
-    // 3. NRF24 ping 2 másodpercenként + 10 mp timeout ellenőrzés
+    // 3. NRF24 ping 2 másodpercenként + 10 mp timeout + kazánvédelem újraszámolás
     if (now - lastNrfPingMs >= NRF_PING_INTERVAL_MS) {
         lastNrfPingMs = now;
-        bool prevNrfOk = state.nrf24Ok;
-        bool prevHeat  = state.heatingOn;
+        bool prevNrfOk     = state.nrf24Ok;
+        bool prevPump      = state.pumpOn;
+        uint8_t prevPState = state.pumpState;
 
         sendToNanoAndReadAck();
 
@@ -555,10 +672,17 @@ void loop() {
             Serial.println(F("[ESP] FIGYELEM: NRF24 timeout (>10mp)!"));
         }
 
-        lcd.update(state.currentTemp, state.targetTemp, state.kazan,
-                   state.heatingOn, state.mode, state.nrf24Ok);
+        bool modeRestored = evaluateBoilerPumpProtection(now);
 
-        if (prevNrfOk != state.nrf24Ok || prevHeat != state.heatingOn) {
+        if (prevPump != state.pumpOn) {
+            sendToNanoAndReadAck();
+        }
+
+        lcd.update(state.currentTemp, state.targetTemp, state.kazan,
+                   state.pumpOn, state.mode, state.nrf24Ok);
+
+        if (modeRestored || prevNrfOk != state.nrf24Ok ||
+            prevPump != state.pumpOn || prevPState != state.pumpState) {
             publishMqttStatus();
         }
     }

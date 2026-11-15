@@ -7,17 +7,16 @@
 #include "config.h"
 
 // ============================================================================
-// 2x20 I2C LCD KEZELŐ (0x27)
+// 2x20 I2C LCD KEZELŐ (0x27) - V4
 // ============================================================================
 // 1. sor (20 kar): "Szoba 20.8C Cel21.5C"
-// 2. sor (20 kar): "Kaz 52C Futes: BE  A"  vagy hiba esetén: "NRF HIBA!"
+// 2. sor (20 kar): "Kaz 52C Sziv: BE   A"  vagy hiba esetén: "NRF HIBA!"
 
 class HeatingLcd {
 public:
     HeatingLcd() : _lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS) {}
 
     void begin() {
-        Wire.setPins(PIN_I2C_SDA, PIN_I2C_SCL);
         Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
         _lcd.init();
         _lcd.backlight();
@@ -27,11 +26,11 @@ public:
     }
 
     void update(float roomTemp, float targetTemp, float boilerTemp,
-                bool heatingOn, uint8_t mode, bool nrfOk) {
+                bool pumpOn, uint8_t mode, bool nrfOk) {
         char line1[LCD_COLS + 1];
         char line2[LCD_COLS + 1];
 
-        // --- 1. sor formázása (pontosan 20 karakter) ---
+        // --- 1. sor ---
         char roomStr[8];
         if (isnan(roomTemp)) {
             snprintf(roomStr, sizeof(roomStr), "--.-");
@@ -43,13 +42,13 @@ public:
         snprintf(rawLine1, sizeof(rawLine1), "Szoba %sC Cel%4.1fC", roomStr, targetTemp);
         formatFixed20(rawLine1, line1);
 
-        // --- 2. sor formázása (pontosan 20 karakter) ---
+        // --- 2. sor ---
         char rawLine2[32];
         if (!nrfOk) {
             snprintf(rawLine2, sizeof(rawLine2), "NRF HIBA!");
         } else {
             char kazStr[6];
-            if (isnan(boilerTemp)) {
+            if (isnan(boilerTemp) || boilerTemp <= -120.0f) {
                 snprintf(kazStr, sizeof(kazStr), "--");
             } else {
                 snprintf(kazStr, sizeof(kazStr), "%d", static_cast<int>(lroundf(boilerTemp)));
@@ -59,14 +58,13 @@ public:
             if (mode == 1) modeChar = 'M';
             else if (mode == 2) modeChar = 'O';
 
-            snprintf(rawLine2, sizeof(rawLine2), "Kaz %sC Futes:%s %c",
+            snprintf(rawLine2, sizeof(rawLine2), "Kaz %sC Sziv: %s  %c",
                      kazStr,
-                     heatingOn ? "BE" : "KI",
+                     pumpOn ? "BE" : "KI",
                      modeChar);
         }
         formatFixed20(rawLine2, line2);
 
-        // Csak változás esetén írjuk felül a sort (villódzásmentes)
         if (strncmp(line1, _lastLine1, LCD_COLS) != 0) {
             _lcd.setCursor(0, 0);
             _lcd.print(line1);
