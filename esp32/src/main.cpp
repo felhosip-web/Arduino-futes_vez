@@ -4,82 +4,36 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <RF24.h>
 #include <math.h>
 
 #include "config.h"
 #include "lcd.h"
+#include "menu.h"
 #include "../../nano/src/common.h"
 
 // ============================================================================
-// ESP32-C3 - SZOBA OLDALI MASTER / GATEWAY (V5 MASTER-SLAVE PROTOKOLL)
+// ESP32-C3 - SZOBA OLDALI MASTER / GATEWAY (V5 PROTOKOLL + MENÜ + NVS)
 // ============================================================================
 // - Master -> Slave REQUEST (0xA1) növekvő seq-el, majd max 500ms várakozás
 //   Slave -> Master RESPONSE (0xB2) csomagra, max 3 próbával, AckPayload KI.
-// - Seq ellenőrzés: nem egyező seq-ű RESPONSE eldobása.
-// - 3 egymás utáni sikertelen ping ciklus -> nrf24_ok = false, alarmState nrf_fail.
-// - Heartbeat intervallum: 5, 10, 15, 20, 25, 30 mp (alap: 5 mp).
-// - Szivattyú kazánvédelmi állapotgép + szobai hiszterézis + riasztás + LCD + MQTT.
+// - 2x20 I2C LCD menürendszer interrupt alapú rotary encoderrel (delay nélkül).
+// - Preferences (NVS, "futes" namespace) tartós tárolás + 3 mp gyári reset.
 // ============================================================================
 
 SPIClass spiNrf(FSPI);
 RF24 radio(PIN_NRF_CE, PIN_NRF_CSN);
 HeatingLcd lcd;
+MenuController menu;
+Preferences prefs;
 
 WiFiClientSecure wifiSecureClient;
 PubSubClient mqtt(wifiSecureClient);
 
-struct SystemState {
-    // Szobatermosztát (LM35 + encoder, külön a szivattyútól)
-    float   currentTemp   = 20.0f;
-    float   targetTemp    = TARGET_TEMP_DEFAULT;
-    bool    heatingOn     = false;
-    uint8_t mode          = MODE_AUTO;
-    bool    manualHeating = false;
+SystemState state;
 
-    // Kimenetek (bit0 a kazánvédelmi állapotgéphez kötött)
-    uint8_t outputsMask   = 0;
-    bool    userLedPiros  = false;
-
-    // Nano felől érkező adatok (-127.0f ha szenzorhiba)
-    float            eloremeno              = SENSOR_DISCONNECTED_VAL;
-    float            visszatero             = SENSOR_DISCONNECTED_VAL;
-    float            kazan                  = SENSOR_DISCONNECTED_VAL;
-    float            kulteri                = SENSOR_DISCONNECTED_VAL;
-    uint8_t          kazanStatus[8]         = { 0 };
-    uint32_t         nanoCounter            = 0;
-    uint8_t          sensorValidMask        = 0;
-    AlarmStatePacked nanoAlarmState         = { 0, ALARM_REASON_NONE };
-    bool             nrf24Ok                = false;
-    uint8_t          consecutiveMissedPings = 0;
-
-    // V5 Master-Slave életjel protokoll
-    uint8_t  heartbeatIntervalSec = HEARTBEAT_DEFAULT_SEC;
-    uint32_t txSeq                = 0;
-
-    // Kazánvédelem (szivattyú állapotgép)
-    PumpConfigPacked pumpConfig = {
-        PUMP_MODE_AUTO,
-        PUMP_START_TEMP_DEFAULT,
-        PUMP_STOP_TEMP_DEFAULT,
-        PUMP_SENSOR_KAZAN
-    };
-    uint8_t  pumpState         = PUMP_STATE_VARAKOZAS;
-    bool     pumpOn            = false;
-    uint32_t manualOffStartMs  = 0;
-    bool     safetyOverheat    = false;
-    bool     safetySensorFault = false;
-
-    // Riasztási konfiguráció és egyesített állapot
-    AlarmConfigPacked alarmConfig = {
-        ALARM_OVERHEAT_TEMP_DEFAULT,
-        ALARM_ENABLED_DEFAULT ? 1 : 0
-    };
-    AlarmStatePacked alarmState = {
-        0,
-        ALARM_REASON_NONE
-    };
-} state;
+constexpr const char* NVS_NAMESPACE = "futes";
 
 // --- Időzítők ---
 uint32_t lastLm35Ms       = 0;
@@ -90,12 +44,21 @@ uint32_t lastMqttTryMs    = 0;
 uint32_t lastAlarmBlinkMs = 0;
 bool     alarmBlinkOn     = false;
 
-// --- Rotary Encoder ISR állapot (Gray-kód tábla + debounce) ---
+// --- Rotary Encoder + Gomb ISR állapot (Gray-kód tábla + szoftveres debounce) ---
 volatile int8_t   encStepAccum    = 0;
 volatile uint8_t  encPrevState    = 0;
-volatile bool     btnPressedEvent = false;
-volatile uint32_t lastBtnIsrMs    = 0;
 volatile int8_t   encQuarterAccum = 0;
+
+volatile bool     isrBtnEdgePending = false;
+volatile bool     isrBtnLevelLow    = false;
+volatile uint32_t isrBtnEdgeMs      = 0;
+
+// Gomb lenyomási idő állapotgép (nem-blokkoló)
+bool     btnIsDown           = false;
+uint32_t btnDownStartMs      = 0;
+bool     btnLongFired        = false;
+bool     btnFactoryFired     = false;
+uint32_t lastBtnPollGuardMs  = 0;
 
 static const int8_t QEM_TABLE[16] = {
      0, -1,  1,  0,
@@ -126,11 +89,10 @@ void IRAM_ATTR isrEncoderRotate() {
 
 void IRAM_ATTR isrEncoderButton() {
     uint32_t now = millis();
-    if (now - lastBtnIsrMs >= BTN_DEBOUNCE_MS) {
-        if (digitalRead(PIN_ENC_SW) == LOW) {
-            btnPressedEvent = true;
-            lastBtnIsrMs = now;
-        }
+    if (now - isrBtnEdgeMs >= BTN_DEBOUNCE_MS) {
+        isrBtnLevelLow    = (digitalRead(PIN_ENC_SW) == LOW);
+        isrBtnEdgeMs      = now;
+        isrBtnEdgePending = true;
     }
 }
 
@@ -242,6 +204,103 @@ bool isValidHeartbeatInterval(int val) {
 }
 
 // ============================================================================
+// PREFERENCES (NVS) TARTÓS MENTÉS ÉS BETÖLTÉS (namespace: "futes")
+// ============================================================================
+void applyDefaultSettings() {
+    state.targetTemp                 = TARGET_TEMP_DEFAULT; // 21.5
+    state.mode                       = MODE_AUTO;
+    state.manualHeating              = false;
+    state.pumpConfig.pumpMode        = PUMP_MODE_AUTO;
+    state.pumpConfig.pumpStartTemp   = PUMP_START_TEMP_DEFAULT; // 40.0
+    state.pumpConfig.pumpStopTemp    = PUMP_STOP_TEMP_DEFAULT;  // 30.0
+    state.pumpConfig.pumpStartSensor = PUMP_SENSOR_KAZAN;
+    state.alarmConfig.overheatTemp   = ALARM_OVERHEAT_TEMP_DEFAULT; // 85.0
+    state.alarmConfig.alarmEnabled   = ALARM_ENABLED_DEFAULT ? 1 : 0; // true
+    state.heartbeatIntervalSec       = HEARTBEAT_DEFAULT_SEC; // 5
+    state.outputsMask                = 0;
+    state.userLedPiros               = false;
+    state.pumpState                  = PUMP_STATE_VARAKOZAS;
+}
+
+void saveSettingsToNvs() {
+    if (!prefs.begin(NVS_NAMESPACE, false)) {
+        Serial.println(F("[NVS] Hiba a Preferences megnyitasakor (iras)."));
+        return;
+    }
+
+    prefs.putFloat("targetTemp", state.targetTemp);
+    prefs.putUChar("mode", state.mode);
+    prefs.putBool("manualHeating", state.manualHeating);
+    prefs.putUChar("pumpMode", state.pumpConfig.pumpMode);
+    prefs.putFloat("pumpStartTemp", state.pumpConfig.pumpStartTemp);
+    prefs.putFloat("pumpStopTemp", state.pumpConfig.pumpStopTemp);
+    prefs.putUChar("pumpSensor", state.pumpConfig.pumpStartSensor);
+    prefs.putFloat("overheatTemp", state.alarmConfig.overheatTemp);
+    prefs.putBool("alarmEnabled", state.alarmConfig.alarmEnabled != 0);
+    prefs.putUChar("heartbeatSec", state.heartbeatIntervalSec);
+
+    // A szivattyú bitet (OUT_BIT_SZIVATTYU) NEM mentjük el, azt az állapotgép számolja
+    uint8_t savedOutputsMask = state.outputsMask & static_cast<uint8_t>(~(1U << OUT_BIT_SZIVATTYU));
+    setBit(savedOutputsMask, OUT_BIT_LED_PIROS, state.userLedPiros);
+    prefs.putUChar("outputsMask", savedOutputsMask);
+
+    prefs.end();
+}
+
+void loadSettingsFromNvs() {
+    applyDefaultSettings();
+
+    if (!prefs.begin(NVS_NAMESPACE, true)) {
+        Serial.println(F("[NVS] Meg nincs mentett beallitas, alapertelmezett ertekek aktivak."));
+        return;
+    }
+
+    float tTemp = prefs.getFloat("targetTemp", TARGET_TEMP_DEFAULT);
+    if (!isnan(tTemp) && tTemp >= TARGET_TEMP_MIN && tTemp <= TARGET_TEMP_MAX) {
+        state.targetTemp = roundf(tTemp * 2.0f) / 2.0f;
+    }
+
+    uint8_t m = prefs.getUChar("mode", MODE_AUTO);
+    state.mode = (m <= MODE_OFF) ? m : MODE_AUTO;
+
+    state.manualHeating = prefs.getBool("manualHeating", false);
+
+    uint8_t pm = prefs.getUChar("pumpMode", PUMP_MODE_AUTO);
+    state.pumpConfig.pumpMode = (pm <= PUMP_MODE_MANUAL_OFF) ? pm : PUMP_MODE_AUTO;
+
+    state.pumpConfig.pumpStartTemp = prefs.getFloat("pumpStartTemp", PUMP_START_TEMP_DEFAULT);
+    state.pumpConfig.pumpStopTemp  = prefs.getFloat("pumpStopTemp", PUMP_STOP_TEMP_DEFAULT);
+
+    uint8_t ps = prefs.getUChar("pumpSensor", PUMP_SENSOR_KAZAN);
+    state.pumpConfig.pumpStartSensor = (ps <= PUMP_SENSOR_MAX) ? ps : PUMP_SENSOR_KAZAN;
+    sanitizePumpConfig(state.pumpConfig);
+
+    state.alarmConfig.overheatTemp = prefs.getFloat("overheatTemp", ALARM_OVERHEAT_TEMP_DEFAULT);
+    state.alarmConfig.alarmEnabled = prefs.getBool("alarmEnabled", ALARM_ENABLED_DEFAULT) ? 1 : 0;
+    sanitizeAlarmConfig(state.alarmConfig);
+
+    uint8_t hb = prefs.getUChar("heartbeatSec", HEARTBEAT_DEFAULT_SEC);
+    state.heartbeatIntervalSec = isValidHeartbeatInterval(hb) ? hb : HEARTBEAT_DEFAULT_SEC;
+
+    uint8_t loadedMask = prefs.getUChar("outputsMask", 0);
+    setBit(loadedMask, OUT_BIT_SZIVATTYU, false);
+    state.outputsMask  = loadedMask;
+    state.userLedPiros = getBit(loadedMask, OUT_BIT_LED_PIROS);
+
+    prefs.end();
+    Serial.println(F("[NVS] Beallitasok betoltve a Preferences-bol."));
+}
+
+void clearNvsAndResetDefaults() {
+    if (prefs.begin(NVS_NAMESPACE, false)) {
+        prefs.clear();
+        prefs.end();
+    }
+    applyDefaultSettings();
+    Serial.println(F("[NVS] Gyari visszaallitas: Preferences torolve, alapertelmezesek visszaallitva."));
+}
+
+// ============================================================================
 // LM35 SZOBAI HŐMÉRSÉKLET OLVASÁSA (10 MÉRÉS ÁTLAGA)
 // ============================================================================
 float readRoomTempLM35() {
@@ -255,7 +314,7 @@ float readRoomTempLM35() {
 }
 
 // ============================================================================
-// SZOBAFŰTÉS HISZTERÉZIS (CSAK JELZÉS A FRONTENDNEK)
+// SZOBAFŰTÉS HISZTERÉZIS (CSAK JELZÉS A FRONTENDNEK ÉS STATUS MENÜNEK)
 // ============================================================================
 void evaluateRoomHeatingIndicator() {
     if (state.mode == MODE_OFF) {
@@ -380,13 +439,12 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
     evaluateAlarmState();
 
     setBit(state.outputsMask, OUT_BIT_SZIVATTYU, state.pumpOn);
-    setBit(state.outputsMask, OUT_BIT_LED_ZOLD,  state.pumpOn);
 
-    if (state.alarmConfig.alarmEnabled == 0) {
-        setBit(state.outputsMask, OUT_BIT_LED_PIROS, false);
+    // Piros LED: riasztás alatt a riasztás vezérli, riasztásmentes állapotban a kézi userLedPiros érvényesül
+    if (state.alarmConfig.alarmEnabled != 0 && state.alarmState.active != 0) {
+        setBit(state.outputsMask, OUT_BIT_LED_PIROS, true);
     } else {
-        setBit(state.outputsMask, OUT_BIT_LED_PIROS,
-               (state.alarmState.active != 0) || state.userLedPiros);
+        setBit(state.outputsMask, OUT_BIT_LED_PIROS, state.userLedPiros);
     }
 
     return modeAutoRestored;
@@ -402,17 +460,8 @@ void updateAlarmBlinkAndLed(uint32_t now) {
     if (now - lastAlarmBlinkMs >= ALARM_BLINK_INTERVAL_MS) {
         lastAlarmBlinkMs = now;
         alarmBlinkOn = !alarmBlinkOn;
-        lcd.update(state.currentTemp, state.targetTemp, state.kazan,
-                   state.pumpOn, state.mode, state.nrf24Ok,
-                   true, state.alarmState.reason, alarmBlinkOn);
     }
     digitalWrite(PIN_ALARM_LED, alarmBlinkOn ? HIGH : LOW);
-}
-
-void refreshLcd() {
-    lcd.update(state.currentTemp, state.targetTemp, state.kazan,
-               state.pumpOn, state.mode, state.nrf24Ok,
-               state.alarmState.active != 0, state.alarmState.reason, alarmBlinkOn);
 }
 
 // ============================================================================
@@ -471,7 +520,6 @@ bool sendRequestToNano() {
                     }
                     return true;
                 }
-                // Nem egyező seq vagy típus esetén eldobjuk és várunk tovább az ablakon belül
             }
             delay(1);
         }
@@ -579,6 +627,40 @@ void publishMqttTelemetry() {
 }
 
 // ============================================================================
+// MENÜ CALLBACK-EK (AZONNALI MENTÉS + NRF REQUEST + MQTT STATUS)
+// ============================================================================
+void onMenuSettingCommitted() {
+    uint32_t now = millis();
+    evaluateRoomHeatingIndicator();
+    evaluateBoilerPumpProtection(now);
+    updateAlarmBlinkAndLed(now);
+    saveSettingsToNvs();
+
+    sendRequestToNano();
+    lastHeartbeatMs = millis();
+    evaluateBoilerPumpProtection(lastHeartbeatMs);
+    updateAlarmBlinkAndLed(lastHeartbeatMs);
+
+    publishMqttStatus();
+    menu.requestRedraw();
+}
+
+void onMenuFactoryReset() {
+    uint32_t now = millis();
+    clearNvsAndResetDefaults();
+    evaluateRoomHeatingIndicator();
+    evaluateBoilerPumpProtection(now);
+    updateAlarmBlinkAndLed(now);
+
+    sendRequestToNano();
+    lastHeartbeatMs = millis();
+    evaluateBoilerPumpProtection(lastHeartbeatMs);
+    updateAlarmBlinkAndLed(lastHeartbeatMs);
+
+    publishMqttStatus();
+}
+
+// ============================================================================
 // MQTT CMD FELDOLGOZÁS (Frontend -> ESP)
 // ============================================================================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -664,11 +746,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     evaluateRoomHeatingIndicator();
     evaluateBoilerPumpProtection(now);
     updateAlarmBlinkAndLed(now);
+    saveSettingsToNvs();
+
     sendRequestToNano();
     lastHeartbeatMs = millis();
     evaluateBoilerPumpProtection(lastHeartbeatMs);
     updateAlarmBlinkAndLed(lastHeartbeatMs);
-    refreshLcd();
+
+    // Ha nincs éppen MENU_EDIT szerkesztésben, a menü azonnal átveszi a friss értékeket
+    if (!menu.isEditing()) {
+        menu.requestRedraw();
+    }
     publishMqttStatus();
 }
 
@@ -707,48 +795,82 @@ void maintainConnectivity(uint32_t now) {
 }
 
 // ============================================================================
-// ENCODER ÉS NYOMÓGOMB KEZELÉS
+// ENCODER ÉS NYOMÓGOMB ESEMÉNYEK FELDOLGOZÁSA (INTERRUPT + DEBOUNCE, DELAY NÉLKÜL)
 // ============================================================================
-void handleEncoderEvents(uint32_t now) {
-    int8_t steps = 0;
-    bool btnClicked = false;
+void processEncoderAndButton(uint32_t now) {
+    int8_t steps        = 0;
+    bool   edgePending  = false;
+    bool   edgeLow      = false;
+    uint32_t edgeMs     = 0;
 
     noInterrupts();
     if (encStepAccum != 0) {
         steps = encStepAccum;
         encStepAccum = 0;
     }
-    if (btnPressedEvent) {
-        btnClicked = true;
-        btnPressedEvent = false;
+    if (isrBtnEdgePending) {
+        edgePending       = true;
+        edgeLow           = isrBtnLevelLow;
+        edgeMs            = isrBtnEdgeMs;
+        isrBtnEdgePending = false;
     }
     interrupts();
 
-    bool changed = false;
+    bool shortPress   = false;
+    bool longPress    = false;
+    bool factoryPress = false;
 
-    if (steps != 0) {
-        float nextTarget = state.targetTemp + (static_cast<float>(steps) * TARGET_TEMP_STEP);
-        if (nextTarget < TARGET_TEMP_MIN) nextTarget = TARGET_TEMP_MIN;
-        if (nextTarget > TARGET_TEMP_MAX) nextTarget = TARGET_TEMP_MAX;
-        if (fabsf(nextTarget - state.targetTemp) >= 0.01f) {
-            state.targetTemp = nextTarget;
-            changed = true;
+    if (edgePending) {
+        if (edgeLow && !btnIsDown) {
+            btnIsDown       = true;
+            btnDownStartMs  = edgeMs;
+            btnLongFired    = false;
+            btnFactoryFired = false;
+        } else if (!edgeLow && btnIsDown) {
+            uint32_t heldMs = edgeMs - btnDownStartMs;
+            if (!btnLongFired && !btnFactoryFired) {
+                if (heldMs < SHORT_PRESS_MAX_MS) {
+                    shortPress = true;
+                } else if (heldMs >= LONG_PRESS_MS) {
+                    longPress = true;
+                }
+            }
+            btnIsDown = false;
         }
     }
 
-    if (btnClicked) {
-        state.mode = (state.mode + 1) % 3; // AUTO -> MANUAL -> OFF -> AUTO
-        changed = true;
+    // Folyamatos nyomva tartás kezelése (hosszú nyomás >1000ms vagy 3mp gyári visszaállítás)
+    if (btnIsDown) {
+        // Védelem esetleges elmaradt felfutó él ellen
+        if (digitalRead(PIN_ENC_SW) == HIGH && (now - lastBtnPollGuardMs >= BTN_DEBOUNCE_MS)) {
+            uint32_t heldMs = now - btnDownStartMs;
+            if (!btnLongFired && !btnFactoryFired) {
+                if (heldMs < SHORT_PRESS_MAX_MS) {
+                    shortPress = true;
+                } else if (heldMs >= LONG_PRESS_MS) {
+                    longPress = true;
+                }
+            }
+            btnIsDown = false;
+        } else {
+            lastBtnPollGuardMs = now;
+            uint32_t heldMs = now - btnDownStartMs;
+            if (menu.isOnFactoryResetItem()) {
+                if (!btnFactoryFired && heldMs >= FACTORY_RESET_HOLD_MS) {
+                    btnFactoryFired = true;
+                    factoryPress    = true;
+                }
+            } else {
+                if (!btnLongFired && heldMs >= LONG_PRESS_MS) {
+                    btnLongFired = true;
+                    longPress    = true;
+                }
+            }
+        }
     }
 
-    if (changed) {
-        evaluateRoomHeatingIndicator();
-        evaluateBoilerPumpProtection(now);
-        sendRequestToNano();
-        lastHeartbeatMs = millis();
-        evaluateBoilerPumpProtection(lastHeartbeatMs);
-        refreshLcd();
-        publishMqttStatus();
+    if (steps != 0 || shortPress || longPress || factoryPress) {
+        menu.handleInput(steps, shortPress, longPress, factoryPress, now);
     }
 }
 
@@ -758,10 +880,12 @@ void handleEncoderEvents(uint32_t now) {
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println(F("\n[ESP32-C3 V5] Master / Gateway inditas..."));
+    Serial.println(F("\n[ESP32-C3 V5] Master / Gateway + Menu inditas..."));
 
     pinMode(PIN_ALARM_LED, OUTPUT);
     digitalWrite(PIN_ALARM_LED, LOW);
+
+    loadSettingsFromNvs();
 
     analogReadResolution(12);
     analogSetPinAttenuation(PIN_LM35, ADC_11db);
@@ -774,9 +898,10 @@ void setup() {
                     static_cast<uint8_t>(digitalRead(PIN_ENC_DT));
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_CLK), isrEncoderRotate, CHANGE);
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_DT),  isrEncoderRotate, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(PIN_ENC_SW),  isrEncoderButton, FALLING);
+    attachInterrupt(digitalPinToInterrupt(PIN_ENC_SW),  isrEncoderButton, CHANGE);
 
     lcd.begin();
+    menu.begin(&lcd, &state, { onMenuSettingCommitted, onMenuFactoryReset });
 
     spiNrf.begin(PIN_NRF_SCK, PIN_NRF_MISO, PIN_NRF_MOSI, PIN_NRF_CSN);
     if (!radio.begin(&spiNrf)) {
@@ -803,7 +928,10 @@ void setup() {
     lastHeartbeatMs = millis();
     evaluateBoilerPumpProtection(lastHeartbeatMs);
     updateAlarmBlinkAndLed(lastHeartbeatMs);
-    refreshLcd();
+    lcd.setStatusIcons(state.pumpOn, state.nrf24Ok, false);
+    menu.requestRedraw();
+    menu.update(lastHeartbeatMs, alarmBlinkOn);
+    lcd.refresh(lastHeartbeatMs);
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
@@ -821,13 +949,13 @@ void setup() {
 void loop() {
     uint32_t now = millis();
 
-    // 0. Nem-blokkoló 500ms riasztási villogás (GPIO 11 + LCD)
+    // 0. Nem-blokkoló 500ms riasztási LED villogás
     updateAlarmBlinkAndLed(now);
 
-    // 1. Encoder és gomb események
-    handleEncoderEvents(now);
+    // 1. Encoder és gomb események feldolgozása (interrupt + debounce)
+    processEncoderAndButton(now);
 
-    // 2. LM35 szobahő mérés és szobafűtés-jelzés
+    // 2. LM35 szobahő mérés és szobafűtés-jelzés (1 mp-enként)
     if (now - lastLm35Ms >= LM35_READ_INTERVAL_MS) {
         lastLm35Ms = now;
         float prevTemp = state.currentTemp;
@@ -837,8 +965,6 @@ void loop() {
         state.currentTemp = readRoomTempLM35();
         evaluateRoomHeatingIndicator();
         bool modeRestored = evaluateBoilerPumpProtection(now);
-
-        refreshLcd();
 
         if (modeRestored || prevHeat != state.heatingOn || prevPump != state.pumpOn ||
             fabsf(prevTemp - state.currentTemp) >= 0.2f) {
@@ -864,11 +990,8 @@ void loop() {
         bool modeRestored = evaluateBoilerPumpProtection(millis());
 
         if (prevPump != state.pumpOn) {
-            // Ha a friss hőmérsékletek alapján változott a szivattyú állapot, azonnal szinkronizáljuk
             sendRequestToNano();
         }
-
-        refreshLcd();
 
         if (modeRestored || prevNrfOk != state.nrf24Ok ||
             prevPump != state.pumpOn || prevPState != state.pumpState ||
@@ -877,10 +1000,16 @@ void loop() {
         }
     }
 
-    // 4. WiFi és HiveMQ Cloud MQTT karbantartás
+    // 4. Nem-blokkoló LCD és menü frissítés (ikonok + 100ms-es millis() ciklus)
+    bool wifiMqttOk = (WiFi.status() == WL_CONNECTED) && mqtt.connected();
+    lcd.setStatusIcons(state.pumpOn, state.nrf24Ok, wifiMqttOk);
+    menu.update(now, alarmBlinkOn);
+    lcd.refresh(now);
+
+    // 5. WiFi és HiveMQ Cloud MQTT karbantartás
     maintainConnectivity(now);
 
-    // 5. Telemetry 30 másodpercenként
+    // 6. Telemetry 30 másodpercenként
     if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
         lastTelemetryMs = now;
         publishMqttTelemetry();

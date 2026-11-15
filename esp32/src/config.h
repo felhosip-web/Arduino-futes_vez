@@ -43,6 +43,19 @@ constexpr uint8_t PIN_NRF_MISO  = 3;
 constexpr uint8_t PIN_NRF_SCK   = 4;
 constexpr uint8_t PIN_NRF_MOSI  = 10;
 
+// --- Encoder és Menü beállítások ---
+// Állítsd 1-re, ha az encoder forgási iránya fordított a hardvereden
+#define ENCODER_REVERSE 0
+
+constexpr uint32_t MENU_TIMEOUT_MS        = 20000UL; // 20 mp tétlenség -> vissza a főképernyőre
+constexpr uint32_t LONG_PRESS_MS          = 1000UL;  // >1000ms -> vissza egy szintet / kilépés
+constexpr uint32_t SHORT_PRESS_MAX_MS     = 800UL;   // <800ms  -> belépés / jóváhagyás
+constexpr uint32_t FACTORY_RESET_HOLD_MS  = 3000UL;  // 3 mp hosszú nyomás -> gyári visszaállítás
+constexpr uint32_t FACTORY_BANNER_MS      = 2000UL;  // 2 mp "GYARI BEALLITAS!" üzenet
+constexpr uint32_t LCD_MAIN_REFRESH_MS    = 1000UL;  // Főképernyő 1 mp-es frissítés
+constexpr uint32_t LCD_MENU_REFRESH_MS    = 100UL;   // Menü 100 ms-es frissítés (ha változott)
+constexpr uint32_t EDIT_BLINK_INTERVAL_MS = 500UL;   // Szerkesztés közbeni < > villogás
+
 // --- LM35 Kalibráció és szobai hiszterézis ---
 constexpr float   LM35_OFFSET         = 0.0f;
 constexpr uint8_t LM35_SAMPLE_COUNT   = 10;
@@ -83,4 +96,4 @@ constexpr uint32_t TELEMETRY_INTERVAL_MS  = 30000UL; // 30 mp-enként telemetry
 constexpr uint32_t LM35_READ_INTERVAL_MS  = 1000UL;  // 1 mp-enként szobahő mérés
 constexpr uint32_t WIFI_RECONNECT_MS      = 10000UL; // 10 mp nem-blokkoló WiFi retry
 constexpr uint32_t MQTT_RECONNECT_MS      = 5000UL;  // 5 mp nem-blokkoló MQTT retry
-constexpr uint32_t BTN_DEBOUNCE_MS        = 60UL;
+constexpr uint32_t BTN_DEBOUNCE_MS        = 50UL;
