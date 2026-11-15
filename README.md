@@ -356,10 +356,17 @@ FŐKÉPERNYŐ
 1. Hozz létre egy **HiveMQ Cloud** klasztert (a **Serverless / Free tier** csomag tökéletesen elegendő).
 2. A klaszteren belül az **Access Management** menüpontban hozz létre egy új felhasználót és jelszót (pl. külön vagy közös hitelesítéssel az ESP32 és a backend számára).
 3. A klaszter **URL-jét (Host)**, a **`8883` TLS portot**, valamint a felhasználónevet és jelszót írd be az `esp32/src/config.h` fájlba:
-   - `WIFI_SSID` és `WIFI_PASSWORD` (a projektben `WIFI_PASS` / `WIFI_PASSWORD`)
-   - `MQTT_BROKER` (cluster URL, `MQTT_HOST`), `MQTT_PORT` (`8883`), `MQTT_USER`, `MQTT_PASSWORD` (`MQTT_PASS`)
+   - `MQTT_BROKER` (cluster URL), `MQTT_PORT` (`8883`), `MQTT_USER` és `MQTT_PASSWORD`
 4. A backend gyökérkönyvtárában hozd létre a `.env` fájlt az `.env.example` alapján, és add meg ugyanazt a HiveMQ `MQTT_HOST`, `MQTT_PORT=8883`, `MQTT_USER` és `MQTT_PASS` értéket.
-5. **Biztonsági figyelmeztetés:** A jelszavakat és WiFi/MQTT hitelesítő adatokat **SOHA ne commitold Git-be!** A backendhez használd a `.gitignore`-ban szereplő `.env` fájlt, az ESP32 `esp32/src/config.h` fájlját pedig tartsd helyben (vedd fel `.gitignore`-ba vagy használj `config.h.example` sablont).
+5. **Biztonsági figyelmeztetés:** A jelszavakat és MQTT hitelesítő adatokat **SOHA ne commitold Git-be!** A backendhez használd a `.gitignore`-ban szereplő `.env` fájlt. A Wi-Fi SSID-t és jelszót az ESP32 első indításkor a saját beállító hálózatán kéri el, majd NVS-ben tárolja.
+
+### ESP32 Wi-Fi beállítása
+
+1. Első indításkor nyisd meg a Serial Monitort (`115200` baud), és a megjelenő jelszóval csatlakozz a **`Futes-ESP32-Setup`** Wi-Fi hálózathoz.
+2. Nyisd meg a **http://192.168.4.1** címet, add meg az otthoni Wi-Fi hálózat SSID-jét és jelszavát, majd mentsd el.
+3. Sikeres csatlakozáskor a beállító hálózat leáll, a hitelesítő adatok pedig NVS-ben maradnak. Ha a hálózat 30 másodperc alatt nem érhető el, a portálon hibaüzenet jelenik meg, és újra megadhatod az adatokat.
+
+A beállító hozzáférési pont eszközönként egyedi WPA2 jelszót használ, amelyet a soros monitor ír ki; ezt kezeld bizalmasan. A beállítás közben az ESP32 fűtésvezérlő főciklusa tovább fut.
 
 ---
 
@@ -378,11 +385,11 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
    pio run -d nano -t upload
    ```
    Nyisd meg a Serial Monitort (`115200` baud), küldj egy **`a`** karaktert, ellenőrizd a 4 db DS18B20 `DeviceAddress` címét, és ha még a placeholder címek vannak benne, írd be őket a `nano/src/main.cpp`-be, majd töltsd fel újra.
-3. **ESP32-C3 feltöltése**:
+3. **ESP32-C3 feltöltése és Wi-Fi beállítása**:
    ```bash
    pio run -d esp32 -t upload
    ```
-   Ellenőrizd a Serial Monitoron, hogy a WiFi és a HiveMQ Cloud MQTT kapcsolat rendben feláll (`SIKERES!`).
+   Első indításkor állítsd be a Wi-Fi-t a fenti beállító oldalon. Ezután ellenőrizd a Serial Monitoron, hogy a HiveMQ Cloud MQTT kapcsolat rendben feláll (`SIKERES!`).
 4. **Frontend indítása**:
    Fejlesztői módban az `npm run dev` (Express + Vite middleware a `3000`-es porton) automatikusan kiszolgálja a frontendet; nyisd meg a böngészőben (`http://localhost:3000`).
 5. **Első ellenőrzés**:

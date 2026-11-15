@@ -6,9 +6,8 @@
 // ESP32-C3 KONFIGURÁCIÓ (V5 MASTER / GATEWAY): WIFI, MQTT, PIN-EK, LCD, LM35
 // ============================================================================
 
-// --- WiFi beállítások ---
-constexpr const char* WIFI_SSID      = "YOUR_WIFI_SSID";
-constexpr const char* WIFI_PASSWORD  = "YOUR_WIFI_PASSWORD";
+// --- WiFi beállító hozzáférési pont ---
+constexpr const char* WIFI_SETUP_AP_SSID = "Futes-ESP32-Setup";
 
 // --- HiveMQ Cloud MQTT (TLS 8883) ---
 constexpr const char* MQTT_BROKER    = "your-cluster-id.s1.eu.hivemq.cloud";
@@ -95,5 +94,6 @@ constexpr uint8_t  NRF_MAX_MISSED_CYCLES    = 3;     // 3 egymás utáni sikerte
 constexpr uint32_t TELEMETRY_INTERVAL_MS  = 30000UL; // 30 mp-enként telemetry
 constexpr uint32_t LM35_READ_INTERVAL_MS  = 1000UL;  // 1 mp-enként szobahő mérés
 constexpr uint32_t WIFI_RECONNECT_MS      = 10000UL; // 10 mp nem-blokkoló WiFi retry
+constexpr uint32_t WIFI_PORTAL_TIMEOUT_MS = 30000UL; // 30 mp sikertelen WiFi után beállító portál
 constexpr uint32_t MQTT_RECONNECT_MS      = 5000UL;  // 5 mp nem-blokkoló MQTT retry
 constexpr uint32_t BTN_DEBOUNCE_MS        = 50UL;

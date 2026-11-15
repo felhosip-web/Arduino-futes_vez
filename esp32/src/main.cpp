@@ -1,7 +1,10 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include <WiFiClientSecure.h>
+#include <stdio.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -30,10 +33,15 @@ Preferences prefs;
 
 WiFiClientSecure wifiSecureClient;
 PubSubClient mqtt(wifiSecureClient);
+WebServer wifiPortalServer(80);
+DNSServer wifiPortalDns;
 
 SystemState state;
 
 constexpr const char* NVS_NAMESPACE = "futes";
+constexpr const char* WIFI_NVS_NAMESPACE = "wifi";
+constexpr uint8_t WIFI_DNS_PORT = 53;
+constexpr const char* WIFI_PORTAL_IP = "192.168.4.1";
 
 // --- Időzítők ---
 uint32_t lastLm35Ms       = 0;
@@ -42,7 +50,15 @@ uint32_t lastTelemetryMs  = 0;
 uint32_t lastWifiTryMs    = 0;
 uint32_t lastMqttTryMs    = 0;
 uint32_t lastAlarmBlinkMs = 0;
+uint32_t wifiDisconnectStartedMs = 0;
+uint32_t lastWifiPortalTryMs = 0;
 bool     alarmBlinkOn     = false;
+bool     wifiPortalActive = false;
+bool     wifiDisconnectTimerActive = false;
+bool     wifiConnectionFailureReported = false;
+String   wifiSsid;
+String   wifiPassword;
+const char* wifiPortalMessage = "Válaszd ki az otthoni Wi-Fi hálózatot.";
 
 // --- Rotary Encoder + Gomb ISR állapot (Gray-kód tábla + szoftveres debounce) ---
 volatile int8_t   encStepAccum    = 0;
@@ -763,15 +779,178 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // ============================================================================
 // NEM-BLOKKOLÓ WIFI ÉS MQTT KAPCSOLATKEZELÉS
 // ============================================================================
+void sendWifiPortalPage(const char* message, uint16_t statusCode = 200) {
+    String page = F(
+        "<!doctype html><html lang=\"hu\"><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>Fűtésvezérlő Wi-Fi</title>"
+        "<style>body{font:16px sans-serif;max-width:28rem;margin:3rem auto;padding:0 1rem}"
+        "input,button{box-sizing:border-box;width:100%;padding:.75rem;margin:.4rem 0}"
+        "button{cursor:pointer}</style><h1>Wi-Fi beállítás</h1><p>"
+    );
+    page += message;
+    page += F(
+        "</p><form method=\"post\" action=\"/save\">"
+        "<label>Hálózat neve (SSID)<input name=\"ssid\" maxlength=\"32\" required></label>"
+        "<label>Wi-Fi jelszó<input name=\"password\" type=\"password\" maxlength=\"64\" "
+        "autocomplete=\"current-password\"></label>"
+        "<button type=\"submit\">Mentés és csatlakozás</button></form></html>"
+    );
+    wifiPortalServer.send(statusCode, "text/html; charset=utf-8", page);
+}
+
+void handleWifiPortalRoot() {
+    sendWifiPortalPage(wifiPortalMessage);
+}
+
+void handleWifiPortalSave() {
+    if (!wifiPortalServer.hasArg("ssid") || !wifiPortalServer.hasArg("password")) {
+        sendWifiPortalPage("Add meg a hálózat nevét és jelszavát.", 400);
+        return;
+    }
+
+    String ssid = wifiPortalServer.arg("ssid");
+    String password = wifiPortalServer.arg("password");
+    if (ssid.length() == 0 || ssid.length() > 32 ||
+        (password.length() > 0 && password.length() < 8) || password.length() > 63) {
+        sendWifiPortalPage("Érvénytelen adat. Az SSID legfeljebb 32, a jelszó 8–63 karakter lehet (vagy üres nyílt hálózathoz).", 400);
+        return;
+    }
+
+    Preferences wifiPrefs;
+    if (!wifiPrefs.begin(WIFI_NVS_NAMESPACE, false)) {
+        Serial.println(F("[WIFI] Hiba a Wi-Fi adatok NVS-be mentésekor."));
+        sendWifiPortalPage("A Wi-Fi adatok mentése nem sikerült. Próbáld újra.", 500);
+        return;
+    }
+    size_t ssidBytes = wifiPrefs.putString("ssid", ssid);
+    size_t passwordBytes = wifiPrefs.putString("password", password);
+    wifiPrefs.end();
+    bool credentialsStored = ssidBytes > 0 && (password.length() == 0 || passwordBytes > 0);
+    if (credentialsStored) {
+        Preferences verifyPrefs;
+        if (!verifyPrefs.begin(WIFI_NVS_NAMESPACE, true)) {
+            credentialsStored = false;
+        } else {
+            credentialsStored =
+                verifyPrefs.getString("ssid", "") == ssid &&
+                verifyPrefs.getString("password", "") == password;
+            verifyPrefs.end();
+        }
+    }
+    if (!credentialsStored) {
+        Serial.println(F("[WIFI] Hiba a Wi-Fi adatok NVS-be mentésekor."));
+        sendWifiPortalPage("A Wi-Fi adatok mentése nem sikerült. Próbáld újra.", 500);
+        return;
+    }
+
+    wifiSsid = ssid;
+    wifiPassword = password;
+    wifiPortalMessage = "Az adatok elmentve. Csatlakozás folyamatban; ha nem sikerül, add meg újra a hálózatot.";
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+    lastWifiTryMs = millis();
+    wifiDisconnectStartedMs = lastWifiTryMs;
+    wifiDisconnectTimerActive = true;
+    wifiConnectionFailureReported = false;
+    Serial.println(F("[WIFI] Beállítás elmentve; csatlakozás indul."));
+    sendWifiPortalPage(wifiPortalMessage);
+}
+
+void handleWifiPortalNotFound() {
+    wifiPortalServer.sendHeader("Location", String("http://") + WIFI_PORTAL_IP + "/");
+    wifiPortalServer.send(302, "text/plain", "");
+}
+
+void beginWifiPortal(const char* message) {
+    wifiPortalMessage = message;
+    lastWifiPortalTryMs = millis();
+    WiFi.mode(wifiSsid.length() == 0 ? WIFI_AP : WIFI_AP_STA);
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char apPassword[13];
+    snprintf(apPassword, sizeof(apPassword), "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    if (!WiFi.softAP(WIFI_SETUP_AP_SSID, apPassword)) {
+        Serial.println(F("[WIFI] HIBA: a beállító hozzáférési pont nem indítható el."));
+        return;
+    }
+
+    wifiPortalDns.start(WIFI_DNS_PORT, "*", WiFi.softAPIP());
+    wifiPortalServer.begin();
+    wifiPortalActive = true;
+    Serial.print(F("[WIFI] Beállító hálózat: "));
+    Serial.println(WIFI_SETUP_AP_SSID);
+    Serial.print(F("[WIFI] Beállító jelszó: "));
+    Serial.println(apPassword);
+    Serial.print(F("[WIFI] Beállító oldal: http://"));
+    Serial.println(WiFi.softAPIP());
+}
+
+void stopWifiPortal() {
+    wifiPortalDns.stop();
+    wifiPortalServer.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    wifiPortalActive = false;
+    wifiConnectionFailureReported = false;
+    wifiPortalMessage = "Válaszd ki az otthoni Wi-Fi hálózatot.";
+    Serial.println(F("[WIFI] Beállító hozzáférési pont leállítva."));
+}
+
+void loadWifiCredentials() {
+    Preferences wifiPrefs;
+    if (!wifiPrefs.begin(WIFI_NVS_NAMESPACE, true)) {
+        Serial.println(F("[WIFI] A mentett Wi-Fi adatok nem olvashatók."));
+        return;
+    }
+    wifiSsid = wifiPrefs.getString("ssid", "");
+    wifiPassword = wifiPrefs.getString("password", "");
+    wifiPrefs.end();
+}
+
 void maintainConnectivity(uint32_t now) {
+    if (wifiPortalActive) {
+        wifiPortalDns.processNextRequest();
+        wifiPortalServer.handleClient();
+    }
+
     if (WiFi.status() != WL_CONNECTED) {
+        if (wifiSsid.length() == 0) {
+            if (!wifiPortalActive && now - lastWifiPortalTryMs >= WIFI_RECONNECT_MS) {
+                beginWifiPortal("Válaszd ki az otthoni Wi-Fi hálózatot.");
+            }
+            return;
+        }
+
+        if (!wifiDisconnectTimerActive) {
+            wifiDisconnectStartedMs = now;
+            wifiDisconnectTimerActive = true;
+        }
+
+        if (wifiPortalActive && !wifiConnectionFailureReported &&
+            now - wifiDisconnectStartedMs >= WIFI_PORTAL_TIMEOUT_MS) {
+            wifiPortalMessage = "Nem sikerült csatlakozni. Ellenőrizd a hálózatnevet/jelszót, majd próbáld újra.";
+            wifiConnectionFailureReported = true;
+        }
+
+        if (!wifiPortalActive &&
+            now - wifiDisconnectStartedMs >= WIFI_PORTAL_TIMEOUT_MS &&
+            now - lastWifiPortalTryMs >= WIFI_RECONNECT_MS) {
+            beginWifiPortal("Nem sikerült csatlakozni a mentett hálózathoz. Add meg a Wi-Fi adatokat.");
+        }
+
         if (now - lastWifiTryMs >= WIFI_RECONNECT_MS) {
             lastWifiTryMs = now;
             Serial.println(F("[WIFI] Ujracsatlakozas..."));
-            WiFi.disconnect(false);
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+            WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
         }
         return;
+    }
+
+    wifiDisconnectTimerActive = false;
+    if (wifiPortalActive) {
+        stopWifiPortal();
     }
 
     if (!mqtt.connected()) {
@@ -933,10 +1112,21 @@ void setup() {
     menu.update(lastHeartbeatMs, alarmBlinkOn);
     lcd.refresh(lastHeartbeatMs);
 
+    wifiPortalServer.on("/", HTTP_GET, handleWifiPortalRoot);
+    wifiPortalServer.on("/save", HTTP_POST, handleWifiPortalSave);
+    wifiPortalServer.onNotFound(handleWifiPortalNotFound);
+
+    loadWifiCredentials();
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    lastWifiTryMs = millis();
+    if (wifiSsid.length() == 0) {
+        beginWifiPortal("Első indítás: válaszd ki az otthoni Wi-Fi hálózatot.");
+    } else {
+        WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+        lastWifiTryMs = millis();
+        wifiDisconnectStartedMs = lastWifiTryMs;
+        wifiDisconnectTimerActive = true;
+    }
 
     wifiSecureClient.setInsecure();
     wifiSecureClient.setTimeout(3);
