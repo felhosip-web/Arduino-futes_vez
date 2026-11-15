@@ -8,15 +8,15 @@
 #include "../../nano/src/common.h"
 
 // ============================================================================
-// 2x20 I2C LCD KEZELŐ (0x27) - V4 + RIASZTÁS KIJELZÉS
+// 2x20 I2C LCD KEZELŐ (0x27) - V5 KIJELZÉS
 // ============================================================================
 // 1. sor (20 kar): "Szoba 20.8C Cel21.5C"
 // 2. sor (20 kar):
 //   - Normál:  "Kaz 52C Sziv: BE   A"
-//   - Riasztás (villogva váltakozva 500ms-enként):
+//   - Riasztás (500ms-enként váltakozva):
 //       overheat:    "RIASZTAS! Kaz 87C"  <-> "ALARM! Kaz 87C"
 //       sensor_fail: "RIASZTAS! SZENZOR!" <-> "ALARM! KAZAN HIBA!"
-//       nrf_fail:    "RIASZTAS! NRF HIBA" <-> "NRF HIBA!"
+//       nrf_fail:    "RIASZTAS! NRF HIBA!" <-> "NRF HIBA!"
 //   - NRF hiba alarmEnabled=false mellett: "NRF HIBA!"
 
 class HeatingLcd {
@@ -60,7 +60,17 @@ public:
             snprintf(kazStr, sizeof(kazStr), "%d", static_cast<int>(lroundf(boilerTemp)));
         }
 
-        if (alarmActive) {
+        if (!nrfOk) {
+            if (alarmActive && alarmReason == ALARM_REASON_NRF_FAIL) {
+                if (blinkPhase) {
+                    snprintf(rawLine2, sizeof(rawLine2), "RIASZTAS! NRF HIBA!");
+                } else {
+                    snprintf(rawLine2, sizeof(rawLine2), "NRF HIBA!");
+                }
+            } else {
+                snprintf(rawLine2, sizeof(rawLine2), "NRF HIBA!");
+            }
+        } else if (alarmActive) {
             switch (alarmReason) {
                 case ALARM_REASON_OVERHEAT:
                     if (blinkPhase) {
@@ -87,8 +97,6 @@ public:
                     }
                     break;
             }
-        } else if (!nrfOk) {
-            snprintf(rawLine2, sizeof(rawLine2), "NRF HIBA!");
         } else {
             char modeChar = 'A';
             if (mode == 1) modeChar = 'M';

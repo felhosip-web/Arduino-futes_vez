@@ -3,16 +3,28 @@
 #include <stdint.h>
 
 // ============================================================================
-// KÖZÖS NRF24L01+ SZERZŐDÉS V4 (+ ALARM EXTENSION) - PONTOSAN 32 BYTE
+// KÖZÖS NRF24L01+ SZERZŐDÉS V5 (MASTER-SLAVE) - PONTOSAN 32 BYTE
 // ============================================================================
-// Nano (8-bit AVR) és ESP32-C3 (32-bit RISC-V) közötti bináris kompatibilitás
-// érdekében fix méretű típusokat és __attribute__((packed)) union csomagot
-// használunk, így minden V4 + riasztási mező elfér 32 byte-ban.
+// Master: ESP32-C3 (32-bit RISC-V), Slave: Arduino Nano (8-bit AVR).
+// Mindkét oldalon fix méretű típusok + __attribute__((packed)) kötelező.
+// A WriteAckPayload TILOS; külön REQUEST (0xA1) és RESPONSE (0xB2) csomagok
+// közlekednek fél-duplex csatornán, seq azonosítással.
+//
+// Méret audit (NanoToEspPayload):
+//   4x float (16B) + uint32_t seq (4B) + uint32_t counter (4B) +
+//   uint8_t kazanStatusMask (1B -> ESP32-n 8 elemű kazan_status[8] tömbbé bővítve) +
+//   uint8_t sensorValidMask (1B) + AlarmStatePacked (2B) + reserved[3] (3B) = 31 byte.
+//   NrfPacket = 1 byte packetType + 31 byte union = pontosan 32 byte!
 
-constexpr uint8_t PKT_TYPE_ESP_TO_NANO = 0xA1;
-constexpr uint8_t PKT_TYPE_NANO_TO_ESP = 0xB2;
+constexpr uint8_t PKT_TYPE_REQUEST  = 0xA1; // Master -> Slave
+constexpr uint8_t PKT_TYPE_RESPONSE = 0xB2; // Slave  -> Master
 
 constexpr float SENSOR_DISCONNECTED_VAL = -127.0f;
+
+constexpr uint8_t HEARTBEAT_DEFAULT_SEC = 5;
+constexpr uint8_t HEARTBEAT_MIN_SEC     = 5;
+constexpr uint8_t HEARTBEAT_MAX_SEC     = 30;
+constexpr uint8_t HEARTBEAT_STEP_SEC    = 5;
 
 // Szobatermosztát módok
 enum HeatingMode : uint8_t {
@@ -55,9 +67,9 @@ constexpr uint8_t OUT_BIT_LED_ZOLD  = 1; // bit1 -> D5
 constexpr uint8_t OUT_BIT_LED_PIROS = 2; // bit2 -> D6
 constexpr uint8_t OUT_BIT_TARTALEK1 = 3; // bit3 -> D8
 constexpr uint8_t OUT_BIT_TARTALEK2 = 4; // bit4 -> D9
-constexpr uint8_t OUT_BIT_TARTALEK3 = 5; // bit5 -> D10
-constexpr uint8_t OUT_BIT_TARTALEK4 = 6; // bit6 -> A3 (17) (D11 foglalt Hardware SPI MOSI-nak)
-constexpr uint8_t OUT_BIT_TARTALEK5 = 7; // bit7 -> A4 (18) (D12 foglalt Hardware SPI MISO-nak)
+constexpr uint8_t OUT_BIT_TARTALEK3 = 5; // bit5 -> D10 (OUTPUT módban AVR SPI Master feltétel miatt)
+constexpr uint8_t OUT_BIT_TARTALEK4 = 6; // bit6 -> A3 (17)
+constexpr uint8_t OUT_BIT_TARTALEK5 = 7; // bit7 -> A4 (18)
 
 struct __attribute__((packed)) PumpConfigPacked {
     uint8_t pumpMode;        // PumpMode (0=auto, 1=manual_on, 2=manual_off)
@@ -68,7 +80,7 @@ struct __attribute__((packed)) PumpConfigPacked {
 
 struct __attribute__((packed)) AlarmConfigPacked {
     float   overheatTemp;    // 70.0 - 90.0 °C (alap: 85.0)
-    uint8_t alarmEnabled;    // 0 = false (nincs riasztás/villogás), 1 = true
+    uint8_t alarmEnabled;    // 0 = false (nincs villogás), 1 = true
 };
 
 struct __attribute__((packed)) AlarmStatePacked {
@@ -77,13 +89,15 @@ struct __attribute__((packed)) AlarmStatePacked {
 };
 
 struct __attribute__((packed)) EspToNanoPayload {
-    uint8_t           outputsMask;    // bit0: szivattyu, bit1: led_zold, bit2: led_piros, bit3-7: tartalek1-5
-    float             targetTemp;     // Célhőmérséklet (°C)
-    uint8_t           mode;           // HeatingMode (0=auto, 1=manual, 2=off)
-    uint8_t           manualHeating;  // 0 = false, 1 = true
-    PumpConfigPacked  pumpConfig;     // 10 byte
-    AlarmConfigPacked alarmConfig;    // 5 byte
-    uint8_t           reserved[9];    // Kitöltés 31 byte-ra
+    uint8_t           outputsMask;          // bit0: szivattyu, bit1: led_zold, bit2: led_piros, bit3-7: tartalek1-5
+    float             targetTemp;           // Célhőmérséklet (°C)
+    uint8_t           mode;                 // HeatingMode (0=auto, 1=manual, 2=off)
+    uint8_t           manualHeating;        // 0 = false, 1 = true
+    PumpConfigPacked  pumpConfig;           // 10 byte
+    AlarmConfigPacked alarmConfig;          // 5 byte
+    uint8_t           heartbeatIntervalSec; // 5, 10, 15, 20, 25, 30 mp (alap: 5)
+    uint32_t          seq;                  // Növekvő kérés sorszám
+    uint8_t           reserved[4];          // Kitöltés 31 byte-ra
 };
 
 struct __attribute__((packed)) NanoToEspPayload {
@@ -91,14 +105,16 @@ struct __attribute__((packed)) NanoToEspPayload {
     float            visszatero;      // Visszatérő vízhőfok (°C), -127.0f hiba esetén
     float            kazan;           // Kazán hőfok (°C), -127.0f hiba esetén
     float            kulteri;         // Kültéri hőfok (°C), -127.0f hiba esetén
-    uint8_t          kazan_status[8]; // 8 byte tartalék státusz tömb (egyelőre mind 0)
+    uint8_t          kazanStatusMask; // 8 bit státusz maszk (ESP32-n kazan_status[8]-ra bontva, egyelőre 0)
     uint32_t         counter;         // Növekvő válaszcsomag számláló
+    uint32_t         seq;             // UGYANAZ a seq, mint a kérésben
     uint8_t          sensorValidMask; // bit0: eloremeno, bit1: visszatero, bit2: kazan, bit3: kulteri
     AlarmStatePacked alarmState;      // 2 byte (active + reason)
+    uint8_t          reserved[3];     // Kitöltés 31 byte-ra
 };
 
 struct __attribute__((packed)) NrfPacket {
-    uint8_t packetType; // PKT_TYPE_ESP_TO_NANO vagy PKT_TYPE_NANO_TO_ESP
+    uint8_t packetType; // PKT_TYPE_REQUEST (0xA1) vagy PKT_TYPE_RESPONSE (0xB2)
     union {
         EspToNanoPayload esp;
         NanoToEspPayload nano;
@@ -112,11 +128,12 @@ static_assert(sizeof(EspToNanoPayload)  == 31, "EspToNanoPayload merete 31 byte 
 static_assert(sizeof(NanoToEspPayload)  == 31, "NanoToEspPayload merete 31 byte kell legyen!");
 static_assert(sizeof(NrfPacket)         == 32, "NrfPacket meretenek pontosan 32 byte-nak kell lennie!");
 
-// Közös RF24 rádió csatorna és cím (5 byte)
+// Közös RF24 rádió csatorna és külön Master->Slave / Slave->Master csőcímek (5 byte)
 constexpr uint8_t NRF_CHANNEL = 108;
-constexpr uint8_t NRF_ADDR_PIPE[6] = "FUTES";
+constexpr uint8_t NRF_ADDR_MASTER_TO_SLAVE[6] = "FUTE1";
+constexpr uint8_t NRF_ADDR_SLAVE_TO_MASTER[6] = "FUTE2";
 
-// Segédfüggvények bitkezeléshez
+// Segédfüggvények bitkezeléshez és heartbeat szanitizáláshoz
 inline bool getBit(uint8_t mask, uint8_t bitIndex) {
     return (mask & (1U << bitIndex)) != 0;
 }
@@ -127,4 +144,13 @@ inline void setBit(uint8_t& mask, uint8_t bitIndex, bool value) {
     } else {
         mask &= static_cast<uint8_t>(~(1U << bitIndex));
     }
+}
+
+inline uint8_t sanitizeHeartbeatIntervalSec(uint8_t sec) {
+    if (sec < HEARTBEAT_MIN_SEC) return HEARTBEAT_MIN_SEC;
+    if (sec > HEARTBEAT_MAX_SEC) return HEARTBEAT_MAX_SEC;
+    uint8_t snapped = static_cast<uint8_t>(((sec + 2U) / HEARTBEAT_STEP_SEC) * HEARTBEAT_STEP_SEC);
+    if (snapped < HEARTBEAT_MIN_SEC) snapped = HEARTBEAT_MIN_SEC;
+    if (snapped > HEARTBEAT_MAX_SEC) snapped = HEARTBEAT_MAX_SEC;
+    return snapped;
 }

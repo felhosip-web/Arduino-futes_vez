@@ -6,9 +6,9 @@
 #include "common.h"
 
 // ============================================================================
-// ARDUINO NANO - KAZÁN OLDALI VEZÉRLŐ (V4 + RIASZTÁSI RENDSZER)
+// ARDUINO NANO - KAZÁN OLDALI SLAVE VEZÉRLŐ (V5 MASTER-SLAVE PROTOKOLL)
 // ============================================================================
-// Bekötés (ütközésmentes Hardware SPI kiosztás):
+// Bekötés (Hardware SPI):
 //   DS18B20 OneWire busz    : D2 (4.7 kOhm pull-up az 5V felé)
 //   NRF24L01+ (Hardware SPI): CE=D3, CSN=D4, MOSI=D11, MISO=D12, SCK=D13
 //   Kimenetek:
@@ -17,15 +17,18 @@
 //     D7 -> szivattyu relé
 //     D8 -> tartalek1
 //     D9 -> tartalek2
-//     D10 -> tartalek3 (OUTPUT módban tartva, hogy az AVR Hardware SPI Master maradjon)
-//     A3 (17) -> tartalek4 (D11 szabadon hagyva MOSI-nak)
-//     A4 (18) -> tartalek5 (D12 szabadon hagyva MISO-nak)
+//     D10 -> tartalek3 (OUTPUT módban marad, hogy az AVR Hardware SPI Master maradjon)
+//     A3 (17) -> tartalek4
+//     A4 (18) -> tartalek5
 //
-// FAIL-SAFE & ÖNÁLLÓ BIZTONSÁG (V4):
-//   - Induláskor és ha 15 mp-ig nem érkezik ESP csomag, a Nano BEKAPCSOLJA a
-//     szivattyút (D7), és alarmEnabled=true esetén villogtatja a piros LED-et (reason=nrf_fail).
-//   - Ha a saját mért kazan >= alarmConfig.overheatTemp vagy szenzorhiba (-127),
-//     a Nano önállóan BEKAPCSOLJA a szivattyút (D7) és villogtatja a piros LED-et (D6).
+// V5 SLAVE SZABÁLYOK:
+//   - SOHA nem ad önállóan, csak a Master (ESP32-C3) 0xA1 REQUEST-jére válaszol
+//     200ms-on belül 0xB2 RESPONSE csomaggal (sima write(), writeAckPayload TILOS).
+//   - Seq duplikáció-védelem: ha már feldolgozott seq érkezik, ugyanazt a
+//     RESPONSE csomagot küldi vissza a kimenetek újbóli végrehajtása nélkül.
+//   - Fail-safe: induláskor amíg nincs ESP kapcsolat, valamint ha
+//     (millis() - lastRequestMs) > 3 * heartbeatIntervalSec * 1000 + 2000:
+//     szivattyú BE, piros LED 500ms-es villogás, alarmState reason = nrf_fail.
 // ============================================================================
 
 constexpr uint8_t PIN_ONE_WIRE   = 2;
@@ -38,16 +41,16 @@ constexpr uint8_t PIN_SZIVATTYU  = 7;
 constexpr uint8_t PIN_TARTALEK1  = 8;
 constexpr uint8_t PIN_TARTALEK2  = 9;
 constexpr uint8_t PIN_TARTALEK3  = 10;
-constexpr uint8_t PIN_TARTALEK4  = 17; // A3 (digitális kimenet, nincs SPI ütközés)
-constexpr uint8_t PIN_TARTALEK5  = 18; // A4 (digitális kimenet, nincs SPI ütközés)
+constexpr uint8_t PIN_TARTALEK4  = 17; // A3
+constexpr uint8_t PIN_TARTALEK5  = 18; // A4
 
 // Relé logika: állítsd true-ra, ha a relémodul LOW jellel húz be
 constexpr bool RELAY_ACTIVE_LOW = false;
 
 constexpr uint32_t TEMP_READ_INTERVAL_MS   = 10000UL; // 10 mp-enként DS18B20 olvasás
-constexpr uint32_t DS18B20_CONV_TIME_MS    = 800UL;   // 12-bit konverziós idő (~750ms)
-constexpr uint32_t FAILSAFE_TIMEOUT_MS     = 15000UL; // 15 mp timeout -> szivattyú BE + nrf_fail
-constexpr uint32_t ALARM_BLINK_INTERVAL_MS = 500UL;   // 500ms BE / 500ms KI villogás
+constexpr uint32_t DS18B20_CONV_TIME_MS    = 800UL;   // 12-bit konverzió (~750ms)
+constexpr uint32_t ALARM_BLINK_INTERVAL_MS = 500UL;   // 500ms BE / 500ms KI
+constexpr uint32_t SLAVE_TX_TURNAROUND_MS  = 5UL;     // 5ms szünet, hogy a Master biztosan RX módban legyen (< 200ms)
 
 constexpr float ALARM_OVERHEAT_DEFAULT = 85.0f;
 constexpr float ALARM_OVERHEAT_MIN     = 70.0f;
@@ -63,37 +66,48 @@ OneWire oneWire(PIN_ONE_WIRE);
 DallasTemperature sensors(&oneWire);
 RF24 radio(PIN_NRF_CE, PIN_NRF_CSN);
 
+// --- Tárolt konfiguráció és mért állapot ---
 PumpConfigPacked lastPumpConfig = {
     PUMP_MODE_AUTO,
     40.0f,
     30.0f,
     PUMP_SENSOR_KAZAN
 };
-bool hasPumpConfig = false;
 
 AlarmConfigPacked currentAlarmConfig = {
     ALARM_OVERHEAT_DEFAULT,
-    1 // alapértelmezett: alarmEnabled = true
+    1
 };
 
 AlarmStatePacked currentAlarmState = {
-    0,
-    ALARM_REASON_NONE
+    1,
+    ALARM_REASON_NRF_FAIL
 };
 
-NrfPacket txPacket;
+uint8_t heartbeatIntervalSec = HEARTBEAT_DEFAULT_SEC;
+
+float   latestEloremeno       = SENSOR_DISCONNECTED_VAL;
+float   latestVisszatero      = SENSOR_DISCONNECTED_VAL;
+float   latestKazan           = SENSOR_DISCONNECTED_VAL;
+float   latestKulteri         = SENSOR_DISCONNECTED_VAL;
+uint8_t latestSensorValidMask = 0;
+
 NrfPacket rxPacket;
+NrfPacket lastResponsePacket;
 
-uint8_t  lastEspOutputsMask = 0;
-bool     hasEspPacket       = false;
-uint32_t lastEspPacketMs    = 0;
-uint32_t lastTempCycleMs    = 0;
-bool     conversionRequested = false;
-uint32_t conversionReqMs    = 0;
-bool     failsafeActive     = false;
+uint8_t  lastEspOutputsMask   = 0;
+bool     hasEspRequest        = false;
+bool     hasProcessedSeq      = false;
+uint32_t lastProcessedSeq     = 0;
+uint32_t responseCounter      = 0;
+uint32_t lastRequestMs        = 0;
+uint32_t lastTempCycleMs      = 0;
+bool     conversionRequested  = false;
+uint32_t conversionReqMs      = 0;
+bool     failsafeActive       = true; // Induláskor nincs még ESP kapcsolat -> biztonságos alapállapot
 
-uint32_t lastAlarmBlinkMs   = 0;
-bool     alarmBlinkOn       = false;
+uint32_t lastAlarmBlinkMs     = 0;
+bool     alarmBlinkOn         = true;
 
 // ============================================================================
 // KIMENETEK ÉS RIASZTÁSI VILLOGÁS KEZELÉSE
@@ -127,9 +141,8 @@ void sanitizeAlarmConfig(AlarmConfigPacked& cfg) {
 }
 
 void evaluateLocalSafetyAndAlarm() {
-    float kazan = txPacket.nano.kazan;
-    bool kazanInvalid = isnan(kazan) || (kazan <= -120.0f) || (kazan > 125.0f);
-    bool overheat = !kazanInvalid && (kazan >= currentAlarmConfig.overheatTemp);
+    bool kazanInvalid = isnan(latestKazan) || (latestKazan <= -120.0f) || (latestKazan > 125.0f);
+    bool overheat     = !kazanInvalid && (latestKazan >= currentAlarmConfig.overheatTemp);
 
     if (currentAlarmConfig.alarmEnabled == 0) {
         currentAlarmState.active = 0;
@@ -140,44 +153,37 @@ void evaluateLocalSafetyAndAlarm() {
     } else if (kazanInvalid) {
         currentAlarmState.active = 1;
         currentAlarmState.reason = ALARM_REASON_SENSOR_FAIL;
-    } else if (failsafeActive) {
+    } else if (!hasEspRequest || failsafeActive) {
         currentAlarmState.active = 1;
         currentAlarmState.reason = ALARM_REASON_NRF_FAIL;
     } else {
         currentAlarmState.active = 0;
         currentAlarmState.reason = ALARM_REASON_NONE;
     }
-
-    txPacket.nano.alarmState = currentAlarmState;
 }
 
-// Kiszámítja a tényleges kimeneteket (szivattyú biztonság + nem-blokkoló 500ms piros LED villogás)
 void refreshHardwareOutputs(uint32_t now) {
-    float kazan = txPacket.nano.kazan;
-    bool kazanInvalid = isnan(kazan) || (kazan <= -120.0f) || (kazan > 125.0f);
-    bool overheat = !kazanInvalid && (kazan >= currentAlarmConfig.overheatTemp);
+    bool kazanInvalid = isnan(latestKazan) || (latestKazan <= -120.0f) || (latestKazan > 125.0f);
+    bool overheat     = !kazanInvalid && (latestKazan >= currentAlarmConfig.overheatTemp);
 
     uint8_t effectiveMask = 0;
-    if (!hasEspPacket || failsafeActive) {
+    if (!hasEspRequest || failsafeActive) {
         setBit(effectiveMask, OUT_BIT_SZIVATTYU, true);
     } else {
         effectiveMask = lastEspOutputsMask;
     }
 
-    // Szivattyú biztonsági szabály: túlmelegedés vagy szenzorhiba esetén MINDIG BE
+    // Biztonsági szabály: túlmelegedés vagy kazán szenzorhiba esetén szivattyú MINDIG BE
     if (overheat || kazanInvalid) {
         setBit(effectiveMask, OUT_BIT_SZIVATTYU, true);
     }
 
-    // Piros LED (D6) vezérlése:
-    // - Ha alarmEnabled == false -> nincs riasztás/villogás, simán KI
-    // - Ha alarmState.active == true -> 500ms BE / 500ms KI millis() villogás
-    // - Különben ha még nincs ESP kapcsolat -> világít jelzésként, vagy ESP kimeneti bit szerint
+    // Piros LED (D6): 500ms villogás, ha riasztás aktív és alarmEnabled=true
     bool pirosOn = false;
     if (currentAlarmConfig.alarmEnabled == 0) {
         alarmBlinkOn = false;
         pirosOn = false;
-    } else if (currentAlarmState.active != 0) {
+    } else if (currentAlarmState.active != 0 || !hasEspRequest || failsafeActive) {
         if (now - lastAlarmBlinkMs >= ALARM_BLINK_INTERVAL_MS) {
             lastAlarmBlinkMs = now;
             alarmBlinkOn = !alarmBlinkOn;
@@ -185,7 +191,7 @@ void refreshHardwareOutputs(uint32_t now) {
         pirosOn = alarmBlinkOn;
     } else {
         alarmBlinkOn = false;
-        pirosOn = !hasEspPacket ? true : getBit(effectiveMask, OUT_BIT_LED_PIROS);
+        pirosOn = getBit(effectiveMask, OUT_BIT_LED_PIROS);
     }
 
     setBit(effectiveMask, OUT_BIT_LED_PIROS, pirosOn);
@@ -193,7 +199,7 @@ void refreshHardwareOutputs(uint32_t now) {
 }
 
 // ============================================================================
-// DS18B20 ADDRESS-KIÍRÓ MÓD (SERIAL)
+// DS18B20 ADDRESS-KIÍRÓ MÓD (SERIAL 'a' KARAKTERRE)
 // ============================================================================
 void printDeviceAddressCArray(const DeviceAddress addr) {
     Serial.print(F("{ "));
@@ -239,56 +245,67 @@ void runAddressScanner() {
 }
 
 // ============================================================================
-// HŐMÉRSÉKLET OLVASÁS (-127 ESETÉN -127.0f-ET KÜLD)
+// DS18B20 OLVASÁS (-127 ESETÉN -127.0f)
 // ============================================================================
 float readSingleSensor(const DeviceAddress addr) {
     float t = sensors.getTempC(addr);
     if (t <= -120.0f || isnan(t) || t > 125.0f) {
-        return SENSOR_DISCONNECTED_VAL; // -127.0f
+        return SENSOR_DISCONNECTED_VAL;
     }
     return t;
 }
 
 void updateAllTemperatures() {
-    txPacket.nano.eloremeno  = readSingleSensor(ADDR_ELOREMENO);
-    txPacket.nano.visszatero = readSingleSensor(ADDR_VISSZATERO);
-    txPacket.nano.kazan      = readSingleSensor(ADDR_KAZAN);
-    txPacket.nano.kulteri    = readSingleSensor(ADDR_KULTERI);
+    latestEloremeno  = readSingleSensor(ADDR_ELOREMENO);
+    latestVisszatero = readSingleSensor(ADDR_VISSZATERO);
+    latestKazan      = readSingleSensor(ADDR_KAZAN);
+    latestKulteri    = readSingleSensor(ADDR_KULTERI);
 
     uint8_t validMask = 0;
-    setBit(validMask, 0, txPacket.nano.eloremeno  > -120.0f);
-    setBit(validMask, 1, txPacket.nano.visszatero > -120.0f);
-    setBit(validMask, 2, txPacket.nano.kazan      > -120.0f);
-    setBit(validMask, 3, txPacket.nano.kulteri    > -120.0f);
-    txPacket.nano.sensorValidMask = validMask;
-
-    for (uint8_t i = 0; i < 8; i++) {
-        txPacket.nano.kazan_status[i] = 0;
-    }
+    setBit(validMask, 0, latestEloremeno  > -120.0f);
+    setBit(validMask, 1, latestVisszatero > -120.0f);
+    setBit(validMask, 2, latestKazan      > -120.0f);
+    setBit(validMask, 3, latestKulteri    > -120.0f);
+    latestSensorValidMask = validMask;
 
     evaluateLocalSafetyAndAlarm();
 
     Serial.print(F("[TEMP] Elore:"));
-    Serial.print(txPacket.nano.eloremeno, 1);
+    Serial.print(latestEloremeno, 1);
     Serial.print(F(" Vissza:"));
-    Serial.print(txPacket.nano.visszatero, 1);
+    Serial.print(latestVisszatero, 1);
     Serial.print(F(" Kazan:"));
-    Serial.print(txPacket.nano.kazan, 1);
+    Serial.print(latestKazan, 1);
     Serial.print(F(" Kulteri:"));
-    Serial.println(txPacket.nano.kulteri, 1);
+    Serial.println(latestKulteri, 1);
 }
 
-void reloadAckPayload() {
-    txPacket.packetType = PKT_TYPE_NANO_TO_ESP;
-    txPacket.nano.alarmState = currentAlarmState;
-    radio.flush_tx();
-    radio.writeAckPayload(1, &txPacket, sizeof(txPacket));
+void buildResponsePacket(uint32_t seq) {
+    memset(&lastResponsePacket, 0, sizeof(lastResponsePacket));
+    lastResponsePacket.packetType           = PKT_TYPE_RESPONSE;
+    lastResponsePacket.nano.eloremeno       = latestEloremeno;
+    lastResponsePacket.nano.visszatero      = latestVisszatero;
+    lastResponsePacket.nano.kazan           = latestKazan;
+    lastResponsePacket.nano.kulteri         = latestKulteri;
+    lastResponsePacket.nano.kazanStatusMask = 0;
+    lastResponsePacket.nano.counter         = responseCounter;
+    lastResponsePacket.nano.seq             = seq;
+    lastResponsePacket.nano.sensorValidMask = latestSensorValidMask;
+    lastResponsePacket.nano.alarmState      = currentAlarmState;
+}
+
+void sendResponseToMaster(const NrfPacket& resp) {
+    delay(SLAVE_TX_TURNAROUND_MS);
+    radio.stopListening();
+    radio.openWritingPipe(NRF_ADDR_SLAVE_TO_MASTER);
+    radio.write(&resp, sizeof(resp));
+    radio.startListening();
 }
 
 void handleSerialCommands() {
     while (Serial.available() > 0) {
         char c = static_cast<char>(Serial.read());
-        if (c == 'a' || c == 'A' || c == 's' || c == 'S') {
+        if (c == 'a' || c == 'A') {
             runAddressScanner();
         }
     }
@@ -300,31 +317,25 @@ void handleSerialCommands() {
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println(F("\n[NANO V4] Kazan vezerlo inditas..."));
-    Serial.println(F("FIGYELEM: Cseréld le az ADDR_* tömböket a scanner által kiírt valós címekre, különben minden szenzor NAN lesz!"));
+    Serial.println(F("\n[NANO V5] Kazan vezerlo SLAVE inditas..."));
+    Serial.println(F("FIGYELEM: Csereld le az ADDR_* tomboket a scanner altal kiirt valos cimekre, kulonben minden szenzor -127 lesz!"));
 
     pinMode(PIN_LED_ZOLD, OUTPUT);
     pinMode(PIN_LED_PIROS, OUTPUT);
     pinMode(PIN_SZIVATTYU, OUTPUT);
     pinMode(PIN_TARTALEK1, OUTPUT);
     pinMode(PIN_TARTALEK2, OUTPUT);
-    pinMode(PIN_TARTALEK3, OUTPUT);
+    pinMode(PIN_TARTALEK3, OUTPUT); // D10 OUTPUT marad (AVR SPI Master)
     pinMode(PIN_TARTALEK4, OUTPUT);
     pinMode(PIN_TARTALEK5, OUTPUT);
 
-    memset(&txPacket, 0, sizeof(txPacket));
-    txPacket.packetType      = PKT_TYPE_NANO_TO_ESP;
-    txPacket.nano.eloremeno  = SENSOR_DISCONNECTED_VAL;
-    txPacket.nano.visszatero = SENSOR_DISCONNECTED_VAL;
-    txPacket.nano.kazan      = SENSOR_DISCONNECTED_VAL;
-    txPacket.nano.kulteri    = SENSOR_DISCONNECTED_VAL;
-
-    // Induláskor biztonságos állapot: amíg nincs ESP kapcsolat, szivattyú BE + piros LED BE/villog
-    uint8_t bootSafeMask = 0;
-    setBit(bootSafeMask, OUT_BIT_SZIVATTYU, true);
-    setBit(bootSafeMask, OUT_BIT_LED_PIROS, true);
-    applyOutputs(bootSafeMask);
-    Serial.println(F("[NANO] Indulasi biztonsagi allapot: Szivattyu BE, Piros LED BE (varakozas ESP-re)."));
+    // Indulási biztonságos alapállapot: amíg nincs ESP kapcsolat, szivattyú BE + piros LED villog
+    failsafeActive = true;
+    hasEspRequest = false;
+    lastAlarmBlinkMs = millis();
+    alarmBlinkOn = true;
+    refreshHardwareOutputs(lastAlarmBlinkMs);
+    Serial.println(F("[NANO] Indulasi biztonsagi allapot: Szivattyu BE, Piros LED villog."));
 
     runAddressScanner();
     sensors.setResolution(12);
@@ -337,28 +348,28 @@ void setup() {
     if (!radio.begin()) {
         Serial.println(F("[NANO] HIBA: NRF24L01+ nem talalhato!"));
     } else {
+        radio.disableAckPayload();
+        radio.setPayloadSize(sizeof(NrfPacket));
+        radio.setAutoAck(true);
         radio.setChannel(NRF_CHANNEL);
         radio.setDataRate(RF24_250KBPS);
         radio.setPALevel(RF24_PA_HIGH);
-        radio.setRetries(6, 15);
-        radio.enableDynamicPayloads();
-        radio.enableAckPayload();
-        radio.openReadingPipe(1, NRF_ADDR_PIPE);
+        radio.setRetries(5, 15);
+        radio.openWritingPipe(NRF_ADDR_SLAVE_TO_MASTER);
+        radio.openReadingPipe(1, NRF_ADDR_MASTER_TO_SLAVE);
         radio.startListening();
-        reloadAckPayload();
-        Serial.println(F("[NANO] NRF24L01+ keszenletben (ACK payload mod)."));
+        Serial.println(F("[NANO] NRF24L01+ SLAVE keszenletben (AckPayload KI)."));
     }
 
-    lastEspPacketMs = millis();
-    lastAlarmBlinkMs = lastEspPacketMs;
-    refreshHardwareOutputs(lastEspPacketMs);
+    lastRequestMs = millis();
+    refreshHardwareOutputs(lastRequestMs);
 }
 
 void loop() {
     uint32_t now = millis();
     handleSerialCommands();
 
-    // 1. Nem-blokkoló DS18B20 mérés 10 másodpercenként (külön DeviceAddress alapján)
+    // 1. Nem-blokkoló DS18B20 mérés 10 másodpercenként (ne blokkolja az RF24 vételt!)
     if (!conversionRequested && (now - lastTempCycleMs >= TEMP_READ_INTERVAL_MS)) {
         sensors.requestTemperatures();
         conversionRequested = true;
@@ -369,56 +380,59 @@ void loop() {
         conversionRequested = false;
         lastTempCycleMs = now;
         updateAllTemperatures();
-        reloadAckPayload();
     }
 
-    // 2. RF24 csomag fogadása az ESP32-C3-tól
+    // 2. Master (ESP32-C3) REQUEST fogadása (0xA1) és azonnali RESPONSE küldése (0xB2)
     if (radio.available()) {
         while (radio.available()) {
             radio.read(&rxPacket, sizeof(rxPacket));
         }
 
-        if (rxPacket.packetType == PKT_TYPE_ESP_TO_NANO) {
-            hasEspPacket = true;
-            lastEspPacketMs = now;
-            if (failsafeActive) {
-                failsafeActive = false;
-                Serial.println(F("[NANO] ESP kapcsolat helyreallt, fail-safe feloldva."));
+        if (rxPacket.packetType == PKT_TYPE_REQUEST) {
+            lastRequestMs = now;
+            uint32_t incomingSeq = rxPacket.esp.seq;
+
+            if (hasProcessedSeq && incomingSeq == lastProcessedSeq) {
+                // Seq duplikáció védelem: ugyanazt a RESPONSE-t küldjük vissza, kimeneteket NEM hajtjuk végre újra
+                Serial.print(F("[NANO] Duplikalt seq="));
+                Serial.println(incomingSeq);
+                sendResponseToMaster(lastResponsePacket);
+            } else {
+                hasProcessedSeq  = true;
+                lastProcessedSeq = incomingSeq;
+                hasEspRequest    = true;
+
+                if (failsafeActive) {
+                    failsafeActive = false;
+                    Serial.println(F("[NANO] Master kapcsolat helyreallt, fail-safe feloldva."));
+                }
+
+                lastPumpConfig       = rxPacket.esp.pumpConfig;
+                currentAlarmConfig   = rxPacket.esp.alarmConfig;
+                sanitizeAlarmConfig(currentAlarmConfig);
+                heartbeatIntervalSec = sanitizeHeartbeatIntervalSec(rxPacket.esp.heartbeatIntervalSec);
+                lastEspOutputsMask   = rxPacket.esp.outputsMask;
+
+                evaluateLocalSafetyAndAlarm();
+                refreshHardwareOutputs(now);
+
+                responseCounter++;
+                buildResponsePacket(incomingSeq);
+                sendResponseToMaster(lastResponsePacket);
             }
-
-            lastPumpConfig = rxPacket.esp.pumpConfig;
-            hasPumpConfig = true;
-            Serial.print(F("[NANO] PumpConfig: mode="));
-            Serial.print(lastPumpConfig.pumpMode);
-            Serial.print(F(" start="));
-            Serial.print(lastPumpConfig.pumpStartTemp, 1);
-            Serial.print(F(" stop="));
-            Serial.print(lastPumpConfig.pumpStopTemp, 1);
-            Serial.print(F(" sensor="));
-            Serial.println(lastPumpConfig.pumpStartSensor);
-
-            currentAlarmConfig = rxPacket.esp.alarmConfig;
-            sanitizeAlarmConfig(currentAlarmConfig);
-            Serial.print(F("[NANO] AlarmConfig: enabled="));
-            Serial.print(currentAlarmConfig.alarmEnabled);
-            Serial.print(F(" overheat="));
-            Serial.println(currentAlarmConfig.overheatTemp, 1);
-
-            lastEspOutputsMask = rxPacket.esp.outputsMask;
-            evaluateLocalSafetyAndAlarm();
-            txPacket.nano.counter++;
-            reloadAckPayload();
         }
     }
 
-    // 3. V4 Fail-safe: ha 15 mp-ig nem jön ESP csomag -> szivattyú BE + nrf_fail riasztás
-    if (!failsafeActive && (now - lastEspPacketMs >= FAILSAFE_TIMEOUT_MS)) {
+    // 3. V5 Fail-safe: ha (millis() - lastRequestMs) > 3 * heartbeatIntervalSec * 1000 + 2000
+    uint32_t failsafeTimeoutMs =
+        (3UL * static_cast<uint32_t>(heartbeatIntervalSec) * 1000UL) + 2000UL;
+
+    if (!failsafeActive && (now - lastRequestMs > failsafeTimeoutMs)) {
         failsafeActive = true;
         evaluateLocalSafetyAndAlarm();
-        reloadAckPayload();
-        Serial.println(F("[NANO] FAIL-SAFE AKTIV: Szivattyu BE, Piros LED BE/villog (nrf_fail)"));
+        Serial.println(F("[NANO] FAIL-SAFE AKTIV: Szivattyu BE, Piros LED villog (nrf_fail)"));
     }
 
-    // 4. Kimenetek és nem-blokkoló 500ms riasztási villogás frissítése minden ciklusban
+    // 4. Kimenetek és nem-blokkoló 500ms riasztási villogás frissítése
     refreshHardwareOutputs(now);
 }

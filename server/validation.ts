@@ -1,6 +1,7 @@
-import { OUTPUT_KEYS } from './types.ts';
+import { OUTPUT_KEYS, VALID_HEARTBEAT_INTERVALS } from './types.ts';
 import type {
   AlarmConfig,
+  HeartbeatConfig,
   HeatingCommand,
   HeatingMode,
   HeatingOutputs,
@@ -16,6 +17,7 @@ const VALID_PUMP_MODES: readonly PumpMode[] = ['auto', 'manual_on', 'manual_off'
 const VALID_PUMP_SENSORS: readonly PumpStartSensor[] = ['kazan', 'eloremeno', 'max'];
 const PUMP_CONFIG_KEYS = ['pumpMode', 'pumpStartTemp', 'pumpStopTemp', 'pumpStartSensor'] as const;
 const ALARM_CONFIG_KEYS = ['overheatTemp', 'alarmEnabled'] as const;
+const HEARTBEAT_KEYS = ['intervalSec'] as const;
 
 export const DEFAULT_PUMP_CONFIG: PumpConfig = {
   pumpMode: 'auto',
@@ -27,6 +29,10 @@ export const DEFAULT_PUMP_CONFIG: PumpConfig = {
 export const DEFAULT_ALARM_CONFIG: AlarmConfig = {
   overheatTemp: 85.0,
   alarmEnabled: true,
+};
+
+export const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
+  intervalSec: 5,
 };
 
 export interface ValidationResult<T> {
@@ -50,6 +56,7 @@ export interface FreshCommandBase {
   kimenetek?: HeatingOutputs;
   pumpConfig?: PumpConfig;
   alarmConfig?: AlarmConfig;
+  heartbeat?: HeartbeatConfig;
 }
 
 export function resolveFreshBase(state?: StoredDeviceState): FreshCommandBase {
@@ -67,6 +74,7 @@ export function resolveFreshBase(state?: StoredDeviceState): FreshCommandBase {
       kimenetek: state.lastCommand.kimenetek,
       pumpConfig: state.lastCommand.pumpConfig,
       alarmConfig: state.lastCommand.alarmConfig,
+      heartbeat: state.lastCommand.heartbeat,
     };
   }
 
@@ -78,6 +86,7 @@ export function resolveFreshBase(state?: StoredDeviceState): FreshCommandBase {
     kimenetek: src?.kimenetek,
     pumpConfig: src?.pumpConfig,
     alarmConfig: src?.alarmConfig,
+    heartbeat: src?.heartbeat,
   };
 }
 
@@ -266,6 +275,59 @@ function validateResolvedAlarmConfig(cfg: AlarmConfig): ValidationResult<AlarmCo
   return { ok: true, value: cfg };
 }
 
+export function validateHeartbeat(
+  rawHeartbeat: unknown,
+  fallbackHeartbeat?: Partial<HeartbeatConfig>
+): ValidationResult<HeartbeatConfig> | ValidationError {
+  const base: HeartbeatConfig = {
+    intervalSec: fallbackHeartbeat?.intervalSec ?? DEFAULT_HEARTBEAT_CONFIG.intervalSec,
+  };
+
+  if (rawHeartbeat === undefined) {
+    return validateResolvedHeartbeat(base);
+  }
+
+  if (!rawHeartbeat || typeof rawHeartbeat !== 'object' || Array.isArray(rawHeartbeat)) {
+    return { ok: false, error: 'A heartbeat mezőnek érvényes JSON objektumnak kell lennie.' };
+  }
+
+  const raw = rawHeartbeat as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!(HEARTBEAT_KEYS as readonly string[]).includes(key)) {
+      return { ok: false, error: `Ismeretlen heartbeat kulcs: "${key}".` };
+    }
+  }
+
+  let intervalSec: number;
+  if (raw.intervalSec === undefined) {
+    intervalSec = base.intervalSec;
+  } else if (
+    typeof raw.intervalSec !== 'number' ||
+    !Number.isFinite(raw.intervalSec) ||
+    !(VALID_HEARTBEAT_INTERVALS as readonly number[]).includes(raw.intervalSec)
+  ) {
+    return { ok: false, error: 'A heartbeat intervallum csak 5,10,15,20,25,30 mp lehet.' };
+  } else {
+    intervalSec = raw.intervalSec;
+  }
+
+  return validateResolvedHeartbeat({ intervalSec });
+}
+
+function validateResolvedHeartbeat(
+  cfg: HeartbeatConfig
+): ValidationResult<HeartbeatConfig> | ValidationError {
+  if (
+    typeof cfg.intervalSec !== 'number' ||
+    !Number.isFinite(cfg.intervalSec) ||
+    !(VALID_HEARTBEAT_INTERVALS as readonly number[]).includes(cfg.intervalSec)
+  ) {
+    return { ok: false, error: 'A heartbeat intervallum csak 5,10,15,20,25,30 mp lehet.' };
+  }
+
+  return { ok: true, value: cfg };
+}
+
 export function validateHeatingCommand(
   body: unknown,
   currentState?: StoredDeviceState
@@ -357,6 +419,11 @@ export function validateHeatingCommand(
     return alarmValidation;
   }
 
+  const heartbeatValidation = validateHeartbeat(raw.heartbeat, freshBase.heartbeat);
+  if (!heartbeatValidation.ok) {
+    return heartbeatValidation;
+  }
+
   return {
     ok: true,
     value: {
@@ -366,6 +433,7 @@ export function validateHeatingCommand(
       kimenetek: normalizedOutputs,
       pumpConfig: pumpValidation.value,
       alarmConfig: alarmValidation.value,
+      heartbeat: heartbeatValidation.value,
     },
   };
 }
@@ -444,6 +512,9 @@ export function buildSingleOutputCommand(
     alarmConfig: {
       ...(fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG),
     },
+    heartbeat: {
+      ...(fresh.heartbeat ?? latest.heartbeat ?? DEFAULT_HEARTBEAT_CONFIG),
+    },
   };
 }
 
@@ -483,6 +554,9 @@ export function buildPumpUpdateCommand(
       pumpConfig: pumpValidation.value,
       alarmConfig: {
         ...(fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG),
+      },
+      heartbeat: {
+        ...(fresh.heartbeat ?? latest.heartbeat ?? DEFAULT_HEARTBEAT_CONFIG),
       },
     },
   };
@@ -525,6 +599,53 @@ export function buildAlarmUpdateCommand(
         ...(fresh.pumpConfig ?? latest.pumpConfig ?? DEFAULT_PUMP_CONFIG),
       },
       alarmConfig: alarmValidation.value,
+      heartbeat: {
+        ...(fresh.heartbeat ?? latest.heartbeat ?? DEFAULT_HEARTBEAT_CONFIG),
+      },
+    },
+  };
+}
+
+export function buildHeartbeatUpdateCommand(
+  state: StoredDeviceState,
+  body: unknown
+): ValidationResult<HeatingCommand> | ValidationError {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: 'A kérés törzsének JSON objektumnak kell lennie.' };
+  }
+
+  const raw = body as Record<string, unknown>;
+  if (!raw.heartbeat || typeof raw.heartbeat !== 'object' || Array.isArray(raw.heartbeat)) {
+    return { ok: false, error: 'A heartbeat objektum kötelező.' };
+  }
+
+  const fresh = resolveFreshBase(state);
+  const latest = state.lastStatus ?? state.status;
+
+  const heartbeatValidation = validateHeartbeat(
+    raw.heartbeat,
+    fresh.heartbeat ?? latest.heartbeat ?? DEFAULT_HEARTBEAT_CONFIG
+  );
+  if (!heartbeatValidation.ok) {
+    return heartbeatValidation;
+  }
+
+  return {
+    ok: true,
+    value: {
+      targetTemp: fresh.targetTemp ?? latest.targetTemp,
+      mode: fresh.mode ?? latest.mode,
+      manualHeating: fresh.manualHeating ?? false,
+      kimenetek: {
+        ...(fresh.kimenetek ?? latest.kimenetek),
+      },
+      pumpConfig: {
+        ...(fresh.pumpConfig ?? latest.pumpConfig ?? DEFAULT_PUMP_CONFIG),
+      },
+      alarmConfig: {
+        ...(fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG),
+      },
+      heartbeat: heartbeatValidation.value,
     },
   };
 }

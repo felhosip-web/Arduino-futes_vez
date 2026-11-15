@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 // ============================================================================
-// ESP32-C3 KONFIGURÁCIÓ (V4 + RIASZTÁS): WIFI, MQTT, PIN-EK, LCD, LM35
+// ESP32-C3 KONFIGURÁCIÓ (V5 MASTER / GATEWAY): WIFI, MQTT, PIN-EK, LCD, LM35
 // ============================================================================
 
 // --- WiFi beállítások ---
@@ -23,8 +23,6 @@ constexpr const char* TOPIC_STATUS    = "futes/haz-futes/status";    // retained
 constexpr const char* TOPIC_TELEMETRY = "futes/haz-futes/telemetry"; // 30 mp-enként
 
 // --- PIN-ek (ESP32-C3, ütközésmentes kiosztás) ---
-// Megjegyzés: GPIO 0/2/8/9 strapping pinek; GPIO 18/19 az USB CDC (D-/D+) miatt foglaltak.
-// A PIN_NRF_CE a szabad GPIO 20 lábon, az új riasztó piros LED a szabad GPIO 11 lábon van.
 constexpr uint8_t PIN_LM35      = 2;  // ADC1_CH2
 
 constexpr uint8_t PIN_ENC_CLK   = 5;
@@ -37,13 +35,13 @@ constexpr uint8_t LCD_I2C_ADDR  = 0x27;
 constexpr uint8_t LCD_COLS      = 20;
 constexpr uint8_t LCD_ROWS      = 2;
 
-constexpr uint8_t PIN_NRF_CE    = 20; // Szabad GPIO20 (korábbi GPIO0 strapping pin helyett; GPIO18/19 USB CDC)
+constexpr uint8_t PIN_ALARM_LED = 11; // Riasztó piros LED (GPIO 11, 500ms villogás)
+
+constexpr uint8_t PIN_NRF_CE    = 20; // Szabad GPIO20 (GPIO18/19 USB CDC)
 constexpr uint8_t PIN_NRF_CSN   = 1;
 constexpr uint8_t PIN_NRF_MISO  = 3;
 constexpr uint8_t PIN_NRF_SCK   = 4;
 constexpr uint8_t PIN_NRF_MOSI  = 10;
-
-constexpr uint8_t PIN_ALARM_LED = 11; // Riasztó piros LED (GPIO11, 500ms villogás aktív riasztásnál)
 
 // --- LM35 Kalibráció és szobai hiszterézis ---
 constexpr float   LM35_OFFSET         = 0.0f;
@@ -67,18 +65,20 @@ constexpr float PUMP_STOP_TEMP_MIN      = 20.0f;
 constexpr float PUMP_STOP_TEMP_MAX      = 40.0f;
 constexpr float PUMP_MIN_HYSTERESIS_GAP = 5.0f;  // pumpStopTemp < pumpStartTemp - 5
 
-constexpr float BOILER_OVERHEAT_TEMP        = 85.0f; // Alap túlmelegedési küszöb (°C)
+// --- Riasztás korlátok ---
 constexpr float ALARM_OVERHEAT_TEMP_DEFAULT = 85.0f;
 constexpr float ALARM_OVERHEAT_TEMP_MIN     = 70.0f;
 constexpr float ALARM_OVERHEAT_TEMP_MAX     = 90.0f;
 constexpr bool  ALARM_ENABLED_DEFAULT       = true;
 
 constexpr uint32_t PUMP_MANUAL_OFF_TIMEOUT_MS = 600000UL; // 10 perc -> vissza auto-ra
-constexpr uint32_t ALARM_BLINK_INTERVAL_MS    = 500UL;    // 500ms BE / 500ms KI villogás
+constexpr uint32_t ALARM_BLINK_INTERVAL_MS    = 500UL;    // 500ms BE / 500ms KI
 
-// --- Időzítések (ms) ---
-constexpr uint32_t NRF_PING_INTERVAL_MS   = 2000UL;  // 2 mp-enként ping
-constexpr uint32_t NRF_TIMEOUT_MS         = 10000UL; // 10 mp -> nrf24_ok = false
+// --- V5 Master-Slave Életjel (Heartbeat) időzítések ---
+constexpr uint32_t NRF_RESPONSE_TIMEOUT_MS  = 500UL; // Max 500ms várakozás RESPONSE-ra
+constexpr uint8_t  NRF_MAX_ATTEMPTS         = 3;     // Max 3 próba egy ping ciklusban
+constexpr uint8_t  NRF_MAX_MISSED_CYCLES    = 3;     // 3 egymás utáni sikertelen ciklus -> nrf_fail
+
 constexpr uint32_t TELEMETRY_INTERVAL_MS  = 30000UL; // 30 mp-enként telemetry
 constexpr uint32_t LM35_READ_INTERVAL_MS  = 1000UL;  // 1 mp-enként szobahő mérés
 constexpr uint32_t WIFI_RECONNECT_MS      = 10000UL; // 10 mp nem-blokkoló WiFi retry

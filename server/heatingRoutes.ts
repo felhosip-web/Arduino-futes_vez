@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { HeatingMqttBridge } from './mqttBridge.ts';
 import {
   buildAlarmUpdateCommand,
+  buildHeartbeatUpdateCommand,
   buildPumpUpdateCommand,
   buildSingleOutputCommand,
   hasValidEspStatus,
@@ -219,6 +220,55 @@ export function createHeatingRouter(bridge: HeatingMqttBridge): Router {
         ok: true,
         topic: `futes/${id}/cmd`,
         alarmConfig: result.command.alarmConfig,
+        command: result.command,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'MQTT küldési hiba.';
+      res.status(503).json({ error: message });
+    }
+  });
+
+  // POST /api/heating/:id/heartbeat - csak a heartbeat módosítása, a többi mező a frissebb forrásból
+  router.post('/:id/heartbeat', async (req, res) => {
+    const { id } = req.params;
+
+    if (
+      !req.body ||
+      typeof req.body !== 'object' ||
+      Array.isArray(req.body) ||
+      !(req.body as Record<string, unknown>).heartbeat ||
+      typeof (req.body as Record<string, unknown>).heartbeat !== 'object' ||
+      Array.isArray((req.body as Record<string, unknown>).heartbeat)
+    ) {
+      res.status(400).json({ error: 'A kérés törzsének tartalmaznia kell egy érvényes heartbeat objektumot.' });
+      return;
+    }
+
+    try {
+      const result = await withDeviceLock(id, async () => {
+        const current = bridge.getDeviceState(id);
+        if (!hasValidEspStatus(current)) {
+          return { status: 409 as const, error: 'Nincs még ESP állapot' };
+        }
+
+        const built = buildHeartbeatUpdateCommand(current, req.body);
+        if (!built.ok) {
+          return { status: 400 as const, error: built.error };
+        }
+
+        await bridge.publishCommand(id, built.value);
+        return { status: 200 as const, command: built.value };
+      });
+
+      if (result.status !== 200) {
+        res.status(result.status).json({ error: result.error });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        topic: `futes/${id}/cmd`,
+        heartbeat: result.command.heartbeat,
         command: result.command,
       });
     } catch (err) {

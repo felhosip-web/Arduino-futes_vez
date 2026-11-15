@@ -1,6 +1,7 @@
 import mqtt from 'mqtt';
 import type { MqttClient } from 'mqtt';
 import type { Server as SocketIOServer } from 'socket.io';
+import { VALID_HEARTBEAT_INTERVALS } from './types.ts';
 import type {
   HeatingCommand,
   HeatingStatusPayload,
@@ -50,6 +51,7 @@ export function mergeHeatingStatus(
     pumpConfig: mergeDefined(prevStatus.pumpConfig, parsed.pumpConfig)!,
     alarmConfig: mergeDefined(prevStatus.alarmConfig, parsed.alarmConfig)!,
     alarmState: mergeDefined(prevStatus.alarmState, parsed.alarmState)!,
+    heartbeat: mergeDefined(prevStatus.heartbeat, parsed.heartbeat)!,
   };
 }
 
@@ -89,10 +91,24 @@ export function isFullEspPayload(parsed: Partial<HeatingStatusPayload>): boolean
     return false;
   }
 
-  return (
+  const alarmValid =
     typeof ac.overheatTemp === 'number' &&
     Number.isFinite(ac.overheatTemp) &&
-    typeof ac.alarmEnabled === 'boolean'
+    typeof ac.alarmEnabled === 'boolean';
+
+  if (!alarmValid) {
+    return false;
+  }
+
+  const hb = parsed.heartbeat;
+  if (!hb || typeof hb !== 'object' || Array.isArray(hb)) {
+    return false;
+  }
+
+  return (
+    typeof hb.intervalSec === 'number' &&
+    Number.isFinite(hb.intervalSec) &&
+    (VALID_HEARTBEAT_INTERVALS as readonly number[]).includes(hb.intervalSec)
   );
 }
 
@@ -197,6 +213,7 @@ export class HeatingMqttBridge {
       lastUpdatedAt: nowMs,
       alarmConfig: mergedStatus.alarmConfig ?? prev?.alarmConfig ?? null,
       alarmState: mergedStatus.alarmState ?? prev?.alarmState ?? null,
+      heartbeat: mergedStatus.heartbeat ?? prev?.heartbeat ?? null,
     };
 
     this.states.set(deviceId, nextState);

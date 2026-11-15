@@ -37,6 +37,10 @@ export interface AlarmState {
   reason: AlarmReason;
 }
 
+export interface HeartbeatConfig {
+  intervalSec: number;
+}
+
 export interface HeatingTemperatures {
   eloremeno: number | null;
   visszatero: number | null;
@@ -57,10 +61,13 @@ export interface HeatingStatusPayload {
   pumpState: PumpState;
   alarmConfig: AlarmConfig;
   alarmState: AlarmState;
+  heartbeat: HeartbeatConfig;
   nrf24_ok: boolean;
   error: string | null;
   manualHeating?: boolean;
   nanoCounter?: number;
+  seq?: number;
+  counter?: number;
 }
 
 export interface HeatingCommandPayload {
@@ -70,6 +77,7 @@ export interface HeatingCommandPayload {
   kimenetek: HeatingOutputs;
   pumpConfig: PumpConfig;
   alarmConfig: AlarmConfig;
+  heartbeat: HeartbeatConfig;
 }
 
 export interface StoredDeviceState {
@@ -83,6 +91,7 @@ export interface StoredDeviceState {
   lastUpdatedAt: number;
   alarmConfig?: AlarmConfig | null;
   alarmState?: AlarmState | null;
+  heartbeat?: HeartbeatConfig | null;
 }
 
 export interface HeatingUpdateEvent {
@@ -120,6 +129,10 @@ export const DEFAULT_ALARM_CONFIG: AlarmConfig = {
 export const DEFAULT_ALARM_STATE: AlarmState = {
   active: false,
   reason: 'none',
+};
+
+export const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
+  intervalSec: 5,
 };
 
 export const OUTPUT_ITEMS: ReadonlyArray<{ key: OutputKey; label: string; bit: number }> = [

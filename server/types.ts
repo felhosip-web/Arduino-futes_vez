@@ -40,6 +40,12 @@ export interface AlarmState {
   reason: AlarmReason;
 }
 
+export const VALID_HEARTBEAT_INTERVALS = [5, 10, 15, 20, 25, 30] as const;
+
+export interface HeartbeatConfig {
+  intervalSec: number;
+}
+
 export interface HeatingCommand {
   targetTemp: number;
   mode: HeatingMode;
@@ -47,6 +53,7 @@ export interface HeatingCommand {
   kimenetek: HeatingOutputs;
   pumpConfig: PumpConfig;
   alarmConfig: AlarmConfig;
+  heartbeat: HeartbeatConfig;
 }
 
 export interface HeatingTemperatures {
@@ -69,6 +76,7 @@ export interface HeatingStatusPayload {
   pumpState: PumpState;
   alarmConfig: AlarmConfig;
   alarmState: AlarmState;
+  heartbeat: HeartbeatConfig;
   nrf24_ok: boolean;
   error: string | null;
   manualHeating?: boolean;
@@ -86,6 +94,7 @@ export interface StoredDeviceState {
   lastUpdatedAt: number;
   alarmConfig?: AlarmConfig | null;
   alarmState?: AlarmState | null;
+  heartbeat?: HeartbeatConfig | null;
 }
 
 export interface HeatingUpdateEvent {

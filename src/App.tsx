@@ -5,9 +5,11 @@ import { API_URL, DEVICE_ID } from './config';
 import {
   DEFAULT_ALARM_CONFIG,
   DEFAULT_ALARM_STATE,
+  DEFAULT_HEARTBEAT_CONFIG,
   DEFAULT_OUTPUTS,
   DEFAULT_PUMP_CONFIG,
   type AlarmConfig,
+  type HeartbeatConfig,
   type HeatingCommandPayload,
   type HeatingMode,
   type HeatingStatusPayload,
@@ -20,6 +22,7 @@ import { HeatingControl } from './components/HeatingControl';
 import { Temperatures } from './components/Temperatures';
 import { PumpControl } from './components/PumpControl';
 import { AlarmControl } from './components/AlarmControl';
+import { HeartbeatControl } from './components/HeartbeatControl';
 import { BoilerControl } from './components/BoilerControl';
 import { BoilerStatus } from './components/BoilerStatus';
 
@@ -54,6 +57,7 @@ export default function App() {
   const [sendingCommand, setSendingCommand] = useState<boolean>(false);
   const [sendingPump, setSendingPump] = useState<boolean>(false);
   const [sendingAlarm, setSendingAlarm] = useState<boolean>(false);
+  const [sendingHeartbeat, setSendingHeartbeat] = useState<boolean>(false);
   const [pendingOutputKey, setPendingOutputKey] = useState<OutputKey | null>(null);
   const [waitingForEsp, setWaitingForEsp] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -67,6 +71,7 @@ export default function App() {
         pumpState: candidate.pumpState ?? (candidate.kimenetek.szivattyu ? 'futes' : 'varakozas'),
         alarmConfig: candidate.alarmConfig ?? DEFAULT_ALARM_CONFIG,
         alarmState: candidate.alarmState ?? DEFAULT_ALARM_STATE,
+        heartbeat: candidate.heartbeat ?? DEFAULT_HEARTBEAT_CONFIG,
       });
       setLastUpdatedAt(deviceState?.lastUpdatedAt ?? Date.now());
       setWaitingForEsp(false);
@@ -144,6 +149,7 @@ export default function App() {
         kimenetek: status.kimenetek ?? DEFAULT_OUTPUTS,
         pumpConfig: status.pumpConfig ?? DEFAULT_PUMP_CONFIG,
         alarmConfig: status.alarmConfig ?? DEFAULT_ALARM_CONFIG,
+        heartbeat: status.heartbeat ?? DEFAULT_HEARTBEAT_CONFIG,
       };
 
       try {
@@ -223,6 +229,32 @@ export default function App() {
     }
   }, []);
 
+  const handleSendHeartbeat = useCallback(async (heartbeat: HeartbeatConfig) => {
+    setSendingHeartbeat(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ heartbeat }),
+      });
+      if (res.status === 409) {
+        setWaitingForEsp(true);
+        return;
+      }
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error || `Életjel beállítási hiba (HTTP ${res.status})`);
+      }
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Hiba az életjel intervallum beállításakor.';
+      setErrorMsg(message);
+    } finally {
+      setSendingHeartbeat(false);
+    }
+  }, []);
+
   const handleToggleOutput = useCallback(async (nev: OutputKey, ertek: boolean) => {
     setPendingOutputKey(nev);
     setErrorMsg(null);
@@ -269,6 +301,10 @@ export default function App() {
               </span>
               <span aria-hidden="true">·</span>
               <span className="tabular-nums">Frissítve: {formatTimestamp(lastUpdatedAt)}</span>
+              <span aria-hidden="true">·</span>
+              <span className="tabular-nums">
+                Ping: {status?.heartbeat?.intervalSec ?? DEFAULT_HEARTBEAT_CONFIG.intervalSec}s
+              </span>
             </div>
           </div>
 
@@ -374,6 +410,15 @@ export default function App() {
               kazanTemp={status.homersekletek?.kazan ?? null}
               sending={sendingAlarm}
               onSendAlarmConfig={handleSendAlarmConfig}
+            />
+
+            <HeartbeatControl
+              heartbeat={status.heartbeat ?? DEFAULT_HEARTBEAT_CONFIG}
+              nrf24Ok={Boolean(status.nrf24_ok)}
+              lastUpdatedAt={lastUpdatedAt}
+              counterValue={status.nanoCounter ?? status.seq ?? status.counter}
+              sending={sendingHeartbeat}
+              onSendHeartbeat={handleSendHeartbeat}
             />
 
             <BoilerControl

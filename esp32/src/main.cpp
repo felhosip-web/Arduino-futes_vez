@@ -12,7 +12,14 @@
 #include "../../nano/src/common.h"
 
 // ============================================================================
-// ESP32-C3 - SZOBA OLDALI TERMOSZTÁT, KAZÁNVÉDELEM, RIASZTÁS & GATEWAY (V4)
+// ESP32-C3 - SZOBA OLDALI MASTER / GATEWAY (V5 MASTER-SLAVE PROTOKOLL)
+// ============================================================================
+// - Master -> Slave REQUEST (0xA1) növekvő seq-el, majd max 500ms várakozás
+//   Slave -> Master RESPONSE (0xB2) csomagra, max 3 próbával, AckPayload KI.
+// - Seq ellenőrzés: nem egyező seq-ű RESPONSE eldobása.
+// - 3 egymás utáni sikertelen ping ciklus -> nrf24_ok = false, alarmState nrf_fail.
+// - Heartbeat intervallum: 5, 10, 15, 20, 25, 30 mp (alap: 5 mp).
+// - Szivattyú kazánvédelmi állapotgép + szobai hiszterézis + riasztás + LCD + MQTT.
 // ============================================================================
 
 SPIClass spiNrf(FSPI);
@@ -22,29 +29,33 @@ HeatingLcd lcd;
 WiFiClientSecure wifiSecureClient;
 PubSubClient mqtt(wifiSecureClient);
 
-// --- Rendszer állapot ---
 struct SystemState {
-    // Szobatermosztát (csak jelzés + encoder)
+    // Szobatermosztát (LM35 + encoder, külön a szivattyútól)
     float   currentTemp   = 20.0f;
     float   targetTemp    = TARGET_TEMP_DEFAULT;
     bool    heatingOn     = false;
     uint8_t mode          = MODE_AUTO;
     bool    manualHeating = false;
 
-    // Kimenetek (bit0-t a kazánvédelmi állapotgép + biztonsági szabályok vezérlik)
+    // Kimenetek (bit0 a kazánvédelmi állapotgéphez kötött)
     uint8_t outputsMask   = 0;
     bool    userLedPiros  = false;
 
     // Nano felől érkező adatok (-127.0f ha szenzorhiba)
-    float            eloremeno       = SENSOR_DISCONNECTED_VAL;
-    float            visszatero      = SENSOR_DISCONNECTED_VAL;
-    float            kazan           = SENSOR_DISCONNECTED_VAL;
-    float            kulteri         = SENSOR_DISCONNECTED_VAL;
-    uint8_t          kazanStatus[8]  = { 0 };
-    uint32_t         nanoCounter     = 0;
-    uint8_t          sensorValidMask = 0;
-    AlarmStatePacked nanoAlarmState  = { 0, ALARM_REASON_NONE };
-    bool             nrf24Ok         = false;
+    float            eloremeno              = SENSOR_DISCONNECTED_VAL;
+    float            visszatero             = SENSOR_DISCONNECTED_VAL;
+    float            kazan                  = SENSOR_DISCONNECTED_VAL;
+    float            kulteri                = SENSOR_DISCONNECTED_VAL;
+    uint8_t          kazanStatus[8]         = { 0 };
+    uint32_t         nanoCounter            = 0;
+    uint8_t          sensorValidMask        = 0;
+    AlarmStatePacked nanoAlarmState         = { 0, ALARM_REASON_NONE };
+    bool             nrf24Ok                = false;
+    uint8_t          consecutiveMissedPings = 0;
+
+    // V5 Master-Slave életjel protokoll
+    uint8_t  heartbeatIntervalSec = HEARTBEAT_DEFAULT_SEC;
+    uint32_t txSeq                = 0;
 
     // Kazánvédelem (szivattyú állapotgép)
     PumpConfigPacked pumpConfig = {
@@ -59,7 +70,7 @@ struct SystemState {
     bool     safetyOverheat    = false;
     bool     safetySensorFault = false;
 
-    // Riasztási konfiguráció és állapot
+    // Riasztási konfiguráció és egyesített állapot
     AlarmConfigPacked alarmConfig = {
         ALARM_OVERHEAT_TEMP_DEFAULT,
         ALARM_ENABLED_DEFAULT ? 1 : 0
@@ -72,8 +83,7 @@ struct SystemState {
 
 // --- Időzítők ---
 uint32_t lastLm35Ms       = 0;
-uint32_t lastNrfPingMs    = 0;
-uint32_t lastNrfAckMs     = 0;
+uint32_t lastHeartbeatMs  = 0;
 uint32_t lastTelemetryMs  = 0;
 uint32_t lastWifiTryMs    = 0;
 uint32_t lastMqttTryMs    = 0;
@@ -125,7 +135,7 @@ void IRAM_ATTR isrEncoderButton() {
 }
 
 // ============================================================================
-// SEGÉDFÜGGVÉNYEK ÉS KONVERZIÓK
+// SEGÉDFÜGGVÉNYEK ÉS SZANITIZÁLÁS
 // ============================================================================
 inline bool isSensorValid(float t) {
     return !isnan(t) && t > -120.0f && t <= 125.0f;
@@ -198,13 +208,16 @@ const char* alarmReasonToStr(uint8_t r) {
 }
 
 void sanitizePumpConfig(PumpConfigPacked& cfg) {
+    if (isnan(cfg.pumpStartTemp)) cfg.pumpStartTemp = PUMP_START_TEMP_DEFAULT;
+    if (isnan(cfg.pumpStopTemp))  cfg.pumpStopTemp  = PUMP_STOP_TEMP_DEFAULT;
+
     if (cfg.pumpStartTemp < PUMP_START_TEMP_MIN) cfg.pumpStartTemp = PUMP_START_TEMP_MIN;
     if (cfg.pumpStartTemp > PUMP_START_TEMP_MAX) cfg.pumpStartTemp = PUMP_START_TEMP_MAX;
 
     if (cfg.pumpStopTemp < PUMP_STOP_TEMP_MIN) cfg.pumpStopTemp = PUMP_STOP_TEMP_MIN;
     if (cfg.pumpStopTemp > PUMP_STOP_TEMP_MAX) cfg.pumpStopTemp = PUMP_STOP_TEMP_MAX;
 
-    // MINDIG pumpStopTemp < pumpStartTemp - 5 kell legyen
+    // MINDIG pumpStopTemp < pumpStartTemp - 5
     float maxAllowedStop = cfg.pumpStartTemp - PUMP_MIN_HYSTERESIS_GAP;
     if (cfg.pumpStopTemp >= maxAllowedStop) {
         cfg.pumpStopTemp = maxAllowedStop - 0.5f;
@@ -224,6 +237,10 @@ void sanitizeAlarmConfig(AlarmConfigPacked& cfg) {
     cfg.alarmEnabled = cfg.alarmEnabled ? 1 : 0;
 }
 
+bool isValidHeartbeatInterval(int val) {
+    return val == 5 || val == 10 || val == 15 || val == 20 || val == 25 || val == 30;
+}
+
 // ============================================================================
 // LM35 SZOBAI HŐMÉRSÉKLET OLVASÁSA (10 MÉRÉS ÁTLAGA)
 // ============================================================================
@@ -238,7 +255,7 @@ float readRoomTempLM35() {
 }
 
 // ============================================================================
-// SZOBAFŰTÉS HISZTERÉZIS (CSAK JELZÉS A FRONTENDNEK, NEM VEZÉRLI A SZIVATTYÚT)
+// SZOBAFŰTÉS HISZTERÉZIS (CSAK JELZÉS A FRONTENDNEK)
 // ============================================================================
 void evaluateRoomHeatingIndicator() {
     if (state.mode == MODE_OFF) {
@@ -249,7 +266,6 @@ void evaluateRoomHeatingIndicator() {
         state.heatingOn = state.manualHeating;
         return;
     }
-    // MODE_AUTO: BE ha currentTemp < target - 0.3, KI ha > target + 0.3
     if (state.currentTemp < (state.targetTemp - HYST_LOW_OFFSET)) {
         state.heatingOn = true;
     } else if (state.currentTemp > (state.targetTemp + HYST_HIGH_OFFSET)) {
@@ -258,7 +274,7 @@ void evaluateRoomHeatingIndicator() {
 }
 
 // ============================================================================
-// KAZÁNVÉDELEM ÁLLAPOTGÉP + BIZTONSÁGI SZABÁLYOK + RIASZTÁS ÁLLAPOT
+// KAZÁNVÉDELEM ÁLLAPOTGÉP + BIZTONSÁGI SZABÁLYOK + RIASZTÁS (OR LOGIKA)
 // ============================================================================
 bool getSelectedStartSensorTemp(float& outTemp) {
     bool kOk = isSensorValid(state.kazan);
@@ -294,15 +310,18 @@ void evaluateAlarmState() {
         return;
     }
 
-    if (state.safetyOverheat) {
+    // Saját és Nano-tól jött riasztás egyesítése (OR logika, prioritási sorrendben)
+    if (state.safetyOverheat ||
+        (state.nanoAlarmState.active != 0 && state.nanoAlarmState.reason == ALARM_REASON_OVERHEAT)) {
         state.alarmState.active = 1;
         state.alarmState.reason = ALARM_REASON_OVERHEAT;
-    } else if (state.safetySensorFault) {
-        state.alarmState.active = 1;
-        state.alarmState.reason = ALARM_REASON_SENSOR_FAIL;
-    } else if (!state.nrf24Ok) {
+    } else if (!state.nrf24Ok && state.consecutiveMissedPings >= NRF_MAX_MISSED_CYCLES) {
         state.alarmState.active = 1;
         state.alarmState.reason = ALARM_REASON_NRF_FAIL;
+    } else if (state.safetySensorFault ||
+               (state.nanoAlarmState.active != 0 && state.nanoAlarmState.reason == ALARM_REASON_SENSOR_FAIL)) {
+        state.alarmState.active = 1;
+        state.alarmState.reason = ALARM_REASON_SENSOR_FAIL;
     } else if (state.nanoAlarmState.active != 0) {
         state.alarmState.active = 1;
         state.alarmState.reason = state.nanoAlarmState.reason;
@@ -312,11 +331,10 @@ void evaluateAlarmState() {
     }
 }
 
-// Visszatér true-val, ha manual_off 10 perc után automatikusan visszaállt auto-ra
 bool evaluateBoilerPumpProtection(uint32_t now) {
     bool modeAutoRestored = false;
 
-    // 0. 10 perces manual_off automatikus visszaállás ellenőrzése
+    // 10 perces manual_off automatikus visszaállás
     if (state.pumpConfig.pumpMode == PUMP_MODE_MANUAL_OFF) {
         if (now - state.manualOffStartMs >= PUMP_MANUAL_OFF_TIMEOUT_MS) {
             state.pumpConfig.pumpMode = PUMP_MODE_AUTO;
@@ -325,7 +343,6 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
         }
     }
 
-    // 1. Állapotgép (pumpMode == "auto") vagy manuális felülbírálás
     bool desiredPump = false;
     if (state.pumpConfig.pumpMode == PUMP_MODE_AUTO) {
         if (state.pumpState == PUMP_STATE_VARAKOZAS) {
@@ -334,7 +351,7 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
                 state.pumpState = PUMP_STATE_FUTES;
             }
         } else {
-            // PUMP_STATE_FUTES: hűlésnél CSAK az eloremeno <= pumpStopTemp feltételt figyeljük!
+            // Hűlésnél CSAK az eloremeno <= pumpStopTemp feltételt figyeljük
             if (isSensorValid(state.eloremeno) && state.eloremeno <= state.pumpConfig.pumpStopTemp) {
                 state.pumpState = PUMP_STATE_VARAKOZAS;
             }
@@ -348,7 +365,7 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
         state.pumpState = PUMP_STATE_VARAKOZAS;
     }
 
-    // 2. BIZTONSÁGI SZABÁLYOK (minden mást felülírnak, még a manual_off-ot is!)
+    // Biztonsági felülbírálás (még manual_off-ot is felülír)
     bool kazanValid = isSensorValid(state.kazan);
     state.safetySensorFault = !kazanValid;
     state.safetyOverheat    = kazanValid && (state.kazan >= state.alarmConfig.overheatTemp);
@@ -360,10 +377,8 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
 
     state.pumpOn = desiredPump;
 
-    // 3. Riasztási állapot kiértékelése
     evaluateAlarmState();
 
-    // Kimeneti bitmaszk szinkronizálása: bit0 mindig a kazánvédelmi döntés!
     setBit(state.outputsMask, OUT_BIT_SZIVATTYU, state.pumpOn);
     setBit(state.outputsMask, OUT_BIT_LED_ZOLD,  state.pumpOn);
 
@@ -401,46 +416,84 @@ void refreshLcd() {
 }
 
 // ============================================================================
-// NRF24 KOMMUNIKÁCIÓ A NANO FELÉ (32 BYTE STRUCT + ACK PAYLOAD)
+// V5 MASTER-SLAVE NRF24 KOMMUNIKÁCIÓ (REQUEST 0xA1 -> RESPONSE 0xB2)
 // ============================================================================
-bool sendToNanoAndReadAck() {
-    NrfPacket tx{};
-    tx.packetType        = PKT_TYPE_ESP_TO_NANO;
-    tx.esp.outputsMask   = state.outputsMask;
-    tx.esp.targetTemp    = state.targetTemp;
-    tx.esp.mode          = state.mode;
-    tx.esp.manualHeating = state.manualHeating ? 1 : 0;
-    tx.esp.pumpConfig    = state.pumpConfig;
-    tx.esp.alarmConfig   = state.alarmConfig;
-
-    bool ok = radio.write(&tx, sizeof(tx));
-    if (ok) {
-        lastNrfAckMs = millis();
-        if (!state.nrf24Ok) {
-            state.nrf24Ok = true;
-            Serial.println(F("[ESP] NRF24 kapcsolat helyreallt."));
-        }
-
-        while (radio.isAckPayloadAvailable()) {
-            NrfPacket rx{};
-            radio.read(&rx, sizeof(rx));
-            if (rx.packetType == PKT_TYPE_NANO_TO_ESP) {
-                state.eloremeno   = rx.nano.eloremeno;
-                state.visszatero  = rx.nano.visszatero;
-                state.kazan       = rx.nano.kazan;
-                state.kulteri     = rx.nano.kulteri;
-                memcpy(state.kazanStatus, rx.nano.kazan_status, 8);
-                state.nanoCounter     = rx.nano.counter;
-                state.sensorValidMask = rx.nano.sensorValidMask;
-                state.nanoAlarmState  = rx.nano.alarmState;
-            }
-        }
+bool sendRequestToNano() {
+    state.txSeq++;
+    if (state.txSeq == 0) {
+        state.txSeq = 1;
     }
-    return ok;
+
+    NrfPacket tx{};
+    tx.packetType               = PKT_TYPE_REQUEST;
+    tx.esp.outputsMask          = state.outputsMask;
+    tx.esp.targetTemp           = state.targetTemp;
+    tx.esp.mode                 = state.mode;
+    tx.esp.manualHeating        = state.manualHeating ? 1 : 0;
+    tx.esp.pumpConfig           = state.pumpConfig;
+    tx.esp.alarmConfig          = state.alarmConfig;
+    tx.esp.heartbeatIntervalSec = state.heartbeatIntervalSec;
+    tx.esp.seq                  = state.txSeq;
+
+    for (uint8_t attempt = 0; attempt < NRF_MAX_ATTEMPTS; attempt++) {
+        radio.stopListening();
+        radio.flush_rx();
+        radio.write(&tx, sizeof(tx));
+        radio.startListening();
+
+        uint32_t waitStartMs = millis();
+        while (millis() - waitStartMs < NRF_RESPONSE_TIMEOUT_MS) {
+            updateAlarmBlinkAndLed(millis());
+
+            if (radio.available()) {
+                NrfPacket rx{};
+                radio.read(&rx, sizeof(rx));
+
+                if (rx.packetType == PKT_TYPE_RESPONSE && rx.nano.seq == tx.esp.seq) {
+                    radio.stopListening();
+
+                    state.eloremeno       = rx.nano.eloremeno;
+                    state.visszatero      = rx.nano.visszatero;
+                    state.kazan           = rx.nano.kazan;
+                    state.kulteri         = rx.nano.kulteri;
+                    state.nanoCounter     = rx.nano.counter;
+                    state.sensorValidMask = rx.nano.sensorValidMask;
+                    state.nanoAlarmState  = rx.nano.alarmState;
+
+                    for (uint8_t b = 0; b < 8; b++) {
+                        state.kazanStatus[b] = getBit(rx.nano.kazanStatusMask, b) ? 1 : 0;
+                    }
+
+                    state.consecutiveMissedPings = 0;
+                    if (!state.nrf24Ok) {
+                        state.nrf24Ok = true;
+                        Serial.println(F("[ESP] NRF24 Master-Slave kapcsolat helyreallt."));
+                    }
+                    return true;
+                }
+                // Nem egyező seq vagy típus esetén eldobjuk és várunk tovább az ablakon belül
+            }
+            delay(1);
+        }
+
+        radio.stopListening();
+    }
+
+    if (state.consecutiveMissedPings < 255) {
+        state.consecutiveMissedPings++;
+    }
+    if (state.consecutiveMissedPings >= NRF_MAX_MISSED_CYCLES) {
+        if (state.nrf24Ok) {
+            Serial.println(F("[ESP] HIBA: 3 egymas utani pingre nincs valasz -> NRF HIBA!"));
+        }
+        state.nrf24Ok = false;
+    }
+
+    return false;
 }
 
 // ============================================================================
-// MQTT JSON STATUS & TELEMETRY PUBLISH (V4 + ALARM)
+// MQTT JSON STATUS & TELEMETRY PUBLISH (V5)
 // ============================================================================
 void buildStatusJson(JsonDocument& doc) {
     doc["currentTemp"] = round1(state.currentTemp);
@@ -486,10 +539,13 @@ void buildStatusJson(JsonDocument& doc) {
     aState["active"] = (state.alarmState.active != 0);
     aState["reason"] = alarmReasonToStr(state.alarmState.reason);
 
+    JsonObject hb = doc["heartbeat"].to<JsonObject>();
+    hb["intervalSec"] = state.heartbeatIntervalSec;
+
     doc["nrf24_ok"] = state.nrf24Ok;
 
-    if (!state.nrf24Ok) {
-        doc["error"] = "NRF24 kommunikacios hiba (10s timeout)";
+    if (!state.nrf24Ok && state.consecutiveMissedPings >= NRF_MAX_MISSED_CYCLES) {
+        doc["error"] = "NRF24 kommunikacios hiba (3 ping kimaradt)";
     } else if (state.safetyOverheat) {
         doc["error"] = "Kazan tulmelegedes (>= overheatTemp) - szivattyu kenyszeritett BE";
     } else if (state.safetySensorFault) {
@@ -503,10 +559,10 @@ void publishMqttStatus() {
     if (!mqtt.connected()) return;
     JsonDocument doc;
     buildStatusJson(doc);
-    char payload[1280];
+    char payload[1536];
     size_t n = serializeJson(doc, payload, sizeof(payload));
     if (n > 0) {
-        mqtt.publish(TOPIC_STATUS, reinterpret_cast<const uint8_t*>(payload), n, true); // retained = true
+        mqtt.publish(TOPIC_STATUS, reinterpret_cast<const uint8_t*>(payload), n, true); // retained=true
     }
 }
 
@@ -515,7 +571,7 @@ void publishMqttTelemetry() {
     JsonDocument doc;
     buildStatusJson(doc);
     doc["nanoCounter"] = state.nanoCounter;
-    char payload[1280];
+    char payload[1536];
     size_t n = serializeJson(doc, payload, sizeof(payload));
     if (n > 0) {
         mqtt.publish(TOPIC_TELEMETRY, reinterpret_cast<const uint8_t*>(payload), n, false);
@@ -553,7 +609,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
     if (doc["kimenetek"].is<JsonObject>()) {
         JsonObject k = doc["kimenetek"].as<JsonObject>();
-        // bit0 (szivattyu) védelmi állapotgép alá tartozik, a többi bit állítható
         if (k["led_zold"].is<bool>())  setBit(state.outputsMask, OUT_BIT_LED_ZOLD,  k["led_zold"].as<bool>());
         if (k["led_piros"].is<bool>()) state.userLedPiros = k["led_piros"].as<bool>();
         if (k["tartalek1"].is<bool>()) setBit(state.outputsMask, OUT_BIT_TARTALEK1, k["tartalek1"].as<bool>());
@@ -595,12 +650,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         sanitizeAlarmConfig(state.alarmConfig);
     }
 
+    if (doc["heartbeat"].is<JsonObject>()) {
+        JsonObject hb = doc["heartbeat"].as<JsonObject>();
+        if (hb["intervalSec"].is<int>()) {
+            int sec = hb["intervalSec"].as<int>();
+            if (isValidHeartbeatInterval(sec)) {
+                state.heartbeatIntervalSec = static_cast<uint8_t>(sec);
+            }
+        }
+    }
+
     uint32_t now = millis();
     evaluateRoomHeatingIndicator();
     evaluateBoilerPumpProtection(now);
     updateAlarmBlinkAndLed(now);
-    sendToNanoAndReadAck();
-    evaluateBoilerPumpProtection(now);
+    sendRequestToNano();
+    lastHeartbeatMs = millis();
+    evaluateBoilerPumpProtection(lastHeartbeatMs);
+    updateAlarmBlinkAndLed(lastHeartbeatMs);
     refreshLcd();
     publishMqttStatus();
 }
@@ -677,7 +744,9 @@ void handleEncoderEvents(uint32_t now) {
     if (changed) {
         evaluateRoomHeatingIndicator();
         evaluateBoilerPumpProtection(now);
-        sendToNanoAndReadAck();
+        sendRequestToNano();
+        lastHeartbeatMs = millis();
+        evaluateBoilerPumpProtection(lastHeartbeatMs);
         refreshLcd();
         publishMqttStatus();
     }
@@ -689,7 +758,7 @@ void handleEncoderEvents(uint32_t now) {
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println(F("\n[ESP32-C3 V4] Szobai termosztat, Kazanvedelem & Riaszto Gateway inditas..."));
+    Serial.println(F("\n[ESP32-C3 V5] Master / Gateway inditas..."));
 
     pinMode(PIN_ALARM_LED, OUTPUT);
     digitalWrite(PIN_ALARM_LED, LOW);
@@ -713,31 +782,33 @@ void setup() {
     if (!radio.begin(&spiNrf)) {
         Serial.println(F("[ESP] HIBA: NRF24L01+ nem talalhato!"));
     } else {
+        radio.disableAckPayload();
+        radio.setPayloadSize(sizeof(NrfPacket));
+        radio.setAutoAck(true);
         radio.setChannel(NRF_CHANNEL);
         radio.setDataRate(RF24_250KBPS);
         radio.setPALevel(RF24_PA_HIGH);
-        radio.setRetries(6, 15);
-        radio.enableDynamicPayloads();
-        radio.enableAckPayload();
-        radio.openWritingPipe(NRF_ADDR_PIPE);
+        radio.setRetries(5, 15);
+        radio.openWritingPipe(NRF_ADDR_MASTER_TO_SLAVE);
+        radio.openReadingPipe(1, NRF_ADDR_SLAVE_TO_MASTER);
         radio.stopListening();
-        Serial.println(F("[ESP] NRF24L01+ keszenletben."));
+        Serial.println(F("[ESP] NRF24L01+ MASTER keszenletben (AckPayload KI)."));
     }
 
     uint32_t now = millis();
-    lastNrfAckMs = now;
     lastAlarmBlinkMs = now;
     evaluateRoomHeatingIndicator();
     evaluateBoilerPumpProtection(now);
-    sendToNanoAndReadAck();
-    evaluateBoilerPumpProtection(now);
-    updateAlarmBlinkAndLed(now);
+    sendRequestToNano();
+    lastHeartbeatMs = millis();
+    evaluateBoilerPumpProtection(lastHeartbeatMs);
+    updateAlarmBlinkAndLed(lastHeartbeatMs);
     refreshLcd();
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    lastWifiTryMs = now;
+    lastWifiTryMs = millis();
 
     wifiSecureClient.setInsecure();
     wifiSecureClient.setTimeout(3);
@@ -750,13 +821,13 @@ void setup() {
 void loop() {
     uint32_t now = millis();
 
-    // 0. Nem-blokkoló 500ms riasztási villogás (GPIO 11 LED + LCD 2. sor váltakozás)
+    // 0. Nem-blokkoló 500ms riasztási villogás (GPIO 11 + LCD)
     updateAlarmBlinkAndLed(now);
 
-    // 1. Encoder és gomb események azonnali feldolgozása
+    // 1. Encoder és gomb események
     handleEncoderEvents(now);
 
-    // 2. LM35 szobai hőmérséklet mérés és szobafűtés-jelzés frissítése
+    // 2. LM35 szobahő mérés és szobafűtés-jelzés
     if (now - lastLm35Ms >= LM35_READ_INTERVAL_MS) {
         lastLm35Ms = now;
         float prevTemp = state.currentTemp;
@@ -771,31 +842,30 @@ void loop() {
 
         if (modeRestored || prevHeat != state.heatingOn || prevPump != state.pumpOn ||
             fabsf(prevTemp - state.currentTemp) >= 0.2f) {
-            sendToNanoAndReadAck();
+            sendRequestToNano();
+            lastHeartbeatMs = millis();
+            evaluateBoilerPumpProtection(lastHeartbeatMs);
             publishMqttStatus();
         }
     }
 
-    // 3. NRF24 ping 2 másodpercenként + 10 mp timeout + kazánvédelem & riasztás újraszámolás
-    if (now - lastNrfPingMs >= NRF_PING_INTERVAL_MS) {
-        lastNrfPingMs = now;
+    // 3. V5 Master-Slave Heartbeat ping minden heartbeatIntervalSec másodpercben
+    uint32_t heartbeatIntervalMs = static_cast<uint32_t>(state.heartbeatIntervalSec) * 1000UL;
+    if (now - lastHeartbeatMs >= heartbeatIntervalMs) {
+        lastHeartbeatMs = now;
+
         bool prevNrfOk       = state.nrf24Ok;
         bool prevPump        = state.pumpOn;
         uint8_t prevPState   = state.pumpState;
         uint8_t prevAlarmAct = state.alarmState.active;
         uint8_t prevAlarmRsn = state.alarmState.reason;
 
-        sendToNanoAndReadAck();
-
-        if (state.nrf24Ok && (now - lastNrfAckMs >= NRF_TIMEOUT_MS)) {
-            state.nrf24Ok = false;
-            Serial.println(F("[ESP] FIGYELEM: NRF24 timeout (>10mp)!"));
-        }
-
-        bool modeRestored = evaluateBoilerPumpProtection(now);
+        sendRequestToNano();
+        bool modeRestored = evaluateBoilerPumpProtection(millis());
 
         if (prevPump != state.pumpOn) {
-            sendToNanoAndReadAck();
+            // Ha a friss hőmérsékletek alapján változott a szivattyú állapot, azonnal szinkronizáljuk
+            sendRequestToNano();
         }
 
         refreshLcd();
@@ -807,10 +877,10 @@ void loop() {
         }
     }
 
-    // 4. WiFi és HiveMQ Cloud MQTT nem-blokkoló karbantartása
+    // 4. WiFi és HiveMQ Cloud MQTT karbantartás
     maintainConnectivity(now);
 
-    // 5. MQTT Telemetry küldés 30 másodpercenként
+    // 5. Telemetry 30 másodpercenként
     if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
         lastTelemetryMs = now;
         publishMqttTelemetry();
