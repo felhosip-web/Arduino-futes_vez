@@ -9,14 +9,21 @@ import type {
   PumpConfig,
   PumpMode,
   PumpStartSensor,
+  SafetyConfig,
   StoredDeviceState,
 } from './types.ts';
+
+export const SAFETY_OVERHEAT_TEMP = 95.0;
+
+export const DEFAULT_SAFETY_CONFIG: SafetyConfig = {
+  safetyOverheatTemp: SAFETY_OVERHEAT_TEMP,
+};
 
 const VALID_MODES: readonly HeatingMode[] = ['auto', 'manual', 'off'];
 const VALID_PUMP_MODES: readonly PumpMode[] = ['auto', 'manual_on', 'manual_off'];
 const VALID_PUMP_SENSORS: readonly PumpStartSensor[] = ['kazan', 'eloremeno', 'max'];
 const PUMP_CONFIG_KEYS = ['pumpMode', 'pumpStartTemp', 'pumpStopTemp', 'pumpStartSensor'] as const;
-const ALARM_CONFIG_KEYS = ['overheatTemp', 'alarmEnabled'] as const;
+const ALARM_CONFIG_KEYS = ['alarmTemp', 'alarmEnabled'] as const;
 const HEARTBEAT_KEYS = ['intervalSec'] as const;
 
 export const DEFAULT_PUMP_CONFIG: PumpConfig = {
@@ -27,13 +34,17 @@ export const DEFAULT_PUMP_CONFIG: PumpConfig = {
 };
 
 export const DEFAULT_ALARM_CONFIG: AlarmConfig = {
-  overheatTemp: 85.0,
+  alarmTemp: 85.0,
   alarmEnabled: true,
 };
 
 export const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
   intervalSec: 5,
 };
+
+export interface ValidationOptions {
+  onWarn?: (code: string, message: string) => void;
+}
 
 export interface ValidationResult<T> {
   ok: true;
@@ -43,6 +54,26 @@ export interface ValidationResult<T> {
 export interface ValidationError {
   ok: false;
   error: string;
+}
+
+function emitWarn(options: ValidationOptions | undefined, code: string, message: string): void {
+  console.warn(`[VALIDATION] [${code}] ${message}`);
+  options?.onWarn?.(code, message);
+}
+
+function normalizeAlarmFallback(
+  cfg?: Partial<AlarmConfig> & { overheatTemp?: unknown }
+): AlarmConfig {
+  const rawTemp =
+    typeof cfg?.alarmTemp === 'number' && Number.isFinite(cfg.alarmTemp)
+      ? cfg.alarmTemp
+      : typeof cfg?.overheatTemp === 'number' && Number.isFinite(cfg.overheatTemp)
+        ? cfg.overheatTemp
+        : DEFAULT_ALARM_CONFIG.alarmTemp;
+  return {
+    alarmTemp: rawTemp,
+    alarmEnabled: typeof cfg?.alarmEnabled === 'boolean' ? cfg.alarmEnabled : DEFAULT_ALARM_CONFIG.alarmEnabled,
+  };
 }
 
 export function isOutputKey(key: unknown): key is OutputKey {
@@ -214,12 +245,12 @@ function validateResolvedPumpConfig(cfg: PumpConfig): ValidationResult<PumpConfi
 
 export function validateAlarmConfig(
   rawAlarmConfig: unknown,
-  fallbackAlarmConfig?: Partial<AlarmConfig>
+  fallbackAlarmConfig?: Partial<AlarmConfig>,
+  options?: ValidationOptions
 ): ValidationResult<AlarmConfig> | ValidationError {
-  const base: AlarmConfig = {
-    overheatTemp: fallbackAlarmConfig?.overheatTemp ?? DEFAULT_ALARM_CONFIG.overheatTemp,
-    alarmEnabled: fallbackAlarmConfig?.alarmEnabled ?? DEFAULT_ALARM_CONFIG.alarmEnabled,
-  };
+  const base = normalizeAlarmFallback(
+    fallbackAlarmConfig as Partial<AlarmConfig> & { overheatTemp?: unknown }
+  );
 
   if (rawAlarmConfig === undefined) {
     return validateResolvedAlarmConfig(base);
@@ -231,18 +262,35 @@ export function validateAlarmConfig(
 
   const raw = rawAlarmConfig as Record<string, unknown>;
   for (const key of Object.keys(raw)) {
+    if (key === 'overheatTemp' || key === 'safetyOverheatTemp') {
+      continue;
+    }
     if (!(ALARM_CONFIG_KEYS as readonly string[]).includes(key)) {
       return { ok: false, error: `Ismeretlen alarmConfig kulcs: "${key}".` };
     }
   }
 
-  let overheatTemp: number;
-  if (raw.overheatTemp === undefined) {
-    overheatTemp = base.overheatTemp;
-  } else if (typeof raw.overheatTemp !== 'number' || !Number.isFinite(raw.overheatTemp)) {
-    return { ok: false, error: 'Az alarmConfig.overheatTemp mezőnek véges számnak kell lennie.' };
+  if (raw.safetyOverheatTemp !== undefined) {
+    emitWarn(options, 'SAFETY_WARN', 'SAFETY_TEMP_IGNORED');
+  }
+
+  let alarmTemp: number;
+  if (raw.alarmTemp !== undefined) {
+    if (raw.overheatTemp !== undefined) {
+      emitWarn(options, 'DEPRECATED', 'DEPRECATED overheatTemp -> alarmTemp');
+    }
+    if (typeof raw.alarmTemp !== 'number' || !Number.isFinite(raw.alarmTemp)) {
+      return { ok: false, error: 'Az alarmConfig.alarmTemp mezőnek véges számnak kell lennie.' };
+    }
+    alarmTemp = Math.round(raw.alarmTemp * 10) / 10;
+  } else if (raw.overheatTemp !== undefined) {
+    emitWarn(options, 'DEPRECATED', 'DEPRECATED overheatTemp -> alarmTemp');
+    if (typeof raw.overheatTemp !== 'number' || !Number.isFinite(raw.overheatTemp)) {
+      return { ok: false, error: 'Az alarmConfig.alarmTemp mezőnek véges számnak kell lennie.' };
+    }
+    alarmTemp = Math.round(raw.overheatTemp * 10) / 10;
   } else {
-    overheatTemp = Math.round(raw.overheatTemp * 10) / 10;
+    alarmTemp = base.alarmTemp;
   }
 
   let alarmEnabled: boolean;
@@ -255,17 +303,17 @@ export function validateAlarmConfig(
   }
 
   return validateResolvedAlarmConfig({
-    overheatTemp,
+    alarmTemp,
     alarmEnabled,
   });
 }
 
 function validateResolvedAlarmConfig(cfg: AlarmConfig): ValidationResult<AlarmConfig> | ValidationError {
-  if (typeof cfg.overheatTemp !== 'number' || !Number.isFinite(cfg.overheatTemp)) {
-    return { ok: false, error: 'Az alarmConfig.overheatTemp mezőnek véges számnak kell lennie.' };
+  if (typeof cfg.alarmTemp !== 'number' || !Number.isFinite(cfg.alarmTemp)) {
+    return { ok: false, error: 'Az alarmConfig.alarmTemp mezőnek véges számnak kell lennie.' };
   }
-  if (cfg.overheatTemp < 70 || cfg.overheatTemp > 90) {
-    return { ok: false, error: 'Az alarmConfig.overheatTemp értéke 70 és 90 °C között lehet.' };
+  if (cfg.alarmTemp < 70 || cfg.alarmTemp > 90) {
+    return { ok: false, error: 'Az alarmConfig.alarmTemp értéke 70 és 90 °C között lehet.' };
   }
 
   if (typeof cfg.alarmEnabled !== 'boolean') {
@@ -330,7 +378,8 @@ function validateResolvedHeartbeat(
 
 export function validateHeatingCommand(
   body: unknown,
-  currentState?: StoredDeviceState
+  currentState?: StoredDeviceState,
+  options?: ValidationOptions
 ): ValidationResult<HeatingCommand> | ValidationError {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { ok: false, error: 'A kérés törzsének érvényes JSON objektumnak kell lennie.' };
@@ -338,6 +387,10 @@ export function validateHeatingCommand(
 
   const raw = body as Record<string, unknown>;
   const freshBase = resolveFreshBase(currentState);
+
+  if (raw.safetyOverheatTemp !== undefined || raw.safety !== undefined) {
+    emitWarn(options, 'SAFETY_WARN', 'SAFETY_TEMP_IGNORED');
+  }
 
   let targetTemp: number;
   if (raw.targetTemp === undefined) {
@@ -414,7 +467,7 @@ export function validateHeatingCommand(
     return pumpValidation;
   }
 
-  const alarmValidation = validateAlarmConfig(raw.alarmConfig, freshBase.alarmConfig);
+  const alarmValidation = validateAlarmConfig(raw.alarmConfig, freshBase.alarmConfig, options);
   if (!alarmValidation.ok) {
     return alarmValidation;
   }
@@ -509,9 +562,7 @@ export function buildSingleOutputCommand(
     pumpConfig: {
       ...(fresh.pumpConfig ?? latest.pumpConfig ?? DEFAULT_PUMP_CONFIG),
     },
-    alarmConfig: {
-      ...(fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG),
-    },
+    alarmConfig: normalizeAlarmFallback(fresh.alarmConfig ?? latest.alarmConfig),
     heartbeat: {
       ...(fresh.heartbeat ?? latest.heartbeat ?? DEFAULT_HEARTBEAT_CONFIG),
     },
@@ -520,13 +571,17 @@ export function buildSingleOutputCommand(
 
 export function buildPumpUpdateCommand(
   state: StoredDeviceState,
-  body: unknown
+  body: unknown,
+  options?: ValidationOptions
 ): ValidationResult<HeatingCommand> | ValidationError {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { ok: false, error: 'A kérés törzsének JSON objektumnak kell lennie.' };
   }
 
   const raw = body as Record<string, unknown>;
+  if (raw.safetyOverheatTemp !== undefined || raw.safety !== undefined) {
+    emitWarn(options, 'SAFETY_WARN', 'SAFETY_TEMP_IGNORED');
+  }
   if (!raw.pumpConfig || typeof raw.pumpConfig !== 'object' || Array.isArray(raw.pumpConfig)) {
     return { ok: false, error: 'A pumpConfig objektum kötelező.' };
   }
@@ -552,9 +607,7 @@ export function buildPumpUpdateCommand(
         ...(fresh.kimenetek ?? latest.kimenetek),
       },
       pumpConfig: pumpValidation.value,
-      alarmConfig: {
-        ...(fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG),
-      },
+      alarmConfig: normalizeAlarmFallback(fresh.alarmConfig ?? latest.alarmConfig),
       heartbeat: {
         ...(fresh.heartbeat ?? latest.heartbeat ?? DEFAULT_HEARTBEAT_CONFIG),
       },
@@ -564,13 +617,17 @@ export function buildPumpUpdateCommand(
 
 export function buildAlarmUpdateCommand(
   state: StoredDeviceState,
-  body: unknown
+  body: unknown,
+  options?: ValidationOptions
 ): ValidationResult<HeatingCommand> | ValidationError {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { ok: false, error: 'A kérés törzsének JSON objektumnak kell lennie.' };
   }
 
   const raw = body as Record<string, unknown>;
+  if (raw.safetyOverheatTemp !== undefined || raw.safety !== undefined) {
+    emitWarn(options, 'SAFETY_WARN', 'SAFETY_TEMP_IGNORED');
+  }
   if (!raw.alarmConfig || typeof raw.alarmConfig !== 'object' || Array.isArray(raw.alarmConfig)) {
     return { ok: false, error: 'Az alarmConfig objektum kötelező.' };
   }
@@ -580,7 +637,8 @@ export function buildAlarmUpdateCommand(
 
   const alarmValidation = validateAlarmConfig(
     raw.alarmConfig,
-    fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG
+    fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG,
+    options
   );
   if (!alarmValidation.ok) {
     return alarmValidation;
@@ -608,13 +666,17 @@ export function buildAlarmUpdateCommand(
 
 export function buildHeartbeatUpdateCommand(
   state: StoredDeviceState,
-  body: unknown
+  body: unknown,
+  options?: ValidationOptions
 ): ValidationResult<HeatingCommand> | ValidationError {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { ok: false, error: 'A kérés törzsének JSON objektumnak kell lennie.' };
   }
 
   const raw = body as Record<string, unknown>;
+  if (raw.safetyOverheatTemp !== undefined || raw.safety !== undefined) {
+    emitWarn(options, 'SAFETY_WARN', 'SAFETY_TEMP_IGNORED');
+  }
   if (!raw.heartbeat || typeof raw.heartbeat !== 'object' || Array.isArray(raw.heartbeat)) {
     return { ok: false, error: 'A heartbeat objektum kötelező.' };
   }
@@ -642,9 +704,7 @@ export function buildHeartbeatUpdateCommand(
       pumpConfig: {
         ...(fresh.pumpConfig ?? latest.pumpConfig ?? DEFAULT_PUMP_CONFIG),
       },
-      alarmConfig: {
-        ...(fresh.alarmConfig ?? latest.alarmConfig ?? DEFAULT_ALARM_CONFIG),
-      },
+      alarmConfig: normalizeAlarmFallback(fresh.alarmConfig ?? latest.alarmConfig),
       heartbeat: heartbeatValidation.value,
     },
   };

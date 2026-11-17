@@ -11,8 +11,12 @@
 #include <RF24.h>
 #include <math.h>
 
+#include <time.h>
+
 #include "config.h"
+#include "hivemq_ca.h"
 #include "lcd.h"
+#include "log.h"
 #include "menu.h"
 #include "../../nano/src/common.h"
 
@@ -37,6 +41,7 @@ WebServer wifiPortalServer(80);
 DNSServer wifiPortalDns;
 
 SystemState state;
+Logger logger;
 
 constexpr const char* NVS_NAMESPACE = "futes";
 constexpr const char* WIFI_NVS_NAMESPACE = "wifi";
@@ -47,18 +52,80 @@ constexpr const char* WIFI_PORTAL_IP = "192.168.4.1";
 uint32_t lastLm35Ms       = 0;
 uint32_t lastHeartbeatMs  = 0;
 uint32_t lastTelemetryMs  = 0;
-uint32_t lastWifiTryMs    = 0;
-uint32_t lastMqttTryMs    = 0;
-uint32_t lastAlarmBlinkMs = 0;
+uint32_t lastWifiTryMs       = 0;
+uint32_t lastMqttTryMs       = 0;
+uint32_t mqttRetryIntervalMs = MQTT_RECONNECT_MS;
+bool     mqttAttemptedOnce   = false;
+uint32_t lastAlarmBlinkMs    = 0;
 uint32_t wifiDisconnectStartedMs = 0;
 uint32_t lastWifiPortalTryMs = 0;
 bool     alarmBlinkOn     = false;
 bool     wifiPortalActive = false;
 bool     wifiDisconnectTimerActive = false;
 bool     wifiConnectionFailureReported = false;
+bool     mqttStatusPendingRetry    = false;
+bool     mqttTelemetryPendingRetry = false;
+bool     nrfErrorBannerShown       = false;
+bool     nrfFailLoggedForOutage    = false;
+bool     prevWifiConnected         = false;
+bool     prevMqttConnected         = false;
+bool     ntpConfigured             = false;
+bool     pumpLogInitialized        = false;
+bool     prevPumpLogged            = false;
+bool     prevAlarmActiveLogged     = false;
+uint8_t  prevAlarmReasonLogged     = ALARM_REASON_NONE;
+bool     lm35OutOfRangeLogged      = false;
 String   wifiSsid;
 String   wifiPassword;
 const char* wifiPortalMessage = "Válaszd ki az otthoni Wi-Fi hálózatot.";
+
+// ============================================================================
+// ESEMÉNY- ÉS HIBANAPLÓ (KÖRKÖRÖS PUFFER + SERIAL + AZONNALI MQTT ERROR)
+// ============================================================================
+static char logsResponsePayload[3584];
+
+void publishMqttLogError(const LogEntry& entry) {
+    if (!mqtt.connected()) {
+        return;
+    }
+
+    JsonDocument doc;
+    doc["id"]        = entry.id;
+    doc["timestamp"] = entry.timestamp;
+    doc["level"]     = Logger::levelToStr(entry.level);
+    doc["code"]      = entry.code;
+    doc["message"]   = entry.message;
+
+    char payload[256];
+    size_t n = serializeJson(doc, payload, sizeof(payload));
+    if (n == 0) {
+        return;
+    }
+    if (!mqtt.publish(TOPIC_LOG, reinterpret_cast<const uint8_t*>(payload), n, false)) {
+        // Rekurzió elkerülése végett hiba esetén CSAK Serial-ra írunk
+        Serial.print(F("MQTT PUBLISH FAILED topic="));
+        Serial.println(TOPIC_LOG);
+    }
+}
+
+void logEvent(uint8_t level, const char* code, const char* message) {
+    LogEntry entry{};
+    logger.addEntry(level, code, message, &entry);
+
+    const char* tsSerial = entry.timestamp;
+    if (strlen(entry.timestamp) >= 19 && entry.timestamp[10] == ' ') {
+        tsSerial = &entry.timestamp[11];
+    }
+    Serial.printf("[%s] %s %s %s\n",
+                  Logger::levelToStr(entry.level),
+                  tsSerial,
+                  entry.code,
+                  entry.message);
+
+    if (entry.level == LOG_ERROR) {
+        publishMqttLogError(entry);
+    }
+}
 
 // --- Rotary Encoder + Gomb ISR állapot (Gray-kód tábla + szoftveres debounce) ---
 volatile int8_t   encStepAccum    = 0;
@@ -206,12 +273,12 @@ void sanitizePumpConfig(PumpConfigPacked& cfg) {
 }
 
 void sanitizeAlarmConfig(AlarmConfigPacked& cfg) {
-    if (isnan(cfg.overheatTemp)) {
-        cfg.overheatTemp = ALARM_OVERHEAT_TEMP_DEFAULT;
+    if (isnan(cfg.alarmTemp)) {
+        cfg.alarmTemp = ALARM_OVERHEAT_TEMP_DEFAULT;
     }
-    if (cfg.overheatTemp < ALARM_OVERHEAT_TEMP_MIN) cfg.overheatTemp = ALARM_OVERHEAT_TEMP_MIN;
-    if (cfg.overheatTemp > ALARM_OVERHEAT_TEMP_MAX) cfg.overheatTemp = ALARM_OVERHEAT_TEMP_MAX;
-    cfg.overheatTemp = round1(cfg.overheatTemp);
+    if (cfg.alarmTemp < ALARM_OVERHEAT_TEMP_MIN) cfg.alarmTemp = ALARM_OVERHEAT_TEMP_MIN;
+    if (cfg.alarmTemp > ALARM_OVERHEAT_TEMP_MAX) cfg.alarmTemp = ALARM_OVERHEAT_TEMP_MAX;
+    cfg.alarmTemp = round1(cfg.alarmTemp);
     cfg.alarmEnabled = cfg.alarmEnabled ? 1 : 0;
 }
 
@@ -230,7 +297,7 @@ void applyDefaultSettings() {
     state.pumpConfig.pumpStartTemp   = PUMP_START_TEMP_DEFAULT; // 40.0
     state.pumpConfig.pumpStopTemp    = PUMP_STOP_TEMP_DEFAULT;  // 30.0
     state.pumpConfig.pumpStartSensor = PUMP_SENSOR_KAZAN;
-    state.alarmConfig.overheatTemp   = ALARM_OVERHEAT_TEMP_DEFAULT; // 85.0
+    state.alarmConfig.alarmTemp      = ALARM_OVERHEAT_TEMP_DEFAULT; // 85.0
     state.alarmConfig.alarmEnabled   = ALARM_ENABLED_DEFAULT ? 1 : 0; // true
     state.heartbeatIntervalSec       = HEARTBEAT_DEFAULT_SEC; // 5
     state.outputsMask                = 0;
@@ -238,36 +305,265 @@ void applyDefaultSettings() {
     state.pumpState                  = PUMP_STATE_VARAKOZAS;
 }
 
-void saveSettingsToNvs() {
-    if (!prefs.begin(NVS_NAMESPACE, false)) {
-        Serial.println(F("[NVS] Hiba a Preferences megnyitasakor (iras)."));
-        return;
+enum NvsValueType : uint8_t {
+    NVS_TYPE_FLOAT = 0,
+    NVS_TYPE_UINT  = 1,
+    NVS_TYPE_BOOL  = 2,
+    NVS_TYPE_STR   = 3
+};
+
+struct PendingNvsItem {
+    bool         used = false;
+    char         key[24] = {0};
+    NvsValueType type = NVS_TYPE_UINT;
+    float        fVal = 0.0f;
+    uint32_t     uVal = 0;
+    bool         bVal = false;
+    char         sVal[65] = {0};
+};
+
+constexpr uint8_t MAX_PENDING_NVS_ITEMS = 12;
+PendingNvsItem pendingNvsItems[MAX_PENDING_NVS_ITEMS];
+bool           pendingNvsRetryActive = false;
+bool           inNvsRetry            = false;
+
+void queuePendingNvsItem(const char* key,
+                         NvsValueType type,
+                         float fVal,
+                         uint32_t uVal,
+                         bool bVal,
+                         const char* sVal) {
+    if (!key) return;
+    int8_t slot = -1;
+    for (uint8_t i = 0; i < MAX_PENDING_NVS_ITEMS; i++) {
+        if (pendingNvsItems[i].used && strcmp(pendingNvsItems[i].key, key) == 0) {
+            slot = static_cast<int8_t>(i);
+            break;
+        }
+        if (!pendingNvsItems[i].used && slot < 0) {
+            slot = static_cast<int8_t>(i);
+        }
+    }
+    if (slot < 0) {
+        slot = 0;
     }
 
-    prefs.putFloat("targetTemp", state.targetTemp);
-    prefs.putUChar("mode", state.mode);
-    prefs.putBool("manualHeating", state.manualHeating);
-    prefs.putUChar("pumpMode", state.pumpConfig.pumpMode);
-    prefs.putFloat("pumpStartTemp", state.pumpConfig.pumpStartTemp);
-    prefs.putFloat("pumpStopTemp", state.pumpConfig.pumpStopTemp);
-    prefs.putUChar("pumpSensor", state.pumpConfig.pumpStartSensor);
-    prefs.putFloat("overheatTemp", state.alarmConfig.overheatTemp);
-    prefs.putBool("alarmEnabled", state.alarmConfig.alarmEnabled != 0);
-    prefs.putUChar("heartbeatSec", state.heartbeatIntervalSec);
+    PendingNvsItem& item = pendingNvsItems[slot];
+    item.used = true;
+    strncpy(item.key, key, sizeof(item.key) - 1);
+    item.key[sizeof(item.key) - 1] = '\0';
+    item.type = type;
+    item.fVal = fVal;
+    item.uVal = uVal;
+    item.bVal = bVal;
+    if (sVal) {
+        strncpy(item.sVal, sVal, sizeof(item.sVal) - 1);
+        item.sVal[sizeof(item.sVal) - 1] = '\0';
+    } else {
+        item.sVal[0] = '\0';
+    }
+    pendingNvsRetryActive = true;
+}
 
-    // A szivattyú bitet (OUT_BIT_SZIVATTYU) NEM mentjük el, azt az állapotgép számolja
-    uint8_t savedOutputsMask = state.outputsMask & static_cast<uint8_t>(~(1U << OUT_BIT_SZIVATTYU));
-    setBit(savedOutputsMask, OUT_BIT_LED_PIROS, state.userLedPiros);
-    prefs.putUChar("outputsMask", savedOutputsMask);
+bool saveSettingInternal(const char* key,
+                         NvsValueType type,
+                         float fVal,
+                         uint32_t uVal,
+                         bool bVal,
+                         const char* sVal) {
+    if (!key) return false;
 
+    if (!prefs.begin(NVS_NAMESPACE, false)) {
+        logEvent(LOG_ERROR, "NVS_FAIL", "NVS BEGIN FAILED");
+        menu.showErrorBanner("NVS HIBA!", "Mentes sikertelen", 2000);
+        if (!inNvsRetry) {
+            queuePendingNvsItem(key, type, fVal, uVal, bVal, sVal);
+        }
+        return false;
+    }
+
+    size_t written = 0;
+    switch (type) {
+        case NVS_TYPE_FLOAT:
+            written = prefs.putFloat(key, fVal);
+            break;
+        case NVS_TYPE_UINT:
+            written = prefs.putUInt(key, uVal);
+            break;
+        case NVS_TYPE_BOOL:
+            written = prefs.putBool(key, bVal);
+            break;
+        case NVS_TYPE_STR:
+            written = prefs.putString(key, sVal ? sVal : "");
+            break;
+    }
     prefs.end();
+
+    if (written == 0) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "NVS WRITE FAILED key=%s", key);
+        logEvent(LOG_ERROR, "NVS_FAIL", msg);
+        menu.showErrorBanner("MENTES HIBA!", key, 2000);
+        if (!inNvsRetry) {
+            queuePendingNvsItem(key, type, fVal, uVal, bVal, sVal);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+bool saveSetting(const char* key, float value) {
+    return saveSettingInternal(key, NVS_TYPE_FLOAT, value, 0, false, nullptr);
+}
+
+bool saveSetting(const char* key, uint32_t value) {
+    return saveSettingInternal(key, NVS_TYPE_UINT, 0.0f, value, false, nullptr);
+}
+
+bool saveSetting(const char* key, bool value) {
+    return saveSettingInternal(key, NVS_TYPE_BOOL, 0.0f, 0, value, nullptr);
+}
+
+bool saveSetting(const char* key, const char* value) {
+    return saveSettingInternal(key, NVS_TYPE_STR, 0.0f, 0, false, value);
+}
+
+void applyPendingNvsItemToState(const PendingNvsItem& item, uint32_t now) {
+    if (strcmp(item.key, "targetTemp") == 0) {
+        state.targetTemp = item.fVal;
+    } else if (strcmp(item.key, "mode") == 0) {
+        state.mode = static_cast<uint8_t>(item.uVal);
+    } else if (strcmp(item.key, "manualHeating") == 0) {
+        state.manualHeating = item.bVal;
+    } else if (strcmp(item.key, "pumpMode") == 0) {
+        uint8_t nextPumpMode = static_cast<uint8_t>(item.uVal);
+        if (nextPumpMode == PUMP_MODE_MANUAL_OFF && state.pumpConfig.pumpMode != PUMP_MODE_MANUAL_OFF) {
+            state.manualOffStartMs = now;
+        }
+        state.pumpConfig.pumpMode = nextPumpMode;
+    } else if (strcmp(item.key, "pumpStartTemp") == 0) {
+        state.pumpConfig.pumpStartTemp = item.fVal;
+    } else if (strcmp(item.key, "pumpStopTemp") == 0) {
+        state.pumpConfig.pumpStopTemp = item.fVal;
+    } else if (strcmp(item.key, "pumpSensor") == 0) {
+        state.pumpConfig.pumpStartSensor = static_cast<uint8_t>(item.uVal);
+    } else if (strcmp(item.key, "alarmTemp") == 0 || strcmp(item.key, "overheatTemp") == 0) {
+        state.alarmConfig.alarmTemp = item.fVal;
+    } else if (strcmp(item.key, "alarmEnabled") == 0) {
+        state.alarmConfig.alarmEnabled = item.bVal ? 1 : 0;
+    } else if (strcmp(item.key, "heartbeatSec") == 0) {
+        state.heartbeatIntervalSec = static_cast<uint8_t>(item.uVal);
+    } else if (strcmp(item.key, "outputsMask") == 0) {
+        uint8_t nextMask = static_cast<uint8_t>(item.uVal);
+        setBit(nextMask, OUT_BIT_SZIVATTYU, state.pumpOn);
+        state.outputsMask  = nextMask;
+        state.userLedPiros = getBit(nextMask, OUT_BIT_LED_PIROS);
+    }
+}
+
+void commitSettingEffects(bool redrawMenu);
+void onMenuSettingCommitted();
+
+void processPendingNvsRetry(uint32_t now) {
+    if (!pendingNvsRetryActive) return;
+
+    PendingNvsItem retryItems[MAX_PENDING_NVS_ITEMS];
+    for (uint8_t i = 0; i < MAX_PENDING_NVS_ITEMS; i++) {
+        retryItems[i] = pendingNvsItems[i];
+        pendingNvsItems[i].used = false;
+    }
+    pendingNvsRetryActive = false;
+
+    inNvsRetry = true;
+    bool allOk = true;
+    for (uint8_t i = 0; i < MAX_PENDING_NVS_ITEMS; i++) {
+        if (!retryItems[i].used) continue;
+        if (!saveSettingInternal(retryItems[i].key,
+                                 retryItems[i].type,
+                                 retryItems[i].fVal,
+                                 retryItems[i].uVal,
+                                 retryItems[i].bVal,
+                                 retryItems[i].sVal)) {
+            allOk = false;
+            break;
+        }
+    }
+    inNvsRetry = false;
+
+    if (allOk) {
+        for (uint8_t i = 0; i < MAX_PENDING_NVS_ITEMS; i++) {
+            if (retryItems[i].used) {
+                applyPendingNvsItemToState(retryItems[i], now);
+            }
+        }
+        logEvent(LOG_INFO, "NVS_OK", "Ujraprobalt NVS mentes sikeres");
+        commitSettingEffects(!menu.isEditing());
+    }
+}
+
+uint32_t readUIntCompat(Preferences& p, const char* key, uint32_t defaultVal) {
+    if (!p.isKey(key)) return defaultVal;
+    if (p.getType(key) == PT_U8) {
+        return static_cast<uint32_t>(p.getUChar(key, static_cast<uint8_t>(defaultVal)));
+    }
+    return p.getUInt(key, defaultVal);
+}
+
+uint8_t computeSavedOutputsMask(const SystemState& src) {
+    uint8_t savedOutputsMask = src.outputsMask & static_cast<uint8_t>(~(1U << OUT_BIT_SZIVATTYU));
+    setBit(savedOutputsMask, OUT_BIT_LED_PIROS, src.userLedPiros);
+    return savedOutputsMask;
+}
+
+bool saveChangedSettingsFromState(const SystemState& prev, const SystemState& next) {
+    bool allOk = true;
+
+    if (fabsf(prev.targetTemp - next.targetTemp) > 0.01f) {
+        if (!saveSetting("targetTemp", next.targetTemp)) allOk = false;
+    }
+    if (prev.mode != next.mode) {
+        if (!saveSetting("mode", static_cast<uint32_t>(next.mode))) allOk = false;
+    }
+    if (prev.manualHeating != next.manualHeating) {
+        if (!saveSetting("manualHeating", next.manualHeating)) allOk = false;
+    }
+    if (prev.pumpConfig.pumpMode != next.pumpConfig.pumpMode) {
+        if (!saveSetting("pumpMode", static_cast<uint32_t>(next.pumpConfig.pumpMode))) allOk = false;
+    }
+    if (fabsf(prev.pumpConfig.pumpStartTemp - next.pumpConfig.pumpStartTemp) > 0.01f) {
+        if (!saveSetting("pumpStartTemp", next.pumpConfig.pumpStartTemp)) allOk = false;
+    }
+    if (fabsf(prev.pumpConfig.pumpStopTemp - next.pumpConfig.pumpStopTemp) > 0.01f) {
+        if (!saveSetting("pumpStopTemp", next.pumpConfig.pumpStopTemp)) allOk = false;
+    }
+    if (prev.pumpConfig.pumpStartSensor != next.pumpConfig.pumpStartSensor) {
+        if (!saveSetting("pumpSensor", static_cast<uint32_t>(next.pumpConfig.pumpStartSensor))) allOk = false;
+    }
+    if (fabsf(prev.alarmConfig.alarmTemp - next.alarmConfig.alarmTemp) > 0.01f) {
+        if (!saveSetting("alarmTemp", next.alarmConfig.alarmTemp)) allOk = false;
+    }
+    if (prev.alarmConfig.alarmEnabled != next.alarmConfig.alarmEnabled) {
+        if (!saveSetting("alarmEnabled", next.alarmConfig.alarmEnabled != 0)) allOk = false;
+    }
+    if (prev.heartbeatIntervalSec != next.heartbeatIntervalSec) {
+        if (!saveSetting("heartbeatSec", static_cast<uint32_t>(next.heartbeatIntervalSec))) allOk = false;
+    }
+
+    uint8_t prevSavedMask = computeSavedOutputsMask(prev);
+    uint8_t nextSavedMask = computeSavedOutputsMask(next);
+    if (prevSavedMask != nextSavedMask) {
+        if (!saveSetting("outputsMask", static_cast<uint32_t>(nextSavedMask))) allOk = false;
+    }
+
+    return allOk;
 }
 
 void loadSettingsFromNvs() {
     applyDefaultSettings();
 
     if (!prefs.begin(NVS_NAMESPACE, true)) {
-        Serial.println(F("[NVS] Meg nincs mentett beallitas, alapertelmezett ertekek aktivak."));
+        logEvent(LOG_INFO, "NVS_LOAD", "Nincs mentett NVS, alapertelmezes");
         return;
     }
 
@@ -276,56 +572,85 @@ void loadSettingsFromNvs() {
         state.targetTemp = roundf(tTemp * 2.0f) / 2.0f;
     }
 
-    uint8_t m = prefs.getUChar("mode", MODE_AUTO);
-    state.mode = (m <= MODE_OFF) ? m : MODE_AUTO;
+    uint32_t m = readUIntCompat(prefs, "mode", MODE_AUTO);
+    state.mode = (m <= MODE_OFF) ? static_cast<uint8_t>(m) : MODE_AUTO;
 
     state.manualHeating = prefs.getBool("manualHeating", false);
 
-    uint8_t pm = prefs.getUChar("pumpMode", PUMP_MODE_AUTO);
-    state.pumpConfig.pumpMode = (pm <= PUMP_MODE_MANUAL_OFF) ? pm : PUMP_MODE_AUTO;
+    uint32_t pm = readUIntCompat(prefs, "pumpMode", PUMP_MODE_AUTO);
+    state.pumpConfig.pumpMode = (pm <= PUMP_MODE_MANUAL_OFF) ? static_cast<uint8_t>(pm) : PUMP_MODE_AUTO;
 
     state.pumpConfig.pumpStartTemp = prefs.getFloat("pumpStartTemp", PUMP_START_TEMP_DEFAULT);
     state.pumpConfig.pumpStopTemp  = prefs.getFloat("pumpStopTemp", PUMP_STOP_TEMP_DEFAULT);
 
-    uint8_t ps = prefs.getUChar("pumpSensor", PUMP_SENSOR_KAZAN);
-    state.pumpConfig.pumpStartSensor = (ps <= PUMP_SENSOR_MAX) ? ps : PUMP_SENSOR_KAZAN;
+    uint32_t ps = readUIntCompat(prefs, "pumpSensor", PUMP_SENSOR_KAZAN);
+    state.pumpConfig.pumpStartSensor = (ps <= PUMP_SENSOR_MAX) ? static_cast<uint8_t>(ps) : PUMP_SENSOR_KAZAN;
     sanitizePumpConfig(state.pumpConfig);
 
-    state.alarmConfig.overheatTemp = prefs.getFloat("overheatTemp", ALARM_OVERHEAT_TEMP_DEFAULT);
+    if (prefs.isKey("alarmTemp")) {
+        state.alarmConfig.alarmTemp = prefs.getFloat("alarmTemp", ALARM_OVERHEAT_TEMP_DEFAULT);
+    } else {
+        state.alarmConfig.alarmTemp = prefs.getFloat("overheatTemp", ALARM_OVERHEAT_TEMP_DEFAULT);
+    }
     state.alarmConfig.alarmEnabled = prefs.getBool("alarmEnabled", ALARM_ENABLED_DEFAULT) ? 1 : 0;
     sanitizeAlarmConfig(state.alarmConfig);
 
-    uint8_t hb = prefs.getUChar("heartbeatSec", HEARTBEAT_DEFAULT_SEC);
-    state.heartbeatIntervalSec = isValidHeartbeatInterval(hb) ? hb : HEARTBEAT_DEFAULT_SEC;
+    uint32_t hb = readUIntCompat(prefs, "heartbeatSec", HEARTBEAT_DEFAULT_SEC);
+    state.heartbeatIntervalSec = isValidHeartbeatInterval(static_cast<int>(hb))
+                                     ? static_cast<uint8_t>(hb)
+                                     : HEARTBEAT_DEFAULT_SEC;
 
-    uint8_t loadedMask = prefs.getUChar("outputsMask", 0);
+    uint8_t loadedMask = static_cast<uint8_t>(readUIntCompat(prefs, "outputsMask", 0) & 0xFFU);
     setBit(loadedMask, OUT_BIT_SZIVATTYU, false);
     state.outputsMask  = loadedMask;
     state.userLedPiros = getBit(loadedMask, OUT_BIT_LED_PIROS);
 
     prefs.end();
-    Serial.println(F("[NVS] Beallitasok betoltve a Preferences-bol."));
+    logEvent(LOG_INFO, "NVS_LOAD", "Beallitasok betoltve");
 }
 
 void clearNvsAndResetDefaults() {
-    if (prefs.begin(NVS_NAMESPACE, false)) {
-        prefs.clear();
+    if (!prefs.begin(NVS_NAMESPACE, false)) {
+        logEvent(LOG_ERROR, "NVS_FAIL", "NVS BEGIN FAILED");
+        menu.showErrorBanner("NVS HIBA!", "Torles hiba", 2000);
+    } else {
+        if (!prefs.clear()) {
+            logEvent(LOG_ERROR, "NVS_FAIL", "NVS WRITE FAILED key=clear");
+            menu.showErrorBanner("MENTES HIBA!", "Torles hiba", 2000);
+        }
         prefs.end();
     }
+    for (uint8_t i = 0; i < MAX_PENDING_NVS_ITEMS; i++) {
+        pendingNvsItems[i].used = false;
+    }
+    pendingNvsRetryActive = false;
     applyDefaultSettings();
-    Serial.println(F("[NVS] Gyari visszaallitas: Preferences torolve, alapertelmezesek visszaallitva."));
+    logEvent(LOG_WARN, "FACTORY_RESET", "Gyari visszaallitas kesz");
 }
 
 // ============================================================================
-// LM35 SZOBAI HŐMÉRSÉKLET OLVASÁSA (10 MÉRÉS ÁTLAGA)
+// LM35 SZOBAI HŐMÉRSÉKLET OLVASÁSA (10 MÉRÉS ÁTLAGA, 10 mV / °C)
 // ============================================================================
 float readRoomTempLM35() {
-    uint32_t sumMv = 0;
+    uint32_t sumRaw = 0;
     for (uint8_t i = 0; i < LM35_SAMPLE_COUNT; i++) {
-        sumMv += analogReadMilliVolts(PIN_LM35);
+        sumRaw += static_cast<uint32_t>(analogRead(PIN_LM35));
     }
-    float avgMv = static_cast<float>(sumMv) / static_cast<float>(LM35_SAMPLE_COUNT);
-    float tempC = (avgMv / 3300.0f) * 100.0f + LM35_OFFSET;
+    float avgRaw = static_cast<float>(sumRaw) / static_cast<float>(LM35_SAMPLE_COUNT);
+    float avgMv = (avgRaw / 4095.0f) * 3300.0f;
+    float tempC = (avgMv / 10.0f) + LM35_OFFSET;
+
+    if (isnan(tempC) || tempC < -10.0f || tempC > 60.0f) {
+        if (!lm35OutOfRangeLogged) {
+            lm35OutOfRangeLogged = true;
+            char msg[48];
+            snprintf(msg, sizeof(msg), "LM35_OUT_OF_RANGE %.1fC", tempC);
+            logEvent(LOG_ERROR, "LM35_FAIL", msg);
+        }
+        return state.currentTemp;
+    }
+
+    lm35OutOfRangeLogged = false;
     return round1(tempC);
 }
 
@@ -379,15 +704,15 @@ bool getSelectedStartSensorTemp(float& outTemp) {
 }
 
 void evaluateAlarmState() {
+    bool alarmOverheat = isSensorValid(state.kazan) && (state.kazan >= state.alarmConfig.alarmTemp);
+
     if (state.alarmConfig.alarmEnabled == 0) {
         state.alarmState.active = 0;
         state.alarmState.reason = ALARM_REASON_NONE;
-        return;
-    }
-
-    // Saját és Nano-tól jött riasztás egyesítése (OR logika, prioritási sorrendben)
-    if (state.safetyOverheat ||
-        (state.nanoAlarmState.active != 0 && state.nanoAlarmState.reason == ALARM_REASON_OVERHEAT)) {
+    } else if (alarmOverheat ||
+               state.safetyOverheat ||
+               (state.nanoAlarmState.active != 0 && state.nanoAlarmState.reason == ALARM_REASON_OVERHEAT)) {
+        // Saját és Nano-tól jött riasztás egyesítése (OR logika, prioritási sorrendben)
         state.alarmState.active = 1;
         state.alarmState.reason = ALARM_REASON_OVERHEAT;
     } else if (!state.nrf24Ok && state.consecutiveMissedPings >= NRF_MAX_MISSED_CYCLES) {
@@ -404,6 +729,35 @@ void evaluateAlarmState() {
         state.alarmState.active = 0;
         state.alarmState.reason = ALARM_REASON_NONE;
     }
+
+    bool activeNow = (state.alarmState.active != 0);
+    if (activeNow && (!prevAlarmActiveLogged || prevAlarmReasonLogged != state.alarmState.reason)) {
+        char msg[48];
+        switch (state.alarmState.reason) {
+            case ALARM_REASON_OVERHEAT:
+                if (isSensorValid(state.kazan)) {
+                    snprintf(msg, sizeof(msg), "Kazan tulmelegedes %.1fC", state.kazan);
+                } else {
+                    snprintf(msg, sizeof(msg), "Kazan tulmelegedes");
+                }
+                logEvent(LOG_ERROR, "ALARM_OVERHEAT", msg);
+                break;
+            case ALARM_REASON_SENSOR_FAIL:
+                logEvent(LOG_ERROR, "ALARM_SENSOR", "Kazan szenzor hiba (-127)");
+                break;
+            case ALARM_REASON_NRF_FAIL:
+                logEvent(LOG_ERROR, "ALARM_NRF", "NRF24 kommunikacios hiba");
+                break;
+            default:
+                snprintf(msg, sizeof(msg), "Riasztas aktiv kod=%u", state.alarmState.reason);
+                logEvent(LOG_ERROR, "ALARM_ACTIVE", msg);
+                break;
+        }
+    } else if (!activeNow && prevAlarmActiveLogged) {
+        logEvent(LOG_INFO, "ALARM_CLEAR", "Riasztas megszunt");
+    }
+    prevAlarmActiveLogged = activeNow;
+    prevAlarmReasonLogged = state.alarmState.reason;
 }
 
 bool evaluateBoilerPumpProtection(uint32_t now) {
@@ -414,7 +768,7 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
         if (now - state.manualOffStartMs >= PUMP_MANUAL_OFF_TIMEOUT_MS) {
             state.pumpConfig.pumpMode = PUMP_MODE_AUTO;
             modeAutoRestored = true;
-            Serial.println(F("[PUMP] 10 perc letelt: manual_off automatikusan visszaallt auto-ra."));
+            logEvent(LOG_INFO, "PUMP_AUTO", "10p letelt, manual_off->auto");
         }
     }
 
@@ -440,10 +794,11 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
         state.pumpState = PUMP_STATE_VARAKOZAS;
     }
 
-    // Biztonsági felülbírálás (még manual_off-ot is felülír)
+    // Biztonsági felülbírálás (CSAK a fix SAFETY_OVERHEAT_TEMP 95.0C és a szenzorhiba -127 számít, SOHA az alarmTemp)
+    // SAFETY: alarmEnabled nem kapcsolja ki a pumpavédelmet
     bool kazanValid = isSensorValid(state.kazan);
     state.safetySensorFault = !kazanValid;
-    state.safetyOverheat    = kazanValid && (state.kazan >= state.alarmConfig.overheatTemp);
+    state.safetyOverheat    = kazanValid && (state.kazan >= SAFETY_OVERHEAT_TEMP);
 
     if (state.safetyOverheat || state.safetySensorFault) {
         desiredPump = true;
@@ -451,6 +806,60 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
     }
 
     state.pumpOn = desiredPump;
+
+    if (!pumpLogInitialized) {
+        pumpLogInitialized = true;
+        prevPumpLogged     = state.pumpOn;
+        if (state.pumpOn) {
+            char msg[48];
+            if (state.safetyOverheat) {
+                snprintf(msg, sizeof(msg), "Szivattyu BE: kazan %.1fC tulmel", state.kazan);
+            } else if (state.safetySensorFault) {
+                snprintf(msg, sizeof(msg), "Szivattyu BE: szenzor hiba");
+            } else if (state.pumpConfig.pumpMode == PUMP_MODE_MANUAL_ON) {
+                snprintf(msg, sizeof(msg), "Szivattyu BE: manual");
+            } else {
+                float refT = 0.0f;
+                if (getSelectedStartSensorTemp(refT)) {
+                    snprintf(msg, sizeof(msg), "Szivattyu BE: kazan %.1fC", refT);
+                } else {
+                    snprintf(msg, sizeof(msg), "Szivattyu BE");
+                }
+            }
+            logEvent(LOG_INFO, "PUMP_ON", msg);
+        }
+    } else if (state.pumpOn != prevPumpLogged) {
+        prevPumpLogged = state.pumpOn;
+        char msg[48];
+        if (state.pumpOn) {
+            if (state.safetyOverheat) {
+                snprintf(msg, sizeof(msg), "Szivattyu BE: kazan %.1fC tulmel", state.kazan);
+            } else if (state.safetySensorFault) {
+                snprintf(msg, sizeof(msg), "Szivattyu BE: szenzor hiba");
+            } else if (state.pumpConfig.pumpMode == PUMP_MODE_MANUAL_ON) {
+                snprintf(msg, sizeof(msg), "Szivattyu BE: manual");
+            } else {
+                float refT = 0.0f;
+                if (state.pumpConfig.pumpStartSensor == PUMP_SENSOR_ELOREMENO && isSensorValid(state.eloremeno)) {
+                    snprintf(msg, sizeof(msg), "Szivattyu BE: eloremeno %.1fC", state.eloremeno);
+                } else if (getSelectedStartSensorTemp(refT)) {
+                    snprintf(msg, sizeof(msg), "Szivattyu BE: kazan %.1fC", refT);
+                } else {
+                    snprintf(msg, sizeof(msg), "Szivattyu BE");
+                }
+            }
+            logEvent(LOG_INFO, "PUMP_ON", msg);
+        } else {
+            if (state.pumpConfig.pumpMode == PUMP_MODE_MANUAL_OFF) {
+                snprintf(msg, sizeof(msg), "Szivattyu KI: manual");
+            } else if (isSensorValid(state.eloremeno)) {
+                snprintf(msg, sizeof(msg), "Szivattyu KI: eloremeno %.1fC", state.eloremeno);
+            } else {
+                snprintf(msg, sizeof(msg), "Szivattyu KI");
+            }
+            logEvent(LOG_INFO, "PUMP_OFF", msg);
+        }
+    }
 
     evaluateAlarmState();
 
@@ -500,10 +909,17 @@ bool sendRequestToNano() {
     tx.esp.heartbeatIntervalSec = state.heartbeatIntervalSec;
     tx.esp.seq                  = state.txSeq;
 
+    bool anyWriteOk = false;
+
     for (uint8_t attempt = 0; attempt < NRF_MAX_ATTEMPTS; attempt++) {
         radio.stopListening();
         radio.flush_rx();
-        radio.write(&tx, sizeof(tx));
+        bool writeOk = radio.write(&tx, sizeof(tx));
+        if (!writeOk) {
+            updateAlarmBlinkAndLed(millis());
+            continue;
+        }
+        anyWriteOk = true;
         radio.startListening();
 
         uint32_t waitStartMs = millis();
@@ -530,9 +946,11 @@ bool sendRequestToNano() {
                     }
 
                     state.consecutiveMissedPings = 0;
+                    nrfErrorBannerShown          = false;
+                    nrfFailLoggedForOutage       = false;
                     if (!state.nrf24Ok) {
                         state.nrf24Ok = true;
-                        Serial.println(F("[ESP] NRF24 Master-Slave kapcsolat helyreallt."));
+                        logEvent(LOG_INFO, "NRF_OK", "NRF24 kapcsolat helyreallt");
                     }
                     return true;
                 }
@@ -543,14 +961,42 @@ bool sendRequestToNano() {
         radio.stopListening();
     }
 
+    if (!anyWriteOk) {
+        state.nrf24Ok                = false;
+        state.consecutiveMissedPings = NRF_MAX_MISSED_CYCLES;
+        evaluateAlarmState();
+        if (state.alarmConfig.alarmEnabled == 0) {
+            state.alarmState.reason = ALARM_REASON_NRF_FAIL;
+        }
+        if (!nrfFailLoggedForOutage) {
+            nrfFailLoggedForOutage = true;
+            char msg[48];
+            snprintf(msg, sizeof(msg), "NRF WRITE FAILED seq=%lu", static_cast<unsigned long>(tx.esp.seq));
+            logEvent(LOG_ERROR, "NRF_FAIL", msg);
+        }
+        if (!nrfErrorBannerShown) {
+            nrfErrorBannerShown = true;
+            menu.showErrorBanner("NRF HIBA!", "Radio iras hiba", 2000);
+        }
+        menu.requestRedraw();
+        return false;
+    }
+
     if (state.consecutiveMissedPings < 255) {
         state.consecutiveMissedPings++;
     }
+    if (state.consecutiveMissedPings == 1) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "1. kimaradt ping seq=%lu", static_cast<unsigned long>(tx.esp.seq));
+        logEvent(LOG_WARN, "NRF_MISS", msg);
+    }
     if (state.consecutiveMissedPings >= NRF_MAX_MISSED_CYCLES) {
-        if (state.nrf24Ok) {
-            Serial.println(F("[ESP] HIBA: 3 egymas utani pingre nincs valasz -> NRF HIBA!"));
-        }
         state.nrf24Ok = false;
+        evaluateAlarmState();
+        if (!nrfFailLoggedForOutage) {
+            nrfFailLoggedForOutage = true;
+            logEvent(LOG_ERROR, "NRF_FAIL", "3 kimaradt ping");
+        }
     }
 
     return false;
@@ -596,8 +1042,11 @@ void buildStatusJson(JsonDocument& doc) {
     doc["pumpState"] = pumpStateToStr(state.pumpState);
 
     JsonObject aCfg = doc["alarmConfig"].to<JsonObject>();
-    aCfg["overheatTemp"] = round1(state.alarmConfig.overheatTemp);
+    aCfg["alarmTemp"]    = round1(state.alarmConfig.alarmTemp);
     aCfg["alarmEnabled"] = (state.alarmConfig.alarmEnabled != 0);
+
+    JsonObject safety = doc["safety"].to<JsonObject>();
+    safety["safetyOverheatTemp"] = round1(SAFETY_OVERHEAT_TEMP);
 
     JsonObject aState = doc["alarmState"].to<JsonObject>();
     aState["active"] = (state.alarmState.active != 0);
@@ -611,7 +1060,7 @@ void buildStatusJson(JsonDocument& doc) {
     if (!state.nrf24Ok && state.consecutiveMissedPings >= NRF_MAX_MISSED_CYCLES) {
         doc["error"] = "NRF24 kommunikacios hiba (3 ping kimaradt)";
     } else if (state.safetyOverheat) {
-        doc["error"] = "Kazan tulmelegedes (>= overheatTemp) - szivattyu kenyszeritett BE";
+        doc["error"] = "Kazan tulmelegedes (>= 95.0C) - szivattyu kenyszeritett BE";
     } else if (state.safetySensorFault) {
         doc["error"] = "Kazan szenzor hiba (-127) - szivattyu biztonsagi BE";
     } else {
@@ -619,38 +1068,118 @@ void buildStatusJson(JsonDocument& doc) {
     }
 }
 
-void publishMqttStatus() {
-    if (!mqtt.connected()) return;
+bool publishMqttStatus() {
+    if (!mqtt.connected()) {
+        mqttStatusPendingRetry = true;
+        return false;
+    }
     JsonDocument doc;
     buildStatusJson(doc);
     char payload[1536];
     size_t n = serializeJson(doc, payload, sizeof(payload));
-    if (n > 0) {
-        mqtt.publish(TOPIC_STATUS, reinterpret_cast<const uint8_t*>(payload), n, true); // retained=true
+    if (n == 0) {
+        mqttStatusPendingRetry = true;
+        return false;
     }
+    bool ok = mqtt.publish(TOPIC_STATUS, reinterpret_cast<const uint8_t*>(payload), n, true); // retained=true
+    if (!ok) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "MQTT PUBLISH FAILED %s", TOPIC_STATUS);
+        logEvent(LOG_WARN, "MQTT_PUB_FAIL", msg);
+        mqttStatusPendingRetry = true;
+        return false;
+    }
+    mqttStatusPendingRetry = false;
+    return true;
 }
 
-void publishMqttTelemetry() {
-    if (!mqtt.connected()) return;
+bool publishMqttTelemetry() {
+    if (!mqtt.connected()) {
+        mqttTelemetryPendingRetry = true;
+        return false;
+    }
     JsonDocument doc;
     buildStatusJson(doc);
     doc["nanoCounter"] = state.nanoCounter;
     char payload[1536];
     size_t n = serializeJson(doc, payload, sizeof(payload));
-    if (n > 0) {
-        mqtt.publish(TOPIC_TELEMETRY, reinterpret_cast<const uint8_t*>(payload), n, false);
+    if (n == 0) {
+        mqttTelemetryPendingRetry = true;
+        return false;
     }
+    bool ok = mqtt.publish(TOPIC_TELEMETRY, reinterpret_cast<const uint8_t*>(payload), n, false);
+    if (!ok) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "MQTT PUBLISH FAILED %s", TOPIC_TELEMETRY);
+        logEvent(LOG_WARN, "MQTT_PUB_FAIL", msg);
+        mqttTelemetryPendingRetry = true;
+        return false;
+    }
+    mqttTelemetryPendingRetry = false;
+    return true;
+}
+
+bool publishMqttLogsResponse(int page, int limit) {
+    if (!mqtt.connected()) {
+        return false;
+    }
+
+    int safeLimit = limit;
+    if (safeLimit < 1)  safeLimit = 20;
+    if (safeLimit > 20) safeLimit = 20;
+
+    int safePage = (page < 1) ? 1 : page;
+    size_t total = logger.count();
+    size_t pages = (total == 0)
+                       ? 1
+                       : ((total + static_cast<size_t>(safeLimit) - 1) / static_cast<size_t>(safeLimit));
+
+    JsonDocument doc;
+    JsonArray arr = doc["logs"].to<JsonArray>();
+
+    size_t startOffset = static_cast<size_t>(safePage - 1) * static_cast<size_t>(safeLimit);
+    for (int i = 0; i < safeLimit; i++) {
+        LogEntry entry{};
+        if (!logger.getNewest(startOffset + static_cast<size_t>(i), entry)) {
+            break;
+        }
+        JsonObject item = arr.add<JsonObject>();
+        item["id"]        = entry.id;
+        item["timestamp"] = entry.timestamp;
+        item["level"]     = Logger::levelToStr(entry.level);
+        item["code"]      = entry.code;
+        item["message"]   = entry.message;
+    }
+
+    doc["total"] = total;
+    doc["page"]  = safePage;
+    doc["pages"] = pages;
+
+    size_t n = serializeJson(doc, logsResponsePayload, sizeof(logsResponsePayload));
+    if (n == 0) {
+        return false;
+    }
+
+    bool ok = mqtt.publish(TOPIC_LOGS,
+                           reinterpret_cast<const uint8_t*>(logsResponsePayload),
+                           n,
+                           false);
+    if (!ok) {
+        logEvent(LOG_WARN, "MQTT_PUB_FAIL", "MQTT PUBLISH FAILED logs");
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
 // MENÜ CALLBACK-EK (AZONNALI MENTÉS + NRF REQUEST + MQTT STATUS)
 // ============================================================================
-void onMenuSettingCommitted() {
+void commitSettingEffects(bool redrawMenu) {
     uint32_t now = millis();
+    nrfErrorBannerShown = false;
     evaluateRoomHeatingIndicator();
     evaluateBoilerPumpProtection(now);
     updateAlarmBlinkAndLed(now);
-    saveSettingsToNvs();
 
     sendRequestToNano();
     lastHeartbeatMs = millis();
@@ -658,11 +1187,18 @@ void onMenuSettingCommitted() {
     updateAlarmBlinkAndLed(lastHeartbeatMs);
 
     publishMqttStatus();
-    menu.requestRedraw();
+    if (redrawMenu) {
+        menu.requestRedraw();
+    }
+}
+
+void onMenuSettingCommitted() {
+    commitSettingEffects(true);
 }
 
 void onMenuFactoryReset() {
     uint32_t now = millis();
+    nrfErrorBannerShown = false;
     clearNvsAndResetDefaults();
     evaluateRoomHeatingIndicator();
     evaluateBoilerPumpProtection(now);
@@ -679,73 +1215,163 @@ void onMenuFactoryReset() {
 // ============================================================================
 // MQTT CMD FELDOLGOZÁS (Frontend -> ESP)
 // ============================================================================
+void logMqttSettingChanges(const SystemState& prev, const SystemState& next) {
+    char msg[48];
+    if (fabsf(prev.targetTemp - next.targetTemp) > 0.01f) {
+        snprintf(msg, sizeof(msg), "Celhofok %.1f->%.1f (mqtt)", prev.targetTemp, next.targetTemp);
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+    if (prev.mode != next.mode) {
+        snprintf(msg, sizeof(msg), "Uzmod %s->%s (mqtt)", modeToStr(prev.mode), modeToStr(next.mode));
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+    if (prev.manualHeating != next.manualHeating) {
+        snprintf(msg, sizeof(msg), "ManualFut %s->%s (mqtt)",
+                 prev.manualHeating ? "BE" : "KI", next.manualHeating ? "BE" : "KI");
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+    if (prev.pumpConfig.pumpMode != next.pumpConfig.pumpMode) {
+        snprintf(msg, sizeof(msg), "PumpMod %s->%s (mqtt)",
+                 pumpModeToStr(prev.pumpConfig.pumpMode), pumpModeToStr(next.pumpConfig.pumpMode));
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+    if (fabsf(prev.pumpConfig.pumpStartTemp - next.pumpConfig.pumpStartTemp) > 0.01f) {
+        snprintf(msg, sizeof(msg), "PumpStart %.1f->%.1f (mqtt)",
+                 prev.pumpConfig.pumpStartTemp, next.pumpConfig.pumpStartTemp);
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+    if (fabsf(prev.pumpConfig.pumpStopTemp - next.pumpConfig.pumpStopTemp) > 0.01f) {
+        snprintf(msg, sizeof(msg), "PumpStop %.1f->%.1f (mqtt)",
+                 prev.pumpConfig.pumpStopTemp, next.pumpConfig.pumpStopTemp);
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+    if (prev.pumpConfig.pumpStartSensor != next.pumpConfig.pumpStartSensor) {
+        snprintf(msg, sizeof(msg), "PumpSzenz %s->%s (mqtt)",
+                 pumpSensorToStr(prev.pumpConfig.pumpStartSensor),
+                 pumpSensorToStr(next.pumpConfig.pumpStartSensor));
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+    if (fabsf(prev.alarmConfig.alarmTemp - next.alarmConfig.alarmTemp) > 0.01f) {
+        snprintf(msg, sizeof(msg), "RiasztHof %.1f->%.1f (mqtt)",
+                 prev.alarmConfig.alarmTemp, next.alarmConfig.alarmTemp);
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+    if (prev.alarmConfig.alarmEnabled != next.alarmConfig.alarmEnabled) {
+        snprintf(msg, sizeof(msg), "Riasztas %s->%s (mqtt)",
+                 prev.alarmConfig.alarmEnabled ? "BE" : "KI",
+                 next.alarmConfig.alarmEnabled ? "BE" : "KI");
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+    if (prev.heartbeatIntervalSec != next.heartbeatIntervalSec) {
+        snprintf(msg, sizeof(msg), "Ping %us->%us (mqtt)",
+                 prev.heartbeatIntervalSec, next.heartbeatIntervalSec);
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+    if (computeSavedOutputsMask(prev) != computeSavedOutputsMask(next)) {
+        snprintf(msg, sizeof(msg), "Kimenetek 0x%02X->0x%02X (mqtt)",
+                 computeSavedOutputsMask(prev), computeSavedOutputsMask(next));
+        logEvent(LOG_INFO, "SETTING", msg);
+    }
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (strcmp(topic, TOPIC_CMD) != 0) return;
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload, length);
     if (err) {
-        Serial.print(F("[MQTT] JSON hiba: "));
-        Serial.println(err.c_str());
+        char msg[48];
+        snprintf(msg, sizeof(msg), "JSON hiba: %s", err.c_str());
+        logEvent(LOG_WARN, "MQTT_JSON", msg);
         return;
     }
+
+    if (doc["action"].is<const char*>()) {
+        const char* action = doc["action"].as<const char*>();
+        if (strcmp(action, "getLogs") == 0) {
+            int page  = doc["page"].is<int>() ? doc["page"].as<int>() : 1;
+            int limit = doc["limit"].is<int>() ? doc["limit"].as<int>() : 20;
+            publishMqttLogsResponse(page, limit);
+            return;
+        }
+        if (strcmp(action, "clearLogs") == 0) {
+            logger.clear();
+            logEvent(LOG_INFO, "LOGS_CLEARED", "Naplo uritve (mqtt)");
+            menu.requestRedraw();
+            return;
+        }
+    }
+
+    SystemState staged = state;
 
     if (doc["targetTemp"].is<float>() || doc["targetTemp"].is<int>()) {
         float t = doc["targetTemp"].as<float>();
         if (t < TARGET_TEMP_MIN) t = TARGET_TEMP_MIN;
         if (t > TARGET_TEMP_MAX) t = TARGET_TEMP_MAX;
-        state.targetTemp = roundf(t * 2.0f) / 2.0f;
+        staged.targetTemp = roundf(t * 2.0f) / 2.0f;
     }
 
     if (doc["mode"].is<const char*>()) {
-        state.mode = strToMode(doc["mode"].as<const char*>());
+        staged.mode = strToMode(doc["mode"].as<const char*>());
     }
 
     if (doc["manualHeating"].is<bool>()) {
-        state.manualHeating = doc["manualHeating"].as<bool>();
+        staged.manualHeating = doc["manualHeating"].as<bool>();
     }
 
     if (doc["kimenetek"].is<JsonObject>()) {
         JsonObject k = doc["kimenetek"].as<JsonObject>();
-        if (k["led_zold"].is<bool>())  setBit(state.outputsMask, OUT_BIT_LED_ZOLD,  k["led_zold"].as<bool>());
-        if (k["led_piros"].is<bool>()) state.userLedPiros = k["led_piros"].as<bool>();
-        if (k["tartalek1"].is<bool>()) setBit(state.outputsMask, OUT_BIT_TARTALEK1, k["tartalek1"].as<bool>());
-        if (k["tartalek2"].is<bool>()) setBit(state.outputsMask, OUT_BIT_TARTALEK2, k["tartalek2"].as<bool>());
-        if (k["tartalek3"].is<bool>()) setBit(state.outputsMask, OUT_BIT_TARTALEK3, k["tartalek3"].as<bool>());
-        if (k["tartalek4"].is<bool>()) setBit(state.outputsMask, OUT_BIT_TARTALEK4, k["tartalek4"].as<bool>());
-        if (k["tartalek5"].is<bool>()) setBit(state.outputsMask, OUT_BIT_TARTALEK5, k["tartalek5"].as<bool>());
+        if (k["led_zold"].is<bool>())  setBit(staged.outputsMask, OUT_BIT_LED_ZOLD,  k["led_zold"].as<bool>());
+        if (k["led_piros"].is<bool>()) staged.userLedPiros = k["led_piros"].as<bool>();
+        if (k["tartalek1"].is<bool>()) setBit(staged.outputsMask, OUT_BIT_TARTALEK1, k["tartalek1"].as<bool>());
+        if (k["tartalek2"].is<bool>()) setBit(staged.outputsMask, OUT_BIT_TARTALEK2, k["tartalek2"].as<bool>());
+        if (k["tartalek3"].is<bool>()) setBit(staged.outputsMask, OUT_BIT_TARTALEK3, k["tartalek3"].as<bool>());
+        if (k["tartalek4"].is<bool>()) setBit(staged.outputsMask, OUT_BIT_TARTALEK4, k["tartalek4"].as<bool>());
+        if (k["tartalek5"].is<bool>()) setBit(staged.outputsMask, OUT_BIT_TARTALEK5, k["tartalek5"].as<bool>());
     }
 
     if (doc["pumpConfig"].is<JsonObject>()) {
         JsonObject pc = doc["pumpConfig"].as<JsonObject>();
         if (pc["pumpMode"].is<const char*>()) {
             uint8_t nextPumpMode = strToPumpMode(pc["pumpMode"].as<const char*>());
-            if (nextPumpMode == PUMP_MODE_MANUAL_OFF && state.pumpConfig.pumpMode != PUMP_MODE_MANUAL_OFF) {
-                state.manualOffStartMs = millis();
+            if (nextPumpMode == PUMP_MODE_MANUAL_OFF && staged.pumpConfig.pumpMode != PUMP_MODE_MANUAL_OFF) {
+                staged.manualOffStartMs = millis();
             }
-            state.pumpConfig.pumpMode = nextPumpMode;
+            staged.pumpConfig.pumpMode = nextPumpMode;
         }
         if (pc["pumpStartTemp"].is<float>() || pc["pumpStartTemp"].is<int>()) {
-            state.pumpConfig.pumpStartTemp = pc["pumpStartTemp"].as<float>();
+            staged.pumpConfig.pumpStartTemp = pc["pumpStartTemp"].as<float>();
         }
         if (pc["pumpStopTemp"].is<float>() || pc["pumpStopTemp"].is<int>()) {
-            state.pumpConfig.pumpStopTemp = pc["pumpStopTemp"].as<float>();
+            staged.pumpConfig.pumpStopTemp = pc["pumpStopTemp"].as<float>();
         }
         if (pc["pumpStartSensor"].is<const char*>()) {
-            state.pumpConfig.pumpStartSensor = strToPumpSensor(pc["pumpStartSensor"].as<const char*>());
+            staged.pumpConfig.pumpStartSensor = strToPumpSensor(pc["pumpStartSensor"].as<const char*>());
         }
-        sanitizePumpConfig(state.pumpConfig);
+        sanitizePumpConfig(staged.pumpConfig);
     }
+
+    bool safetyIgnored = !doc["safetyOverheatTemp"].isNull() || !doc["safety"].isNull();
 
     if (doc["alarmConfig"].is<JsonObject>()) {
         JsonObject ac = doc["alarmConfig"].as<JsonObject>();
-        if (ac["overheatTemp"].is<float>() || ac["overheatTemp"].is<int>()) {
-            state.alarmConfig.overheatTemp = ac["overheatTemp"].as<float>();
+        if (!ac["safetyOverheatTemp"].isNull()) {
+            safetyIgnored = true;
+        }
+        if (ac["alarmTemp"].is<float>() || ac["alarmTemp"].is<int>()) {
+            staged.alarmConfig.alarmTemp = ac["alarmTemp"].as<float>();
+        } else if (ac["overheatTemp"].is<float>() || ac["overheatTemp"].is<int>()) {
+            staged.alarmConfig.alarmTemp = ac["overheatTemp"].as<float>();
+            logEvent(LOG_WARN, "DEPRECATED", "DEPRECATED overheatTemp -> alarmTemp");
         }
         if (ac["alarmEnabled"].is<bool>()) {
-            state.alarmConfig.alarmEnabled = ac["alarmEnabled"].as<bool>() ? 1 : 0;
+            staged.alarmConfig.alarmEnabled = ac["alarmEnabled"].as<bool>() ? 1 : 0;
         }
-        sanitizeAlarmConfig(state.alarmConfig);
+        sanitizeAlarmConfig(staged.alarmConfig);
+    }
+
+    if (safetyIgnored) {
+        logEvent(LOG_WARN, "SAFETY_WARN", "SAFETY_TEMP_IGNORED");
     }
 
     if (doc["heartbeat"].is<JsonObject>()) {
@@ -753,27 +1379,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (hb["intervalSec"].is<int>()) {
             int sec = hb["intervalSec"].as<int>();
             if (isValidHeartbeatInterval(sec)) {
-                state.heartbeatIntervalSec = static_cast<uint8_t>(sec);
+                staged.heartbeatIntervalSec = static_cast<uint8_t>(sec);
             }
         }
     }
 
-    uint32_t now = millis();
-    evaluateRoomHeatingIndicator();
-    evaluateBoilerPumpProtection(now);
-    updateAlarmBlinkAndLed(now);
-    saveSettingsToNvs();
-
-    sendRequestToNano();
-    lastHeartbeatMs = millis();
-    evaluateBoilerPumpProtection(lastHeartbeatMs);
-    updateAlarmBlinkAndLed(lastHeartbeatMs);
-
-    // Ha nincs éppen MENU_EDIT szerkesztésben, a menü azonnal átveszi a friss értékeket
-    if (!menu.isEditing()) {
-        menu.requestRedraw();
+    if (!saveChangedSettingsFromState(state, staged)) {
+        // Mentési hiba esetén megtartjuk a régi értéket RAM-ban, nem küldünk STATUS-t
+        return;
     }
-    publishMqttStatus();
+
+    logMqttSettingChanges(state, staged);
+    state = staged;
+    commitSettingEffects(!menu.isEditing());
 }
 
 // ============================================================================
@@ -819,7 +1437,7 @@ void handleWifiPortalSave() {
 
     Preferences wifiPrefs;
     if (!wifiPrefs.begin(WIFI_NVS_NAMESPACE, false)) {
-        Serial.println(F("[WIFI] Hiba a Wi-Fi adatok NVS-be mentésekor."));
+        logEvent(LOG_ERROR, "NVS_FAIL", "WiFi NVS begin hiba");
         sendWifiPortalPage("A Wi-Fi adatok mentése nem sikerült. Próbáld újra.", 500);
         return;
     }
@@ -839,7 +1457,7 @@ void handleWifiPortalSave() {
         }
     }
     if (!credentialsStored) {
-        Serial.println(F("[WIFI] Hiba a Wi-Fi adatok NVS-be mentésekor."));
+        logEvent(LOG_ERROR, "NVS_FAIL", "WiFi adatok NVS mentesi hiba");
         sendWifiPortalPage("A Wi-Fi adatok mentése nem sikerült. Próbáld újra.", 500);
         return;
     }
@@ -853,7 +1471,7 @@ void handleWifiPortalSave() {
     wifiDisconnectStartedMs = lastWifiTryMs;
     wifiDisconnectTimerActive = true;
     wifiConnectionFailureReported = false;
-    Serial.println(F("[WIFI] Beállítás elmentve; csatlakozás indul."));
+    logEvent(LOG_INFO, "WIFI_SAVE", "WiFi adatok mentve, csatlakozas");
     sendWifiPortalPage(wifiPortalMessage);
 }
 
@@ -872,19 +1490,16 @@ void beginWifiPortal(const char* message) {
     snprintf(apPassword, sizeof(apPassword), "%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     if (!WiFi.softAP(WIFI_SETUP_AP_SSID, apPassword)) {
-        Serial.println(F("[WIFI] HIBA: a beállító hozzáférési pont nem indítható el."));
+        logEvent(LOG_ERROR, "WIFI_AP", "Beallito AP inditasi hiba");
         return;
     }
 
     wifiPortalDns.start(WIFI_DNS_PORT, "*", WiFi.softAPIP());
     wifiPortalServer.begin();
     wifiPortalActive = true;
-    Serial.print(F("[WIFI] Beállító hálózat: "));
-    Serial.println(WIFI_SETUP_AP_SSID);
-    Serial.print(F("[WIFI] Beállító jelszó: "));
-    Serial.println(apPassword);
-    Serial.print(F("[WIFI] Beállító oldal: http://"));
-    Serial.println(WiFi.softAPIP());
+    char apMsg[48];
+    snprintf(apMsg, sizeof(apMsg), "AP:%s PW:%s", WIFI_SETUP_AP_SSID, apPassword);
+    logEvent(LOG_INFO, "WIFI_AP", apMsg);
 }
 
 void stopWifiPortal() {
@@ -895,13 +1510,13 @@ void stopWifiPortal() {
     wifiPortalActive = false;
     wifiConnectionFailureReported = false;
     wifiPortalMessage = "Válaszd ki az otthoni Wi-Fi hálózatot.";
-    Serial.println(F("[WIFI] Beállító hozzáférési pont leállítva."));
+    logEvent(LOG_INFO, "WIFI_AP", "Beallito AP leallitva");
 }
 
 void loadWifiCredentials() {
     Preferences wifiPrefs;
     if (!wifiPrefs.begin(WIFI_NVS_NAMESPACE, true)) {
-        Serial.println(F("[WIFI] A mentett Wi-Fi adatok nem olvashatók."));
+        logEvent(LOG_WARN, "WIFI_NVS", "Mentett WiFi adatok nem olvashatok");
         return;
     }
     wifiSsid = wifiPrefs.getString("ssid", "");
@@ -916,6 +1531,15 @@ void maintainConnectivity(uint32_t now) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+        if (prevWifiConnected) {
+            prevWifiConnected = false;
+            logEvent(LOG_WARN, "WIFI_LOST", "WiFi kapcsolat megszakadt");
+        }
+        if (prevMqttConnected) {
+            prevMqttConnected = false;
+            logEvent(LOG_WARN, "MQTT_LOST", "MQTT kapcsolat megszakadt");
+        }
+
         if (wifiSsid.length() == 0) {
             if (!wifiPortalActive && now - lastWifiPortalTryMs >= WIFI_RECONNECT_MS) {
                 beginWifiPortal("Válaszd ki az otthoni Wi-Fi hálózatot.");
@@ -942,10 +1566,19 @@ void maintainConnectivity(uint32_t now) {
 
         if (now - lastWifiTryMs >= WIFI_RECONNECT_MS) {
             lastWifiTryMs = now;
-            Serial.println(F("[WIFI] Ujracsatlakozas..."));
+            logEvent(LOG_INFO, "WIFI_RETRY", "WiFi ujracsatlakozas");
             WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
         }
         return;
+    }
+
+    if (!prevWifiConnected) {
+        prevWifiConnected = true;
+        if (!ntpConfigured) {
+            configTzTime(NTP_TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+            ntpConfigured = true;
+        }
+        logEvent(LOG_INFO, "WIFI_OK", "WiFi csatlakozva");
     }
 
     wifiDisconnectTimerActive = false;
@@ -954,18 +1587,47 @@ void maintainConnectivity(uint32_t now) {
     }
 
     if (!mqtt.connected()) {
-        if (now - lastMqttTryMs >= MQTT_RECONNECT_MS) {
-            lastMqttTryMs = now;
-            Serial.print(F("[MQTT] Csatlakozas HiveMQ Cloud-hoz... "));
+        if (prevMqttConnected) {
+            prevMqttConnected = false;
+            logEvent(LOG_WARN, "MQTT_LOST", "MQTT kapcsolat megszakadt");
+        }
+
+        if (!mqttAttemptedOnce || (now - lastMqttTryMs >= mqttRetryIntervalMs)) {
+            mqttAttemptedOnce = true;
+            lastMqttTryMs     = now;
+
+            bool caConfigured =
+                strstr_P(HIVEMQ_CA_CERT, PSTR("TODO_")) == nullptr &&
+                strstr_P(HIVEMQ_CA_CERT, PSTR("-----BEGIN CERTIFICATE-----")) != nullptr;
+
+            if (!caConfigured) {
+                logEvent(LOG_ERROR, "TLS_FAIL", "TLS CERT FAILED");
+                menu.showErrorBanner("TLS HIBA!", "CA tanusitvany!", 2000);
+                mqttRetryIntervalMs = TLS_CERT_RETRY_MS;
+                return;
+            }
+
             if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD,
                              TOPIC_STATUS, 1, true,
                              "{\"online\":false,\"error\":\"Gateway offline\"}")) {
-                Serial.println(F("SIKERES!"));
+                prevMqttConnected   = true;
+                mqttRetryIntervalMs = MQTT_RECONNECT_MS;
                 mqtt.subscribe(TOPIC_CMD);
+                logEvent(LOG_INFO, "MQTT_OK", "HiveMQ Cloud csatlakozva");
                 publishMqttStatus();
             } else {
-                Serial.print(F("HIBA, rc="));
-                Serial.println(mqtt.state());
+                char tlsErrBuf[128] = { 0 };
+                int tlsErr = wifiSecureClient.lastError(tlsErrBuf, sizeof(tlsErrBuf));
+                if (tlsErr != 0) {
+                    logEvent(LOG_ERROR, "TLS_FAIL", "TLS CERT FAILED");
+                    menu.showErrorBanner("TLS HIBA!", "CA tanusitvany!", 2000);
+                    mqttRetryIntervalMs = TLS_CERT_RETRY_MS;
+                } else {
+                    mqttRetryIntervalMs = MQTT_RECONNECT_MS;
+                    char msg[48];
+                    snprintf(msg, sizeof(msg), "MQTT hiba rc=%d", mqtt.state());
+                    logEvent(LOG_WARN, "MQTT_FAIL", msg);
+                }
             }
         }
     } else {
@@ -1059,7 +1721,7 @@ void processEncoderAndButton(uint32_t now) {
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println(F("\n[ESP32-C3 V5] Master / Gateway + Menu inditas..."));
+    logEvent(LOG_INFO, "BOOT", "Indulas V5.4");
 
     pinMode(PIN_ALARM_LED, OUTPUT);
     digitalWrite(PIN_ALARM_LED, LOW);
@@ -1084,7 +1746,7 @@ void setup() {
 
     spiNrf.begin(PIN_NRF_SCK, PIN_NRF_MISO, PIN_NRF_MOSI, PIN_NRF_CSN);
     if (!radio.begin(&spiNrf)) {
-        Serial.println(F("[ESP] HIBA: NRF24L01+ nem talalhato!"));
+        logEvent(LOG_ERROR, "NRF_INIT", "NRF24L01+ nem talalhato");
     } else {
         radio.disableAckPayload();
         radio.setPayloadSize(sizeof(NrfPacket));
@@ -1096,7 +1758,7 @@ void setup() {
         radio.openWritingPipe(NRF_ADDR_MASTER_TO_SLAVE);
         radio.openReadingPipe(1, NRF_ADDR_SLAVE_TO_MASTER);
         radio.stopListening();
-        Serial.println(F("[ESP] NRF24L01+ MASTER keszenletben (AckPayload KI)."));
+        logEvent(LOG_INFO, "NRF_INIT", "NRF24L01+ MASTER keszenletben");
     }
 
     uint32_t now = millis();
@@ -1128,11 +1790,12 @@ void setup() {
         wifiDisconnectTimerActive = true;
     }
 
-    wifiSecureClient.setInsecure();
+    static_assert(TLS_REQUIRE_CA_CERT, "CA tanusitvany ellenorzes kotelezo");
+    wifiSecureClient.setCACert(HIVEMQ_CA_CERT);
     wifiSecureClient.setTimeout(3);
 
     mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-    mqtt.setBufferSize(2048);
+    mqtt.setBufferSize(4096);
     mqtt.setCallback(mqttCallback);
 }
 
@@ -1141,6 +1804,9 @@ void loop() {
 
     // 0. Nem-blokkoló 500ms riasztási LED villogás
     updateAlarmBlinkAndLed(now);
+
+    // 0b. Sikertelen NVS mentés egyszeri újrapróbálkozása a következő loop-ban
+    processPendingNvsRetry(now);
 
     // 1. Encoder és gomb események feldolgozása (interrupt + debounce)
     processEncoderAndButton(now);
@@ -1155,6 +1821,9 @@ void loop() {
         state.currentTemp = readRoomTempLM35();
         evaluateRoomHeatingIndicator();
         bool modeRestored = evaluateBoilerPumpProtection(now);
+        if (modeRestored) {
+            saveSetting("pumpMode", static_cast<uint32_t>(state.pumpConfig.pumpMode));
+        }
 
         if (modeRestored || prevHeat != state.heatingOn || prevPump != state.pumpOn ||
             fabsf(prevTemp - state.currentTemp) >= 0.2f) {
@@ -1176,17 +1845,26 @@ void loop() {
         uint8_t prevAlarmAct = state.alarmState.active;
         uint8_t prevAlarmRsn = state.alarmState.reason;
 
-        sendRequestToNano();
+        bool txOk = sendRequestToNano();
         bool modeRestored = evaluateBoilerPumpProtection(millis());
+        if (modeRestored) {
+            saveSetting("pumpMode", static_cast<uint32_t>(state.pumpConfig.pumpMode));
+        }
 
-        if (prevPump != state.pumpOn) {
+        if (txOk && prevPump != state.pumpOn) {
             sendRequestToNano();
         }
 
-        if (modeRestored || prevNrfOk != state.nrf24Ok ||
+        if (mqttStatusPendingRetry || modeRestored || prevNrfOk != state.nrf24Ok ||
             prevPump != state.pumpOn || prevPState != state.pumpState ||
             prevAlarmAct != state.alarmState.active || prevAlarmRsn != state.alarmState.reason) {
             publishMqttStatus();
+        }
+
+        if (mqttTelemetryPendingRetry && mqtt.connected()) {
+            if (publishMqttTelemetry()) {
+                lastTelemetryMs = millis();
+            }
         }
     }
 

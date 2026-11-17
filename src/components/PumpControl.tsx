@@ -1,17 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Flame, PauseCircle } from 'lucide-react';
-import type {
-  AlarmConfig,
-  PumpConfig,
-  PumpMode,
-  PumpStartSensor,
-  PumpState,
+import {
+  DEFAULT_SAFETY_CONFIG,
+  type PumpConfig,
+  type PumpMode,
+  type PumpStartSensor,
+  type PumpState,
+  type SafetyConfig,
 } from '../types/heating';
 
 interface PumpControlProps {
   pumpConfig: PumpConfig;
   pumpState: PumpState;
-  alarmConfig: AlarmConfig;
+  safety?: SafetyConfig;
   kazanTemp: number | null;
   sending: boolean;
   onSendPumpConfig: (config: PumpConfig) => Promise<void>;
@@ -40,7 +41,7 @@ function hasHysteresisError(startTemp: number, stopTemp: number): boolean {
 export function PumpControl({
   pumpConfig,
   pumpState,
-  alarmConfig,
+  safety = DEFAULT_SAFETY_CONFIG,
   kazanTemp,
   sending,
   onSendPumpConfig,
@@ -103,13 +104,13 @@ export function PumpControl({
     }, 500);
   };
 
+  // A szivattyú biztonsági felülírása KIZÁRÓLAG a fix 95.0°C biztonsági határt használja (alarmEnabled-től függetlenül)
   const isOverheat =
-    alarmConfig.alarmEnabled &&
     kazanTemp !== null &&
     kazanTemp !== undefined &&
     !Number.isNaN(kazanTemp) &&
     kazanTemp > -120 &&
-    kazanTemp >= alarmConfig.overheatTemp;
+    kazanTemp >= safety.safetyOverheatTemp;
 
   const isPumpRunning = pumpState === 'futes';
 

@@ -26,8 +26,12 @@ export interface PumpConfig {
 }
 
 export interface AlarmConfig {
-  overheatTemp: number;
+  alarmTemp: number;
   alarmEnabled: boolean;
+}
+
+export interface SafetyConfig {
+  readonly safetyOverheatTemp: number;
 }
 
 export type AlarmReason = 'none' | 'overheat' | 'sensor_fail' | 'nrf_fail';
@@ -60,6 +64,7 @@ export interface HeatingStatusPayload {
   pumpConfig: PumpConfig;
   pumpState: PumpState;
   alarmConfig: AlarmConfig;
+  safety?: SafetyConfig;
   alarmState: AlarmState;
   heartbeat: HeartbeatConfig;
   nrf24_ok: boolean;
@@ -122,8 +127,12 @@ export const DEFAULT_PUMP_CONFIG: PumpConfig = {
 };
 
 export const DEFAULT_ALARM_CONFIG: AlarmConfig = {
-  overheatTemp: 85.0,
+  alarmTemp: 85.0,
   alarmEnabled: true,
+};
+
+export const DEFAULT_SAFETY_CONFIG: SafetyConfig = {
+  safetyOverheatTemp: 95.0,
 };
 
 export const DEFAULT_ALARM_STATE: AlarmState = {

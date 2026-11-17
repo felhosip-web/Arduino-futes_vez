@@ -1,10 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Bell, BellOff, ShieldCheck } from 'lucide-react';
-import type { AlarmConfig, AlarmReason, AlarmState } from '../types/heating';
+import { AlertTriangle, Bell, BellOff, ShieldAlert, ShieldCheck } from 'lucide-react';
+import {
+  DEFAULT_SAFETY_CONFIG,
+  type AlarmConfig,
+  type AlarmReason,
+  type AlarmState,
+  type SafetyConfig,
+} from '../types/heating';
 
 interface AlarmControlProps {
   alarmConfig: AlarmConfig;
   alarmState: AlarmState;
+  safety?: SafetyConfig;
   kazanTemp: number | null;
   sending: boolean;
   onSendAlarmConfig: (config: AlarmConfig) => Promise<void>;
@@ -35,6 +42,7 @@ function getAlarmBadgeText(reason: AlarmReason): string {
 export function AlarmControl({
   alarmConfig,
   alarmState,
+  safety = DEFAULT_SAFETY_CONFIG,
   kazanTemp,
   sending,
   onSendAlarmConfig,
@@ -48,7 +56,7 @@ export function AlarmControl({
     if (!isSlidingRef.current) {
       setDraftConfig(alarmConfig);
     }
-  }, [alarmConfig.overheatTemp, alarmConfig.alarmEnabled]);
+  }, [alarmConfig.alarmTemp, alarmConfig.alarmEnabled]);
 
   useEffect(() => {
     return () => {
@@ -87,7 +95,7 @@ export function AlarmControl({
     kazanTemp !== undefined &&
     !Number.isNaN(kazanTemp) &&
     kazanTemp > -120 &&
-    kazanTemp >= alarmConfig.overheatTemp;
+    kazanTemp >= alarmConfig.alarmTemp;
 
   return (
     <section
@@ -120,8 +128,8 @@ export function AlarmControl({
 
       {/* Magyarázó szöveg */}
       <p className="mt-4 text-sm leading-relaxed text-slate-400">
-        Ha a kazán eléri a beállított hőmérsékletet, a piros LED villog a kazánnál (Nano) és a
-        szobában (ESP32) is, és a szivattyú kényszerítve BEkapcsol.
+        Ha a kazán eléri a beállított riasztási hőmérsékletet, a piros LED villog a kazánnál
+        (Nano) és a szobában (ESP32) is.
       </p>
 
       {/* Figyelmeztetés kikapcsolt riasztásnál */}
@@ -152,7 +160,7 @@ export function AlarmControl({
                 draftConfig.alarmEnabled ? 'text-red-400' : 'text-slate-500'
               }`}
             >
-              {draftConfig.overheatTemp.toFixed(1)}°C
+              {draftConfig.alarmTemp.toFixed(1)}°C
             </span>
           </div>
 
@@ -163,7 +171,7 @@ export function AlarmControl({
             max={OVERHEAT_MAX}
             step={OVERHEAT_STEP}
             disabled={!draftConfig.alarmEnabled}
-            value={draftConfig.overheatTemp}
+            value={draftConfig.alarmTemp}
             onPointerDown={() => {
               isSlidingRef.current = true;
             }}
@@ -179,7 +187,7 @@ export function AlarmControl({
             onChange={(e) =>
               scheduleSliderCommit({
                 ...draftConfig,
-                overheatTemp: clampOverheatTemp(parseFloat(e.target.value)),
+                alarmTemp: clampOverheatTemp(parseFloat(e.target.value)),
               })
             }
             className={`mt-3 w-full ${
@@ -241,6 +249,15 @@ export function AlarmControl({
             <span>{draftConfig.alarmEnabled ? 'BE' : 'KI'}</span>
           </button>
         </div>
+      </div>
+
+      {/* Fix biztonsági határ tájékoztató sáv */}
+      <div className="mt-5 flex items-start gap-2.5 rounded-lg border border-slate-700/80 bg-slate-800/70 px-4 py-3 text-xs text-slate-300">
+        <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" aria-hidden="true" />
+        <span>
+          Biztonsági határ: <strong className="tabular-nums text-slate-100">{safety.safetyOverheatTemp.toFixed(1)}°C</strong>{' '}
+          (nem állítható) - e fölött a szivattyú mindenképp BEkapcsol, akkor is, ha a riasztás ki van kapcsolva.
+        </span>
       </div>
     </section>
   );

@@ -12,11 +12,12 @@ enum FokSrcId : uint8_t {
 };
 
 enum StatusFieldId : uint8_t {
-    STAT_SZIVATTYU  = 0,
-    STAT_FUTES      = 1,
-    STAT_PUMP_STATE = 2,
-    STAT_RIASZTAS   = 3,
-    STAT_RADIO      = 4
+    STAT_SZIVATTYU   = 0,
+    STAT_FUTES       = 1,
+    STAT_PUMP_STATE  = 2,
+    STAT_RIASZTAS    = 3,
+    STAT_RADIO       = 4,
+    STAT_SAFETY_TEMP = 5
 };
 
 enum EditFieldId : uint8_t {
@@ -26,7 +27,7 @@ enum EditFieldId : uint8_t {
     EDIT_PUMP_START     = 3,
     EDIT_PUMP_STOP      = 4,
     EDIT_PUMP_SENSOR    = 5,
-    EDIT_OVERHEAT_TEMP  = 6,
+    EDIT_ALARM_TEMP     = 6,
     EDIT_ALARM_ENABLED  = 7,
     EDIT_HEARTBEAT      = 8,
     EDIT_MANUAL_HEATING = 9
@@ -39,6 +40,24 @@ uint8_t heartbeatSecToIndex(uint8_t sec) {
         if (HEARTBEAT_OPTIONS[i] == sec) return i;
     }
     return 0;
+}
+
+const char* modeLabel(uint8_t m) {
+    if (m == MODE_MANUAL) return "MANUAL";
+    if (m == MODE_OFF)    return "OFF";
+    return "AUTO";
+}
+
+const char* pumpModeLabel(uint8_t pm) {
+    if (pm == PUMP_MODE_MANUAL_ON)  return "BE";
+    if (pm == PUMP_MODE_MANUAL_OFF) return "KI";
+    return "AUTO";
+}
+
+const char* pumpSensorLabel(uint8_t ps) {
+    if (ps == PUMP_SENSOR_ELOREMENO) return "ELOREMENO";
+    if (ps == PUMP_SENSOR_MAX)       return "MAX";
+    return "KAZAN";
 }
 } // namespace
 
@@ -61,11 +80,13 @@ void MenuController::begin(HeatingLcd* lcd, SystemState* state, const MenuCallba
     _menuState       = MENU_HOME;
     _cursor          = 0;
     _mainCursor      = 0;
+    _logCursor       = 0;
     _lastActivityMs  = millis();
     _lastMenuDrawMs  = 0;
     _lastMainDrawMs  = 0;
     _lastEditBlinkMs = 0;
     _bannerUntilMs   = 0;
+    _alertUntilMs    = 0;
     _editBlinkOn     = true;
     _menuDirty       = true;
     _mainDirty       = true;
@@ -77,6 +98,14 @@ void MenuController::begin(HeatingLcd* lcd, SystemState* state, const MenuCallba
 void MenuController::requestRedraw() {
     _menuDirty = true;
     _mainDirty = true;
+}
+
+void MenuController::showErrorBanner(const char* line1, const char* line2, uint32_t durationMs) {
+    uint32_t until = millis() + durationMs;
+    _alertUntilMs = (until == 0) ? 1 : until;
+    if (_lcd) {
+        _lcd->printLinesImmediate(line1 ? line1 : "HIBA!", line2 ? line2 : "");
+    }
 }
 
 bool MenuController::isOnFactoryResetItem() const {
@@ -116,6 +145,8 @@ void MenuController::buildItemsForState(MenuState targetState) {
             _items[_itemCount++] = { "Pumpa Allapot", ITEM_READONLY_STATUS, &_state->pumpState,  0, 0, 0, STAT_PUMP_STATE };
             _items[_itemCount++] = { "Riasztas",      ITEM_READONLY_STATUS, &_state->alarmState, 0, 0, 0, STAT_RIASZTAS };
             _items[_itemCount++] = { "Radio",         ITEM_READONLY_STATUS, &_state->nrf24Ok,    0, 0, 0, STAT_RADIO };
+            _items[_itemCount++] = { "Bizt. Hatar",   ITEM_READONLY_STATUS, nullptr,             0, 0, 0, STAT_SAFETY_TEMP };
+            _items[_itemCount++] = { "NAPLO",         ITEM_SUBMENU,         nullptr,             0, 0, 0, MENU_LOGS };
             _items[_itemCount++] = { "VISSZA",        ITEM_ACTION_BACK,     nullptr,             0, 0, 0, MENU_MAIN };
             break;
 
@@ -126,7 +157,7 @@ void MenuController::buildItemsForState(MenuState targetState) {
             _items[_itemCount++] = { "Pump Start",          ITEM_EDIT_FLOAT,           &_state->pumpConfig.pumpStartTemp,   PUMP_START_TEMP_MIN,    PUMP_START_TEMP_MAX,    0.5f, EDIT_PUMP_START };
             _items[_itemCount++] = { "Pump Stop",           ITEM_EDIT_FLOAT,           &_state->pumpConfig.pumpStopTemp,    PUMP_STOP_TEMP_MIN,     PUMP_STOP_TEMP_MAX,     0.5f, EDIT_PUMP_STOP };
             _items[_itemCount++] = { "Pump Szenzor",        ITEM_EDIT_ENUM,            &_state->pumpConfig.pumpStartSensor, 0.0f,                   2.0f,                   1.0f, EDIT_PUMP_SENSOR };
-            _items[_itemCount++] = { "Riasztas Hofok",      ITEM_EDIT_FLOAT,           &_state->alarmConfig.overheatTemp,   ALARM_OVERHEAT_TEMP_MIN, ALARM_OVERHEAT_TEMP_MAX, 0.5f, EDIT_OVERHEAT_TEMP };
+            _items[_itemCount++] = { "Riasztas Hofok",      ITEM_EDIT_FLOAT,           &_state->alarmConfig.alarmTemp,      ALARM_OVERHEAT_TEMP_MIN, ALARM_OVERHEAT_TEMP_MAX, 0.5f, EDIT_ALARM_TEMP };
             _items[_itemCount++] = { "Riasztas",            ITEM_EDIT_BOOL,            &_state->alarmConfig.alarmEnabled,   0.0f,                   1.0f,                   1.0f, EDIT_ALARM_ENABLED };
             _items[_itemCount++] = { "Ping",                ITEM_EDIT_ENUM,            &_state->heartbeatIntervalSec,       0.0f,                   5.0f,                   1.0f, EDIT_HEARTBEAT };
             _items[_itemCount++] = { "Manual Futes",        ITEM_EDIT_BOOL,            &_state->manualHeating,              0.0f,                   1.0f,                   1.0f, EDIT_MANUAL_HEATING };
@@ -147,6 +178,7 @@ void MenuController::buildItemsForState(MenuState targetState) {
             break;
 
         case MENU_HOME:
+        case MENU_LOGS:
         case MENU_EDIT:
         default:
             break;
@@ -158,6 +190,12 @@ void MenuController::buildItemsForState(MenuState targetState) {
 // ============================================================================
 void MenuController::enterSubmenu(MenuState sub, uint8_t initialCursor, uint32_t now) {
     _menuState = sub;
+    if (sub == MENU_LOGS) {
+        _logCursor      = 0;
+        _lastActivityMs = now;
+        _menuDirty      = true;
+        return;
+    }
     buildItemsForState(sub);
     _cursor = (_itemCount > 0 && initialCursor < _itemCount) ? initialCursor : 0;
     _lastActivityMs = now;
@@ -193,8 +231,8 @@ void MenuController::enterEditMode(uint8_t itemIndex, uint32_t now) {
         case EDIT_PUMP_SENSOR:
             _editEnum = _state->pumpConfig.pumpStartSensor;
             break;
-        case EDIT_OVERHEAT_TEMP:
-            _editFloat = roundHalf(_state->alarmConfig.overheatTemp);
+        case EDIT_ALARM_TEMP:
+            _editFloat = roundHalf(_state->alarmConfig.alarmTemp);
             break;
         case EDIT_ALARM_ENABLED:
             _editBool = (_state->alarmConfig.alarmEnabled != 0);
@@ -222,52 +260,119 @@ void MenuController::commitEdit(uint32_t now) {
     }
 
     const MenuItem& item = _items[_editItemIndex];
+    bool saved = true;
+    char logMsg[48] = { 0 };
+
     switch (item.extraId) {
         case EDIT_TARGET_TEMP:
-            _state->targetTemp = _editFloat;
-            break;
-
-        case EDIT_MODE:
-            _state->mode = _editEnum % 3;
-            break;
-
-        case EDIT_PUMP_MODE: {
-            uint8_t nextMode = _editEnum % 3;
-            if (nextMode == PUMP_MODE_MANUAL_OFF &&
-                _state->pumpConfig.pumpMode != PUMP_MODE_MANUAL_OFF) {
-                _state->manualOffStartMs = now;
+            saved = saveSetting("targetTemp", _editFloat);
+            if (saved) {
+                snprintf(logMsg, sizeof(logMsg), "Celhofok %.1f->%.1f (menu)", _state->targetTemp, _editFloat);
+                _state->targetTemp = _editFloat;
             }
-            _state->pumpConfig.pumpMode = nextMode;
+            break;
+
+        case EDIT_MODE: {
+            uint8_t nextMode = _editEnum % 3;
+            saved = saveSetting("mode", static_cast<uint32_t>(nextMode));
+            if (saved) {
+                snprintf(logMsg, sizeof(logMsg), "Uzmod %s->%s (menu)", modeLabel(_state->mode), modeLabel(nextMode));
+                _state->mode = nextMode;
+            }
             break;
         }
 
-        case EDIT_PUMP_START:
-            _state->pumpConfig.pumpStartTemp = _editFloat;
-            _state->pumpConfig.pumpStopTemp  = _editPartnerFloat;
+        case EDIT_PUMP_MODE: {
+            uint8_t nextMode = _editEnum % 3;
+            saved = saveSetting("pumpMode", static_cast<uint32_t>(nextMode));
+            if (saved) {
+                snprintf(logMsg, sizeof(logMsg), "PumpMod %s->%s (menu)",
+                         pumpModeLabel(_state->pumpConfig.pumpMode), pumpModeLabel(nextMode));
+                if (nextMode == PUMP_MODE_MANUAL_OFF &&
+                    _state->pumpConfig.pumpMode != PUMP_MODE_MANUAL_OFF) {
+                    _state->manualOffStartMs = now;
+                }
+                _state->pumpConfig.pumpMode = nextMode;
+            }
             break;
+        }
+
+        case EDIT_PUMP_START: {
+            bool okStop = true;
+            if (_editPartnerFloat != _state->pumpConfig.pumpStopTemp) {
+                okStop = saveSetting("pumpStopTemp", _editPartnerFloat);
+                if (okStop) {
+                    _state->pumpConfig.pumpStopTemp = _editPartnerFloat;
+                }
+            }
+            bool okStart = okStop ? saveSetting("pumpStartTemp", _editFloat) : false;
+            if (okStart) {
+                snprintf(logMsg, sizeof(logMsg), "PumpStart %.1f->%.1f (menu)",
+                         _state->pumpConfig.pumpStartTemp, _editFloat);
+                _state->pumpConfig.pumpStartTemp = _editFloat;
+            }
+            saved = okStop && okStart;
+            break;
+        }
 
         case EDIT_PUMP_STOP:
-            _state->pumpConfig.pumpStopTemp = _editFloat;
+            saved = saveSetting("pumpStopTemp", _editFloat);
+            if (saved) {
+                snprintf(logMsg, sizeof(logMsg), "PumpStop %.1f->%.1f (menu)",
+                         _state->pumpConfig.pumpStopTemp, _editFloat);
+                _state->pumpConfig.pumpStopTemp = _editFloat;
+            }
             break;
 
-        case EDIT_PUMP_SENSOR:
-            _state->pumpConfig.pumpStartSensor = _editEnum % 3;
+        case EDIT_PUMP_SENSOR: {
+            uint8_t nextSensor = _editEnum % 3;
+            saved = saveSetting("pumpSensor", static_cast<uint32_t>(nextSensor));
+            if (saved) {
+                snprintf(logMsg, sizeof(logMsg), "PumpSzenz %s->%s (menu)",
+                         pumpSensorLabel(_state->pumpConfig.pumpStartSensor), pumpSensorLabel(nextSensor));
+                _state->pumpConfig.pumpStartSensor = nextSensor;
+            }
             break;
+        }
 
-        case EDIT_OVERHEAT_TEMP:
-            _state->alarmConfig.overheatTemp = _editFloat;
+        case EDIT_ALARM_TEMP:
+            saved = saveSetting("alarmTemp", _editFloat);
+            if (saved) {
+                snprintf(logMsg, sizeof(logMsg), "RiasztHof %.1f->%.1f (menu)",
+                         _state->alarmConfig.alarmTemp, _editFloat);
+                _state->alarmConfig.alarmTemp = _editFloat;
+            }
             break;
 
         case EDIT_ALARM_ENABLED:
-            _state->alarmConfig.alarmEnabled = _editBool ? 1 : 0;
+            saved = saveSetting("alarmEnabled", _editBool);
+            if (saved) {
+                snprintf(logMsg, sizeof(logMsg), "Riasztas %s->%s (menu)",
+                         (_state->alarmConfig.alarmEnabled != 0) ? "BE" : "KI",
+                         _editBool ? "BE" : "KI");
+                _state->alarmConfig.alarmEnabled = _editBool ? 1 : 0;
+            }
             break;
 
-        case EDIT_HEARTBEAT:
-            _state->heartbeatIntervalSec = HEARTBEAT_OPTIONS[_editEnum % 6];
+        case EDIT_HEARTBEAT: {
+            uint8_t nextHb = HEARTBEAT_OPTIONS[_editEnum % 6];
+            saved = saveSetting("heartbeatSec", static_cast<uint32_t>(nextHb));
+            if (saved) {
+                snprintf(logMsg, sizeof(logMsg), "Ping %us->%us (menu)",
+                         _state->heartbeatIntervalSec, nextHb);
+                _state->heartbeatIntervalSec = nextHb;
+            }
             break;
+        }
 
         case EDIT_MANUAL_HEATING:
-            _state->manualHeating = _editBool;
+            saved = saveSetting("manualHeating", _editBool);
+            if (saved) {
+                snprintf(logMsg, sizeof(logMsg), "ManualFut %s->%s (menu)",
+                         _state->manualHeating ? "BE" : "KI",
+                         _editBool ? "BE" : "KI");
+                _state->manualHeating = _editBool;
+            }
             break;
 
         default:
@@ -278,8 +383,13 @@ void MenuController::commitEdit(uint32_t now) {
     _lastActivityMs = now;
     _menuDirty      = true;
 
-    if (_callbacks.onSettingCommitted) {
-        _callbacks.onSettingCommitted();
+    if (saved) {
+        if (logMsg[0] != '\0') {
+            logEvent(LOG_INFO, "SETTING", logMsg);
+        }
+        if (_callbacks.onSettingCommitted) {
+            _callbacks.onSettingCommitted();
+        }
     }
 }
 
@@ -288,35 +398,63 @@ void MenuController::toggleOutput(uint8_t itemIndex, uint32_t now) {
 
     const MenuItem& item = _items[itemIndex];
     uint8_t bit = item.extraId;
+    bool saved = true;
+    char logMsg[48] = { 0 };
 
     if (bit == OUT_BIT_SZIVATTYU) {
         // AUTO módban zárolva, csak manual_on / manual_off módban kapcsolható
         if (_state->pumpConfig.pumpMode == PUMP_MODE_AUTO) {
             return;
         }
-        if (_state->pumpOn) {
-            _state->pumpConfig.pumpMode = PUMP_MODE_MANUAL_OFF;
-            _state->manualOffStartMs    = now;
-        } else {
-            _state->pumpConfig.pumpMode = PUMP_MODE_MANUAL_ON;
+        uint8_t nextPumpMode = _state->pumpOn ? PUMP_MODE_MANUAL_OFF : PUMP_MODE_MANUAL_ON;
+        saved = saveSetting("pumpMode", static_cast<uint32_t>(nextPumpMode));
+        if (saved) {
+            if (nextPumpMode == PUMP_MODE_MANUAL_OFF) {
+                _state->manualOffStartMs = now;
+            }
+            _state->pumpConfig.pumpMode = nextPumpMode;
+            snprintf(logMsg, sizeof(logMsg), "Kim Szivattyu %s (menu)",
+                     (nextPumpMode == PUMP_MODE_MANUAL_ON) ? "BE" : "KI");
         }
     } else if (bit == OUT_BIT_LED_PIROS) {
         // Ha riasztás aktív, a riasztás vezérli a piros LED-et
         if (_state->alarmConfig.alarmEnabled != 0 && _state->alarmState.active != 0) {
             return;
         }
-        _state->userLedPiros = !_state->userLedPiros;
-        setBit(_state->outputsMask, OUT_BIT_LED_PIROS, _state->userLedPiros);
+        bool nextUserLed = !_state->userLedPiros;
+        uint8_t nextMask = _state->outputsMask;
+        setBit(nextMask, OUT_BIT_LED_PIROS, nextUserLed);
+        uint8_t savedMask = nextMask & static_cast<uint8_t>(~(1U << OUT_BIT_SZIVATTYU));
+        setBit(savedMask, OUT_BIT_LED_PIROS, nextUserLed);
+        saved = saveSetting("outputsMask", static_cast<uint32_t>(savedMask));
+        if (saved) {
+            _state->userLedPiros = nextUserLed;
+            _state->outputsMask  = nextMask;
+            snprintf(logMsg, sizeof(logMsg), "Kim LED Piros %s (menu)", nextUserLed ? "BE" : "KI");
+        }
     } else {
-        bool current = getBit(_state->outputsMask, bit);
-        setBit(_state->outputsMask, bit, !current);
+        uint8_t nextMask = _state->outputsMask;
+        bool current = getBit(nextMask, bit);
+        setBit(nextMask, bit, !current);
+        uint8_t savedMask = nextMask & static_cast<uint8_t>(~(1U << OUT_BIT_SZIVATTYU));
+        setBit(savedMask, OUT_BIT_LED_PIROS, _state->userLedPiros);
+        saved = saveSetting("outputsMask", static_cast<uint32_t>(savedMask));
+        if (saved) {
+            _state->outputsMask = nextMask;
+            snprintf(logMsg, sizeof(logMsg), "Kim %s %s (menu)", item.name, !current ? "BE" : "KI");
+        }
     }
 
     _lastActivityMs = now;
     _menuDirty      = true;
 
-    if (_callbacks.onSettingCommitted) {
-        _callbacks.onSettingCommitted();
+    if (saved) {
+        if (logMsg[0] != '\0') {
+            logEvent(LOG_INFO, "SETTING", logMsg);
+        }
+        if (_callbacks.onSettingCommitted) {
+            _callbacks.onSettingCommitted();
+        }
     }
 }
 
@@ -328,6 +466,11 @@ void MenuController::navigateBack(uint32_t now) {
             // Félbehagyott szerkesztés eldobása -> vissza BEALLITAS listába
             _menuState = MENU_BEALLITAS;
             _menuDirty = true;
+            break;
+
+        case MENU_LOGS:
+            // NAPLO nézetből vissza STATUS almenübe (NAPLO pontra)
+            enterSubmenu(MENU_STATUS, 6, now);
             break;
 
         case MENU_FOKOK:
@@ -356,8 +499,8 @@ void MenuController::handleInput(int8_t encSteps,
                                  uint32_t now) {
     if (!_state) return;
 
-    // Gyári visszaállítás banner alatt ne reagáljon navigációra
-    if (_bannerUntilMs != 0) {
+    // Gyári visszaállítás vagy hibajelző banner alatt ne reagáljon navigációra
+    if (_bannerUntilMs != 0 || _alertUntilMs != 0) {
         return;
     }
 
@@ -451,6 +594,29 @@ void MenuController::handleInput(int8_t encSteps,
         return;
     }
 
+    // 4b. Napló néző (`MENU_LOGS` - utolsó 5 bejegyzés lapozása)
+    if (_menuState == MENU_LOGS) {
+        size_t total = logger.count();
+        uint8_t logCount = static_cast<uint8_t>(total < 5 ? total : 5);
+        if (steps != 0 && logCount > 0) {
+            _lastActivityMs = now;
+            int16_t next = static_cast<int16_t>(_logCursor) + steps;
+            while (next < 0) next += logCount;
+            _logCursor = static_cast<uint8_t>(next % logCount);
+            _menuDirty = true;
+        }
+        if (shortPress) {
+            _lastActivityMs = now;
+            if (logCount == 0) {
+                navigateBack(now);
+            } else {
+                _logCursor = static_cast<uint8_t>((_logCursor + 1) % logCount);
+                _menuDirty = true;
+            }
+        }
+        return;
+    }
+
     // 5. Lista navigáció (`MENU_MAIN`, `MENU_FOKOK`, `MENU_STATUS`, `MENU_BEALLITAS`, `MENU_KIMENETEK`)
     if (steps != 0 && _itemCount > 0) {
         _lastActivityMs = now;
@@ -516,12 +682,26 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
         }
     }
 
+    // 1b. 2 mp-es NVS / NRF hibajelző banner (a menüállapotot megőrzi)
+    if (_alertUntilMs != 0) {
+        if (static_cast<int32_t>(now - _alertUntilMs) >= 0) {
+            _alertUntilMs   = 0;
+            _menuDirty      = true;
+            _mainDirty      = true;
+            _lastMainDrawMs = 0;
+            _lastMenuDrawMs = 0;
+        } else {
+            return;
+        }
+    }
+
     // 2. 20 mp tétlenség ellenőrzése: vissza a főképernyőre, félbehagyott szerkesztés eldobva
     if (_menuState != MENU_HOME) {
         if (now - _lastActivityMs >= MENU_TIMEOUT_MS) {
             _menuState      = MENU_HOME;
             _mainDirty      = true;
             _lastMainDrawMs = 0;
+            logEvent(LOG_INFO, "MENU_TIMEOUT", "Menu 20s inaktivitas timeout");
         }
     }
 
@@ -551,8 +731,8 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
         }
     }
 
-    // 5. Menü LCD frissítése 100ms-enként, ha változott (vagy lekérdező menüben 1mp-enként)
-    if (_menuState == MENU_FOKOK || _menuState == MENU_STATUS) {
+    // 5. Menü LCD frissítése 100ms-enként, ha változott (vagy lekérdező/napló menüben 1mp-enként)
+    if (_menuState == MENU_FOKOK || _menuState == MENU_STATUS || _menuState == MENU_LOGS) {
         if (now - _lastMainDrawMs >= LCD_MAIN_REFRESH_MS) {
             _lastMainDrawMs = now;
             _menuDirty      = true;
@@ -564,6 +744,8 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
         _menuDirty      = false;
         if (_menuState == MENU_EDIT) {
             drawEditValue(_editBlinkOn);
+        } else if (_menuState == MENU_LOGS) {
+            drawLogViewer();
         } else {
             drawMenu();
         }
@@ -666,6 +848,32 @@ void MenuController::drawEditValue(bool editBlinkPhase) {
     _lcd->printLines(item.name, line2);
 }
 
+void MenuController::drawLogViewer() {
+    if (!_lcd) return;
+
+    size_t total = logger.count();
+    uint8_t showCount = static_cast<uint8_t>(total < 5 ? total : 5);
+    if (showCount == 0) {
+        _lcd->printLines("NAPLO (URES)", "Nincs bejegyzes");
+        return;
+    }
+    if (_logCursor >= showCount) {
+        _logCursor = 0;
+    }
+
+    LogEntry entry{};
+    if (!logger.getNewest(_logCursor, entry)) {
+        _lcd->printLines("NAPLO (URES)", "Nincs bejegyzes");
+        return;
+    }
+
+    char line1[24];
+    char line2[24];
+    snprintf(line1, sizeof(line1), "%c %s", Logger::levelToShortChar(entry.level), entry.code);
+    snprintf(line2, sizeof(line2), "%.20s", entry.message);
+    _lcd->printLines(line1, line2);
+}
+
 // ============================================================================
 // ÉRTÉKEK FORMÁZÁSA KIJELZÉSHEZ
 // ============================================================================
@@ -734,6 +942,9 @@ void MenuController::formatMenuItemValue(const MenuItem& item, char* buf, size_t
                     } else {
                         snprintf(buf, bufLen, "NINCS KAPCSOLAT");
                     }
+                    break;
+                case STAT_SAFETY_TEMP:
+                    snprintf(buf, bufLen, "%.1fC (FIX)", SAFETY_OVERHEAT_TEMP);
                     break;
                 default:
                     snprintf(buf, bufLen, "-");

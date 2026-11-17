@@ -21,6 +21,12 @@ constexpr uint8_t PKT_TYPE_RESPONSE = 0xB2; // Slave  -> Master
 
 constexpr float SENSOR_DISCONNECTED_VAL = -127.0f;
 
+#ifndef SAFETY_OVERHEAT_TEMP_DEFINED
+#define SAFETY_OVERHEAT_TEMP_DEFINED
+// Fix hardveres/szoftveres szivattyú biztonsági küszöb (NEM állítható, NEM menthető, NEM megy át NRF-en)
+constexpr float SAFETY_OVERHEAT_TEMP = 95.0f;
+#endif
+
 constexpr uint8_t HEARTBEAT_DEFAULT_SEC = 5;
 constexpr uint8_t HEARTBEAT_MIN_SEC     = 5;
 constexpr uint8_t HEARTBEAT_MAX_SEC     = 30;
@@ -79,7 +85,7 @@ struct __attribute__((packed)) PumpConfigPacked {
 };
 
 struct __attribute__((packed)) AlarmConfigPacked {
-    float   overheatTemp;    // 70.0 - 90.0 °C (alap: 85.0)
+    float   alarmTemp;       // 70.0 - 90.0 °C (alap: 85.0) - csak riasztás
     uint8_t alarmEnabled;    // 0 = false (nincs villogás), 1 = true
 };
 

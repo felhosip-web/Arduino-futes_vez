@@ -20,6 +20,13 @@ constexpr const char* MQTT_CLIENT_ID = "esp32c3-futes-gateway";
 constexpr const char* TOPIC_CMD       = "futes/haz-futes/cmd";
 constexpr const char* TOPIC_STATUS    = "futes/haz-futes/status";    // retained=true
 constexpr const char* TOPIC_TELEMETRY = "futes/haz-futes/telemetry"; // 30 mp-enként
+constexpr const char* TOPIC_LOG       = "futes/haz-futes/log";       // ERROR események azonnal
+constexpr const char* TOPIC_LOGS      = "futes/haz-futes/logs";      // getLogs válasz
+
+// --- NTP időszinkron ---
+constexpr const char* NTP_SERVER_1    = "pool.ntp.org";
+constexpr const char* NTP_SERVER_2    = "time.nist.gov";
+constexpr const char* NTP_TZ_INFO     = "CET-1CEST,M3.5.0,M10.5.0/3";
 
 // --- PIN-ek (ESP32-C3, ütközésmentes kiosztás) ---
 constexpr uint8_t PIN_LM35      = 2;  // ADC1_CH2
@@ -77,11 +84,17 @@ constexpr float PUMP_STOP_TEMP_MIN      = 20.0f;
 constexpr float PUMP_STOP_TEMP_MAX      = 40.0f;
 constexpr float PUMP_MIN_HYSTERESIS_GAP = 5.0f;  // pumpStopTemp < pumpStartTemp - 5
 
-// --- Riasztás korlátok ---
+// --- Riasztás és fix szivattyú biztonsági küszöb ---
 constexpr float ALARM_OVERHEAT_TEMP_DEFAULT = 85.0f;
 constexpr float ALARM_OVERHEAT_TEMP_MIN     = 70.0f;
 constexpr float ALARM_OVERHEAT_TEMP_MAX     = 90.0f;
 constexpr bool  ALARM_ENABLED_DEFAULT       = true;
+
+#ifndef SAFETY_OVERHEAT_TEMP_DEFINED
+#define SAFETY_OVERHEAT_TEMP_DEFINED
+// Fix szivattyú biztonsági határ (NEM állítható, NEM mentődik NVS-be, NEM módosítható menüből/MQTT-ről)
+constexpr float SAFETY_OVERHEAT_TEMP        = 95.0f;
+#endif
 
 constexpr uint32_t PUMP_MANUAL_OFF_TIMEOUT_MS = 600000UL; // 10 perc -> vissza auto-ra
 constexpr uint32_t ALARM_BLINK_INTERVAL_MS    = 500UL;    // 500ms BE / 500ms KI
@@ -90,6 +103,10 @@ constexpr uint32_t ALARM_BLINK_INTERVAL_MS    = 500UL;    // 500ms BE / 500ms KI
 constexpr uint32_t NRF_RESPONSE_TIMEOUT_MS  = 500UL; // Max 500ms várakozás RESPONSE-ra
 constexpr uint8_t  NRF_MAX_ATTEMPTS         = 3;     // Max 3 próba egy ping ciklusban
 constexpr uint8_t  NRF_MAX_MISSED_CYCLES    = 3;     // 3 egymás utáni sikertelen ciklus -> nrf_fail
+
+// --- TLS biztonsági beállítások (kizárólag CA tanúsítvány-ellenőrzéssel) ---
+constexpr bool     TLS_REQUIRE_CA_CERT    = true;
+constexpr uint32_t TLS_CERT_RETRY_MS      = 30000UL; // Sikertelen TLS handshake után 30 mp múlva újrapróba
 
 constexpr uint32_t TELEMETRY_INTERVAL_MS  = 30000UL; // 30 mp-enként telemetry
 constexpr uint32_t LM35_READ_INTERVAL_MS  = 1000UL;  // 1 mp-enként szobahő mérés

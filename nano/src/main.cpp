@@ -132,22 +132,22 @@ void applyOutputs(uint8_t mask) {
 }
 
 void sanitizeAlarmConfig(AlarmConfigPacked& cfg) {
-    if (isnan(cfg.overheatTemp)) {
-        cfg.overheatTemp = ALARM_OVERHEAT_DEFAULT;
+    if (isnan(cfg.alarmTemp)) {
+        cfg.alarmTemp = ALARM_OVERHEAT_DEFAULT;
     }
-    if (cfg.overheatTemp < ALARM_OVERHEAT_MIN) cfg.overheatTemp = ALARM_OVERHEAT_MIN;
-    if (cfg.overheatTemp > ALARM_OVERHEAT_MAX) cfg.overheatTemp = ALARM_OVERHEAT_MAX;
+    if (cfg.alarmTemp < ALARM_OVERHEAT_MIN) cfg.alarmTemp = ALARM_OVERHEAT_MIN;
+    if (cfg.alarmTemp > ALARM_OVERHEAT_MAX) cfg.alarmTemp = ALARM_OVERHEAT_MAX;
     cfg.alarmEnabled = cfg.alarmEnabled ? 1 : 0;
 }
 
 void evaluateLocalSafetyAndAlarm() {
     bool kazanInvalid = isnan(latestKazan) || (latestKazan <= -120.0f) || (latestKazan > 125.0f);
-    bool overheat     = !kazanInvalid && (latestKazan >= currentAlarmConfig.overheatTemp);
+    bool alarmOverheat = !kazanInvalid && (latestKazan >= currentAlarmConfig.alarmTemp);
 
     if (currentAlarmConfig.alarmEnabled == 0) {
         currentAlarmState.active = 0;
         currentAlarmState.reason = ALARM_REASON_NONE;
-    } else if (overheat) {
+    } else if (alarmOverheat) {
         currentAlarmState.active = 1;
         currentAlarmState.reason = ALARM_REASON_OVERHEAT;
     } else if (kazanInvalid) {
@@ -163,8 +163,8 @@ void evaluateLocalSafetyAndAlarm() {
 }
 
 void refreshHardwareOutputs(uint32_t now) {
-    bool kazanInvalid = isnan(latestKazan) || (latestKazan <= -120.0f) || (latestKazan > 125.0f);
-    bool overheat     = !kazanInvalid && (latestKazan >= currentAlarmConfig.overheatTemp);
+    bool kazanInvalid   = isnan(latestKazan) || (latestKazan <= -120.0f) || (latestKazan > 125.0f);
+    bool safetyOverheat = !kazanInvalid && (latestKazan >= SAFETY_OVERHEAT_TEMP);
 
     uint8_t effectiveMask = 0;
     if (!hasEspRequest || failsafeActive) {
@@ -173,8 +173,9 @@ void refreshHardwareOutputs(uint32_t now) {
         effectiveMask = lastEspOutputsMask;
     }
 
-    // Biztonsági szabály: túlmelegedés vagy kazán szenzorhiba esetén szivattyú MINDIG BE
-    if (overheat || kazanInvalid) {
+    // Biztonsági szabály: CSAK a fix SAFETY_OVERHEAT_TEMP (95.0C) vagy kazán szenzorhiba (-127) kapcsolja BE a szivattyút
+    // SAFETY: alarmEnabled nem kapcsolja ki a pumpavédelmet
+    if (safetyOverheat || kazanInvalid) {
         setBit(effectiveMask, OUT_BIT_SZIVATTYU, true);
     }
 

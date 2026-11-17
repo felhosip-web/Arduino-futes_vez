@@ -1,8 +1,11 @@
 import mqtt from 'mqtt';
 import type { MqttClient } from 'mqtt';
 import type { Server as SocketIOServer } from 'socket.io';
+import { LogsStore, normalizeLogLevel } from './logsStore.ts';
+import type { LogLevel } from './logsStore.ts';
 import { VALID_HEARTBEAT_INTERVALS } from './types.ts';
 import type {
+  AlarmConfig,
   HeatingCommand,
   HeatingStatusPayload,
   HeatingUpdateEvent,
@@ -10,6 +13,7 @@ import type {
   PumpStartSensor,
   StoredDeviceState,
 } from './types.ts';
+import { SAFETY_OVERHEAT_TEMP } from './validation.ts';
 
 const VALID_PUMP_MODES: readonly PumpMode[] = ['auto', 'manual_on', 'manual_off'];
 const VALID_PUMP_SENSORS: readonly PumpStartSensor[] = ['kazan', 'eloremeno', 'max'];
@@ -28,17 +32,38 @@ function mergeDefined<T extends object>(
   return base ? { ...base, ...cleanPatch } : (cleanPatch as T);
 }
 
+function normalizeIncomingAlarmConfig(raw: unknown): Partial<AlarmConfig> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const ac = raw as Record<string, unknown>;
+  const out: Partial<AlarmConfig> = {};
+  if (typeof ac.alarmTemp === 'number' && Number.isFinite(ac.alarmTemp)) {
+    out.alarmTemp = ac.alarmTemp;
+  } else if (typeof ac.overheatTemp === 'number' && Number.isFinite(ac.overheatTemp)) {
+    out.alarmTemp = ac.overheatTemp;
+  }
+  if (typeof ac.alarmEnabled === 'boolean') {
+    out.alarmEnabled = ac.alarmEnabled;
+  }
+  return out;
+}
+
 export function mergeHeatingStatus(
   prevStatus: HeatingStatusPayload | null | undefined,
   parsed: HeatingStatusPayload
 ): HeatingStatusPayload {
+  const normalizedAlarm = normalizeIncomingAlarmConfig(parsed.alarmConfig) as AlarmConfig | undefined;
+
   if (!prevStatus) {
-    return parsed;
+    return {
+      ...parsed,
+      ...(normalizedAlarm ? { alarmConfig: normalizedAlarm } : {}),
+      safety: { safetyOverheatTemp: SAFETY_OVERHEAT_TEMP },
+    };
   }
 
   const cleanTop: Partial<HeatingStatusPayload> = {};
   for (const [key, value] of Object.entries(parsed)) {
-    if (value !== undefined) {
+    if (value !== undefined && key !== 'safety') {
       (cleanTop as Record<string, unknown>)[key] = value;
     }
   }
@@ -49,7 +74,8 @@ export function mergeHeatingStatus(
     homersekletek: mergeDefined(prevStatus.homersekletek, parsed.homersekletek)!,
     kimenetek: mergeDefined(prevStatus.kimenetek, parsed.kimenetek)!,
     pumpConfig: mergeDefined(prevStatus.pumpConfig, parsed.pumpConfig)!,
-    alarmConfig: mergeDefined(prevStatus.alarmConfig, parsed.alarmConfig)!,
+    alarmConfig: mergeDefined(prevStatus.alarmConfig, normalizedAlarm)!,
+    safety: { safetyOverheatTemp: SAFETY_OVERHEAT_TEMP },
     alarmState: mergeDefined(prevStatus.alarmState, parsed.alarmState)!,
     heartbeat: mergeDefined(prevStatus.heartbeat, parsed.heartbeat)!,
   };
@@ -86,14 +112,15 @@ export function isFullEspPayload(parsed: Partial<HeatingStatusPayload>): boolean
     return false;
   }
 
-  const ac = parsed.alarmConfig;
+  const ac = parsed.alarmConfig as (Partial<AlarmConfig> & { overheatTemp?: unknown }) | undefined;
   if (!ac || typeof ac !== 'object' || Array.isArray(ac)) {
     return false;
   }
 
+  const rawAlarmTemp = ac.alarmTemp ?? ac.overheatTemp;
   const alarmValid =
-    typeof ac.overheatTemp === 'number' &&
-    Number.isFinite(ac.overheatTemp) &&
+    typeof rawAlarmTemp === 'number' &&
+    Number.isFinite(rawAlarmTemp) &&
     typeof ac.alarmEnabled === 'boolean';
 
   if (!alarmValid) {
@@ -115,12 +142,23 @@ export function isFullEspPayload(parsed: Partial<HeatingStatusPayload>): boolean
 export class HeatingMqttBridge {
   private client: MqttClient | null = null;
   private readonly io: SocketIOServer;
+  private readonly logsStore: LogsStore;
   private readonly states = new Map<string, StoredDeviceState>();
   private readonly lastCommands = new Map<string, { command: HeatingCommand; sentAt: number }>();
+  private readonly onlineStates = new Map<string, boolean>();
   private connected = false;
 
-  constructor(io: SocketIOServer) {
+  constructor(io: SocketIOServer, logsStore: LogsStore = new LogsStore()) {
     this.io = io;
+    this.logsStore = logsStore;
+  }
+
+  public getLogsStore(): LogsStore {
+    return this.logsStore;
+  }
+
+  public logBackendEvent(level: LogLevel, code: string, message: string): void {
+    this.logsStore.add(level, code, message, 'backend');
   }
 
   public connect(): void {
@@ -152,13 +190,17 @@ export class HeatingMqttBridge {
     });
 
     this.client.on('connect', () => {
+      const wasConnected = this.connected;
       this.connected = true;
       console.log('[MQTT] Sikeresen csatlakozva a HiveMQ Cloud brokerhez.');
-      this.client?.subscribe(['futes/+/status', 'futes/+/telemetry'], { qos: 1 }, (err) => {
+      if (!wasConnected) {
+        this.logBackendEvent('INFO', 'MQTT_CONNECT', 'HiveMQ Cloud broker csatlakozva');
+      }
+      this.client?.subscribe(['futes/+/status', 'futes/+/telemetry', 'futes/+/log'], { qos: 1 }, (err) => {
         if (err) {
           console.error('[MQTT] Feliratkozási hiba:', err.message);
         } else {
-          console.log('[MQTT] Feliratkozva: futes/+/status, futes/+/telemetry');
+          console.log('[MQTT] Feliratkozva: futes/+/status, futes/+/telemetry, futes/+/log');
         }
       });
     });
@@ -168,11 +210,16 @@ export class HeatingMqttBridge {
     });
 
     this.client.on('close', () => {
+      const wasConnected = this.connected;
       this.connected = false;
+      if (wasConnected) {
+        this.logBackendEvent('WARN', 'MQTT_DISCONNECT', 'HiveMQ Cloud kapcsolat megszakadt');
+      }
     });
 
     this.client.on('error', (err) => {
       console.error('[MQTT] Hiba:', err.message);
+      this.logBackendEvent('ERROR', 'MQTT_DISCONNECT', `MQTT hiba: ${err.message}`);
     });
 
     this.client.on('message', (topic, payloadBuffer) => {
@@ -181,6 +228,12 @@ export class HeatingMqttBridge {
   }
 
   private handleIncomingMessage(topic: string, payloadBuffer: Buffer): void {
+    const logMatch = /^futes\/([^/]+)\/log$/.exec(topic);
+    if (logMatch) {
+      this.handleIncomingLogMessage(logMatch[1], payloadBuffer);
+      return;
+    }
+
     const match = /^futes\/([^/]+)\/(status|telemetry)$/.exec(topic);
     if (!match) return;
 
@@ -218,6 +271,17 @@ export class HeatingMqttBridge {
 
     this.states.set(deviceId, nextState);
 
+    if (messageType === 'status' && typeof parsed.online === 'boolean') {
+      const prevOnline = this.onlineStates.get(deviceId);
+      if (parsed.online && prevOnline !== true) {
+        this.logBackendEvent('INFO', 'ESP_ONLINE', `${deviceId} online`);
+      } else if (!parsed.online && prevOnline !== false) {
+        const reason = typeof parsed.error === 'string' && parsed.error ? parsed.error : 'offline';
+        this.logBackendEvent('WARN', 'ESP_OFFLINE', `${deviceId}: ${reason}`);
+      }
+      this.onlineStates.set(deviceId, parsed.online);
+    }
+
     const eventPayload: HeatingUpdateEvent = {
       id: deviceId,
       type: messageType,
@@ -228,6 +292,49 @@ export class HeatingMqttBridge {
     };
 
     this.io.emit('heating-update', eventPayload);
+  }
+
+  private handleIncomingLogMessage(deviceId: string, payloadBuffer: Buffer): void {
+    let parsed: Record<string, unknown>;
+    try {
+      const raw = JSON.parse(payloadBuffer.toString('utf8')) as unknown;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+      parsed = raw as Record<string, unknown>;
+    } catch {
+      console.warn(`[MQTT] Érvénytelen log JSON (futes/${deviceId}/log)`);
+      return;
+    }
+
+    const level = normalizeLogLevel(parsed.level);
+    if (level !== 'ERROR') {
+      return;
+    }
+
+    const code = typeof parsed.code === 'string' && parsed.code.trim() ? parsed.code.trim() : 'ESP_ERROR';
+    const message = typeof parsed.message === 'string' ? parsed.message : '';
+    const timestamp = typeof parsed.timestamp === 'string' ? parsed.timestamp : undefined;
+
+    this.logsStore.add('ERROR', code, message, 'esp', timestamp);
+  }
+
+  public publishAction(deviceId: string, actionPayload: Record<string, unknown>): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (!this.client || !this.connected) {
+        reject(new Error('Az MQTT kliens jelenleg nincs csatlakozva a HiveMQ Cloud brokerhez.'));
+        return;
+      }
+
+      const topic = `futes/${deviceId}/cmd`;
+      const payload = JSON.stringify(actionPayload);
+
+      this.client.publish(topic, payload, { qos: 1, retain: false }, (err) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve();
+      });
+    });
   }
 
   public publishCommand(deviceId: string, command: HeatingCommand): Promise<void> {

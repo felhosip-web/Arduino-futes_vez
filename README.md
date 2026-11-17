@@ -2,6 +2,16 @@
 
 Két egységes, **Master–Slave** felépítésű okos fűtésvezérlő és szilárdtüzelésű kazánvédelmi rendszer **Arduino Nano (kazán oldal)**, **ESP32-C3 (szoba oldal / I2C LCD + rotary encoder + WiFi/MQTT gateway)**, **Node.js/Express + Socket.IO backend** és **React frontend** komponensekkel, **HiveMQ Cloud TLS 8883** kapcsolaton keresztül.
 
+### Változásnapló
+
+| Dátum | Változás |
+| :--- | :--- |
+| V5.0 | V5 Master–Slave életjel + heartbeat protokoll (32 byte NRF csomag, `5–30s` ping, `3 * ping + 2 mp` Nano fail-safe) |
+| V5.1 | ESP32-C3 2×20 I2C LCD menürendszer (interrupt rotary encoder, `20s` timeout, NVS mentés, `0..5` állapot ikonok) |
+| V5.2 | WiFi beállító portál (`Futes-ESP32-Setup`, `192.168.4.1`) eszközönként egyedi WPA2 jelszóval és NVS tárolással |
+| V5.3 | Mentés és kommunikáció ellenőrzése (NVS `Preferences`, NRF `radio.write()`, MQTT `publish()` visszatérési értékek + hibajelzés) |
+| V5.4 | CA TLS ellenőrzés (`esp32/src/hivemq_ca.h`, `setCACert`) + Backend `127.0.0.1` bind + `HEATING_API_KEY` Bearer auth + szigorú `FRONTEND_ORIGIN` CORS |
+
 ---
 
 ## 1. Rendszer áttekintés
@@ -64,7 +74,7 @@ A 4 db **DS18B20** hőmérséklet-szenzor közös **OneWire** buszon van a **D2*
 
 | Komponens / Jel | ESP32-C3 GPIO | Irány / Típus | Megjegyzés |
 | :--- | :--- | :--- | :--- |
-| **LM35 szobai hőfok** | `GPIO 2` | Analóg bemenet (ADC) | 10 mérés átlaga, `LM35_OFFSET` kalibráció a `esp32/src/config.h`-ban |
+| **LM35 szobai hőfok** | `GPIO 2` | Analóg bemenet (ADC, 12 bit, `ADC_11db`, 3300 mV) | LM35 **10 mV / °C**, 10 mérés átlaga: `avgMv = (adcRaw / 4095.0) * 3300.0`, `tempC = mV / 10 + OFFSET` (`LM35_OFFSET` a `esp32/src/config.h`-ban; `-10..60 °C` tartományon kívül `LM35_OUT_OF_RANGE` hiba) |
 | **Rotary Encoder CLK** | `GPIO 5` | Bemenet (`INPUT_PULLUP`) | Interrupt-vezérelt Gray-kód olvasás |
 | **Rotary Encoder DT** | `GPIO 6` | Bemenet (`INPUT_PULLUP`) | Interrupt-vezérelt Gray-kód olvasás |
 | **Rotary Encoder SW** | `GPIO 7` | Bemenet (`INPUT_PULLUP`) | Nyomógomb (LOW-ra húz), szoftveres debounce |
@@ -128,7 +138,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
     "pumpStartSensor": "kazan"
   },
   "alarmConfig": {
-    "overheatTemp": 85.0,
+    "alarmTemp": 85.0,
     "alarmEnabled": true
   },
   "heartbeat": {
@@ -171,8 +181,11 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
   },
   "pumpState": "futes",
   "alarmConfig": {
-    "overheatTemp": 85.0,
+    "alarmTemp": 85.0,
     "alarmEnabled": true
+  },
+  "safety": {
+    "safetyOverheatTemp": 95.0
   },
   "alarmState": {
     "active": false,
@@ -207,7 +220,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 
 ### Biztonsági felülírások (MINDENT felülírnak, még a `manual_off`-ot is!)
 
-1. **Túlmelegedés (`kazan >= overheatTemp`)**: a szivattyú kényszerítve **BEkapcsol**.
+1. **Túlmelegedés (`kazan >= 95.0 °C`, fix `SAFETY_OVERHEAT_TEMP`)**: a szivattyú kényszerítve **BEkapcsol**. A szivattyú védelem **SOHA nem a felhasználói `alarmTemp` értéket**, hanem kizárólag a nem állítható `95.0 °C`-os biztonsági határt használja (akkor is aktív marad, ha `alarmEnabled == false`).
 2. **Kazán szenzor hiba (`kazan == -127` / érvénytelen)**: a szivattyú kényszerítve **BEkapcsol**.
 3. **NRF24 rádiós szakadás**: az Arduino Nano fail-safe módba lép és **BEkapcsolja** a szivattyút.
 
@@ -215,17 +228,19 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 
 ## 5. Riasztás
 
-- **`alarmConfig`**:
-  - `overheatTemp`: `70.0 – 90.0 °C` (alapérték: **`85.0 °C`**)
+- **`alarmConfig`** (felhasználói riasztási küszöb — nem vezérli a szivattyút):
+  - `alarmTemp`: `70.0 – 90.0 °C` (alapérték: **`85.0 °C`**)
   - `alarmEnabled`: `true` / `false` (alapérték: **`true`**)
+- **`safety`** (csak olvasható, nem állítható, nem mentődik NVS-be):
+  - `safetyOverheatTemp`: **`95.0 °C`** (`SAFETY_OVERHEAT_TEMP` fix konstans mindkét mikrokontrolleren)
 - **`alarmState.reason`**:
   - `"none"` – nincs riasztás
-  - `"overheat"` – a kazán elérte vagy meghaladta az `overheatTemp` értéket
+  - `"overheat"` – a kazán elérte vagy meghaladta az `alarmTemp` értéket
   - `"sensor_fail"` – a kazán DS18B20 szenzor nem olvasható (`-127 °C`)
   - `"nrf_fail"` – az ESP32 és Nano közötti rádiós kapcsolat megszakadt
 - **LED jelzés**:
   - Ha `alarmState.active == true` **ÉS** `alarmEnabled == true`, akkor **MINDKÉT piros LED** (Nano `D6` és ESP32 `GPIO 11`) szinkron nélkül, nem-blokkoló `millis()` időzítéssel villog **`500 ms BE / 500 ms KI`** ütemben (`delay()` használata nélkül).
-  - Ha `alarmEnabled == false`, akkor **nincs piros LED villogás** és az LCD sem villogtat riasztási sort, **DE a szivattyú biztonsági védelme túlmelegedés vagy szenzorhiba esetén továbbra is kényszerítve BE marad!**
+  - Ha `alarmEnabled == false`, akkor **nincs piros LED villogás** és az LCD sem villogtat riasztási sort, **DE a szivattyú `95.0 °C`-os (`SAFETY_OVERHEAT_TEMP`) és szenzorhibás (`-127`) biztonsági védelme továbbra is kényszerítve BE marad!**
 - **LCD jelzés**:
   - Aktív és engedélyezett riasztás esetén a főképernyő 2. sora 500 ms-enként váltakozik a normál `Sz:20.8C C:21.5C` sor és a riasztási üzenet között (pl. `RIASZTAS! Kaz 87C`, `RIASZTAS! SZENZOR!`, `RIASZTAS! NRF HIBA!`, vagy angol megfelelője `ALARM! Kaz 87C`).
 
@@ -241,7 +256,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
   - A Slave ugyanazzal a `seq` számmal válaszol `RESPONSE (0xB2)` csomagban.
   - Ha az újrapróbálkozás miatt ugyanaz a `seq` érkezik meg még egyszer a Slave-hez, a Nano **nem hajtja végre újra** a parancsot, hanem a tárolt választ küldi vissza.
 - **Időtúrák és fail-safe**:
-  - **Master oldalon**: válaszonként max. **`500 ms`** várakozás, kérésenként legfeljebb **`3` próba**. Ha **`3` egymást követő ping ciklus** sikertelen, a Master `nrf24_ok = false` és `alarmState.reason = "nrf_fail"` állapotba vált.
+  - **Master oldalon**: válaszonként max. **`500 ms`** várakozás, kérésenként legfeljebb **`3` próba**. Ha **`3` egymást követő ping ciklus** sikertelen, a Master `nrf24_ok = false` és `alarmState.reason = "nrf_fail"` állapotba vált. Ha egy kérésnél mindhárom `radio.write()` hívás `false` értékkel tér vissza, az ESP32 azonnal `nrf24_ok = false` és `alarmState.reason = "nrf_fail"` állapotba kapcsol, az LCD-n megjelenik a **`"NRF HIBA!"`** üzenet, és a soros porton naplózza a hibát (`NRF WRITE FAILED seq=<seq>`).
   - **Slave oldalon (Nano fail-safe)**: ha `(millis() - utolsó kérés ideje) > (3 * heartbeatIntervalSec * 1000 + 2000)`, akkor a Nano fail-safe módba lép: **szivattyú BE**, **piros LED villog**, `alarmState.reason = "nrf_fail"`.
 - **DS18B20 mérés**: A Nano **10 másodpercenként** mér nem-blokkoló módon (`TEMP_READ_INTERVAL_MS = 10000`), nem minden egyes rádió pingnél, így mindig azonnal (<200 ms-on belül) tud válaszolni a Master kérésére.
 
@@ -269,7 +284,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 
 - **`E`** = Előremenő vízhőfok (`eloremeno`)
 - **`K`** = Kültéri hőfok (`kulteri`)
-- **`Sz`** = Szobai hőmérséklet az LM35 szenzorról (`currentTemp`)
+- **`Sz`** = Szobai hőmérséklet az LM35 szenzorról (`currentTemp`, **10 mV / °C**, `tempC = mV / 10 + OFFSET`, érvényes tartomány: `-10..60 °C`)
 - **`C`** = Célhőmérséklet (`targetTemp`)
 - Ha nincs érvényes rádiókapcsolat (`nrf24_ok == false`), az előremenő és kültéri helyén **`E: --.- K: --.-`** jelenik meg.
 
@@ -309,6 +324,8 @@ FŐKÉPERNYŐ
       │    ├── Pumpa Allapot
       │    ├── Riasztas
       │    ├── Radio
+      │    ├── Bizt. Hatar        (95.0C (FIX), csak olvasható)
+      │    ├── NAPLO
       │    └── VISSZA
       ├── BEALLITAS
       │    ├── Celhofok           (16.0 - 26.0 °C, lépés: 0.5 °C)
@@ -345,9 +362,19 @@ FŐKÉPERNYŐ
 - **Boot-kor** automatikusan visszatölti a mentett értékeket; első indításkor az alapértékek lépnek életbe:
   - `targetTemp`: **`21.5 °C`**
   - `pumpStartTemp`: **`40.0 °C`**, `pumpStopTemp`: **`30.0 °C`**
-  - `overheatTemp`: **`85.0 °C`**
+  - `alarmTemp`: **`85.0 °C`** *(a fix `95.0 °C`-os `SAFETY_OVERHEAT_TEMP` nem mentődik NVS-be)*
   - `heartbeatIntervalSec`: **`5 mp`**
 - **A szivattyú kimeneti bitet (`OUT_BIT_SZIVATTYU`) NEM menti el** a `Preferences`, azt minden indítás után és működés közben a kazánvédelem állapotgépe számolja újra.
+
+### 7.6 Mentés ellenőrzés és hibajelzés
+
+Az ESP32-C3 firmware a `saveSetting(...)` egységes NVS-kezelőn keresztül minden írási és kommunikációs művelet visszatérési értékét ellenőrzi, hogy ne maradjon észrevétlen adatvesztés:
+
+- **`Preferences` megnyitás ellenőrzése (`begin`)**: minden `prefs.begin("futes", false)` hívás visszatérési értéke ellenőrzött. Ha `false`, a soros porton **`NVS BEGIN FAILED`** jelenik meg, az LCD-n pedig **2 másodpercig** a **`"NVS HIBA!"`** üzenet látható.
+- **`Preferences` írás ellenőrzése (`putFloat` / `putUInt` / `putBool` / `putString`)**: ha bármely `put*` művelet `0`-val tér vissza, a soros porton **`NVS WRITE FAILED key=<kulcsnév>`** jelenik meg, az LCD-n pedig **2 másodpercig** a **`"MENTES HIBA!"`** üzenet.
+- **Visszagörgetés és egyszeri újrapróbálkozás**: sikertelen NVS íráskor az ESP32 **nem jelöli elmentettnek** a módosítást, megtartja a régi értéket a RAM-ban, a következő `loop()` ciklusban **egyszer automatikusan újrapróbálja** az írást, és **csak akkor** hívja meg az `onMenuSettingCommitted()`-et (valamint küld MQTT `STATUS`-t), ha minden `put*` művelet sikeres volt.
+- **MQTT `publish()` ellenőrzés**: ha a `mqtt.publish()` `false` értékkel tér vissza, a soros porton **`MQTT PUBLISH FAILED topic=<topic>`** jelenik meg, a firmware pedig megjegyzi a függőben lévő státuszt, és a következő `STATUS` (heartbeat) ciklusban újraküldi, nem dobja el csendben.
+- **Miért fontos ez?**: ha írás közben megtelik az NVS partíció vagy áramszünet / flash-hiba lép fel, a felhasználó azonnal látja az LCD-n és a soros porton, hogy a `22.0 °C` nem íródott tartós memóriába (így elkerülhető a látszólagos mentés utáni váratlan visszaállás `21.5 °C`-ra).
 
 ---
 
@@ -368,9 +395,18 @@ FŐKÉPERNYŐ
 
 A beállító hozzáférési pont eszközönként egyedi WPA2 jelszót használ, amelyet a soros monitor ír ki; ezt kezeld bizalmasan. A beállítás közben az ESP32 fűtésvezérlő főciklusa tovább fut.
 
+### 8.1 TLS CA ellenőrzés
+
+- Az ESP32-C3 firmware **SOHA nem használ `setInsecure()` módot** (sem alapértelmezettként, sem hiba esetén tartalékként); a TLS 8883-as kapcsolathoz minden esetben szigorú CA tanúsítvány-ellenőrzés (`WiFiClientSecure.setCACert(HIVEMQ_CA_CERT)`) történik.
+- A HiveMQ Cloud gyökér CA tanúsítványa (Let's Encrypt **ISRG Root X1**) az `esp32/src/hivemq_ca.h` fájlban, `PROGMEM`-ben (`HIVEMQ_CA_CERT`) van tárolva.
+- Ha a CA tanúsítvány hiányzik, hibás vagy lejárt, és a TLS handshake meghiúsul, az ESP32 **nem csatlakozik** az MQTT brokerhez, a soros portra kiírja a **`TLS CERT FAILED`** üzenetet, az LCD-n **2 másodpercre** megjeleníti a **`"TLS HIBA!"`** nem-blokkoló bannert (a felső sor állapotikonjainak megtartásával), majd **30 másodperc múlva** próbálja újra.
+- **Tanúsítvány frissítése / beillesztése**: nyisd meg a **`HiveMQ Console -> Cluster -> Details`** oldalt, töltsd le a CA tanúsítványt (PEM), másold be a `-----BEGIN CERTIFICATE-----` ... `-----END CERTIFICATE-----` blokkot az `esp32/src/hivemq_ca.h` fájlba a `TODO` helyére, majd töltsd fel újra a firmware-t.
+
 ---
 
 ## 9. Startup sorrend (Indítás)
+
+> **Biztonsági ajánlás külső eléréshez:** A backend alapértelmezetten csak a **`127.0.0.1`** (`localhost only`) címen figyel. Ha külső hálózatról is el szeretnéd érni a felületet, **NE használj router port-forwardot** — használj inkább VPN-t (**Tailscale** / **WireGuard**) vagy TLS-sel védett fordított proxyt, és **MINDIG állíts be erős `HEATING_API_KEY` értéket** az `.env` fájlban! (`HOST=0.0.0.0` esetén `HEATING_API_KEY` nélkül a szerver el sem indul.)
 
 Indítsd el a rendszert pontosan ebben a sorrendben:
 
@@ -484,5 +520,12 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
 | **Szivattyú nem kapcsol a `KIMENETEK` menüben/kártyán** | `pumpMode` `AUTO` módban van, így a kézi kapcsolás szándékosan zárolva van | Állítsd a **Szivattyú Módot** `manual_on`-ra (`BEALLITAS -> Szivattyu Mod`), vagy várd meg a `40.0 °C`-ot. |
 | **Frontend `409 Conflict` hibát dob** | Még nem érkezett első ESP32 `STATUS` üzenet a backendhez | Indítsd el az ESP32-t, ellenőrizd a WiFi/MQTT kapcsolatot, és várd meg az első retained `STATUS` csomagot. |
 | **Frontend `400 Bad Request` (`heartbeat: 12`)** | A ping intervallum csak `5, 10, 15, 20, 25, 30` másodperc lehet | Válassz a frontend 6 előre definiált gombja vagy az ESP32 `Ping` menüpontja közül. |
-| **Riasztás nem villog, pedig 90 °C a kazán** | `alarmEnabled == false` (riasztás kikapcsolva) | Kapcsold **BE** a Riasztást a frontend **Túlmelegedés riasztás** kártyáján vagy az ESP32 menüben (`BEALLITAS -> Riasztas`). *(A szivattyú ettől függetlenül kényszerítve BE marad!)* |
+| **Riasztás nem villog, pedig 90 °C a kazán** | `alarmEnabled == false` (riasztás kikapcsolva) | Kapcsold **BE** a Riasztást a frontend **Túlmelegedés riasztás** kártyáján vagy az ESP32 menüben (`BEALLITAS -> Riasztas`). *(A szivattyú `95.0 °C` felett és szenzorhiba esetén ettől függetlenül kényszerítve BE marad!)* |
+| **Riasztást 90-re állítottam, de a szivattyú már 85-nél bekapcsolt** | Ez nem hiba, a riasztás és a biztonság szét van választva | Ellenőrizd, hogy a szivattyú a 95°C-os biztonsági határnál kapcsol-e be, nem a riasztásnál. |
 | **Áramkimaradás után visszaáll `21.5 °C`-ra** | A `Preferences` NVS nem mentette el a módosítást | Ellenőrizd, hogy szerkesztés után megvolt-e a **rövid nyomás (jóváhagyás)** — ne csak tekerd az értéket, mert 20 mp után vagy hosszú nyomásra eldobódik. |
+| **`"MENTES HIBA!"` az LCD-n** | A `Preferences.put*()` `0` értékkel tért vissza (pl. megtelt NVS partíció vagy flash írási hiba) | Nézd meg a Serial Monitort (`NVS WRITE FAILED key=<kulcsnév>`). A firmware megőrzi a régi értéket és 1× újrapróbálja; tartós hiba esetén futtass 3 mp-es gyári visszaállítást vagy `pio run -d esp32 -t erase` törlést. |
+| **`"NVS HIBA!"` az LCD-n** | A `Preferences.begin("futes", false)` `false`-szal tért vissza (sérült/nem inicializált NVS névtér) | Ellenőrizd a Serial Monitorban az `NVS BEGIN FAILED` naplót, és indítsd újra az ESP32-t; ha ismétlődik, töröld és töltsd újra a flash NVS partíciót. |
+| **Frontend nem frissül, pedig LCD-n elmentve látszik** | Az `mqtt.publish()` sikertelen volt (WiFi/TLS megszakadt vagy `MQTT PUBLISH FAILED`) | Ellenőrizd az LCD jobb felső WiFi/MQTT ikonját (4-es ívek) és a Serial Monitort (`MQTT PUBLISH FAILED topic=...`); a következő `STATUS` ciklusban az ESP32 automatikusan újraküldi. |
+| **LCD-n `"TLS HIBA!"`** | A CA tanúsítvány nem stimmel, hiányzik a `TODO` helyéről vagy lejárt | Töltsd le újra a HiveMQ CA-t (`HiveMQ Console -> Cluster -> Details`) és írd be a `esp32/src/hivemq_ca.h`-ba; **ne** kapcsold vissza a `setInsecure()` módot! |
+| **POST `401 Unauthorized`** | Hiányzik vagy hibás az `Authorization: Bearer <HEATING_API_KEY>` fejléc | Ellenőrizd az `.env` fájl `HEATING_API_KEY` értékét és a kérés `Authorization` fejlécét. |
+| **Szerver nem indul: `"HEATING_API_KEY kötelező"`** | `HOST=0.0.0.0` van beállítva, de nincs megadva `HEATING_API_KEY` | Állíts be erős `HEATING_API_KEY` kulcsot az `.env`-ben, vagy tedd vissza `HOST=127.0.0.1`-re. |

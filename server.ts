@@ -11,14 +11,40 @@ import { createHeatingRouter } from './server/heatingRoutes.ts';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = Number(process.env.PORT || 3000);
-const CORS_ORIGINS = (process.env.CORS_ORIGIN || 'http://localhost:5173')
+const NGINX_PORT = process.env.NGINX_PORT?.trim();
+const DEFAULT_PORT = Number(process.env.DEFAULT_APP_PORT || 3000);
+const RAW_PORT = process.env.PORT?.trim();
+const PARSED_PORT = RAW_PORT ? Number(RAW_PORT) : NaN;
+const PORT =
+  RAW_PORT && RAW_PORT !== NGINX_PORT && Number.isFinite(PARSED_PORT) && PARSED_PORT > 0
+    ? PARSED_PORT
+    : DEFAULT_PORT;
+const HOST = process.env.HOST?.trim() || '127.0.0.1';
+const HEATING_API_KEY = process.env.HEATING_API_KEY?.trim() || '';
+const IS_LOCALHOST = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1';
+
+if (HOST === '0.0.0.0' && !HEATING_API_KEY) {
+  console.error('HEATING_API_KEY kötelező, ha HOST=0.0.0.0');
+  process.exit(1);
+}
+
+if (!IS_LOCALHOST && !HEATING_API_KEY) {
+  console.error('HEATING_API_KEY kötelező, ha HOST=0.0.0.0');
+  process.exit(1);
+}
+
+if (!HEATING_API_KEY && IS_LOCALHOST) {
+  console.warn('FIGYELEM: HEATING_API_KEY nincs beállítva, csak localhost');
+}
+
+const rawFrontendOrigins = process.env.FRONTEND_ORIGIN || 'http://localhost:3000';
+const FRONTEND_ORIGINS = rawFrontendOrigins
   .split(',')
   .map((o) => o.trim())
-  .filter(Boolean);
+  .filter((o) => Boolean(o) && o !== '*');
 
-if (process.env.APP_URL && !CORS_ORIGINS.includes(process.env.APP_URL)) {
-  CORS_ORIGINS.push(process.env.APP_URL);
+if (FRONTEND_ORIGINS.length === 0) {
+  FRONTEND_ORIGINS.push('http://localhost:3000');
 }
 
 async function startServer(): Promise<void> {
@@ -27,8 +53,9 @@ async function startServer(): Promise<void> {
 
   app.use(
     cors({
-      origin: CORS_ORIGINS,
-      methods: ['GET', 'POST', 'OPTIONS'],
+      origin: FRONTEND_ORIGINS,
+      methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
       credentials: true,
     })
   );
@@ -36,8 +63,9 @@ async function startServer(): Promise<void> {
 
   const io = new SocketIOServer(httpServer, {
     cors: {
-      origin: CORS_ORIGINS,
+      origin: FRONTEND_ORIGINS,
       methods: ['GET', 'POST'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
       credentials: true,
     },
   });
@@ -68,7 +96,13 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.use('/api/heating', createHeatingRouter(mqttBridge));
+  app.use(
+    '/api/heating',
+    createHeatingRouter(mqttBridge, {
+      host: HOST,
+      apiKey: HEATING_API_KEY,
+    })
+  );
 
   // Fejlesztői környezetben Vite middleware, élesben statikus dist kiszolgálás
   if (process.env.NODE_ENV !== 'production') {
@@ -86,8 +120,15 @@ async function startServer(): Promise<void> {
     });
   }
 
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`[SERVER] Express + Socket.IO fut a http://0.0.0.0:${PORT} címen`);
+  httpServer.listen(PORT, HOST, () => {
+    mqttBridge.logBackendEvent('INFO', 'SERVER_START', `Listening on ${HOST}:${PORT}`);
+    if (HOST === '0.0.0.0') {
+      console.warn(
+        `FIGYELEM: Listening on 0.0.0.0:${PORT} - külső hálózatról is elérhető, auth kötelező!`
+      );
+    } else {
+      console.log(`Listening on ${HOST}:${PORT} (localhost only)`);
+    }
   });
 
   const shutdown = () => {

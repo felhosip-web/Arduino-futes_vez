@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { io } from 'socket.io-client';
-import { AlertTriangle, RefreshCw, Wifi, WifiOff } from 'lucide-react';
+import { AlertTriangle, LayoutDashboard, RefreshCw, ScrollText, Wifi, WifiOff } from 'lucide-react';
 import { API_URL, DEVICE_ID } from './config';
 import {
   DEFAULT_ALARM_CONFIG,
@@ -8,6 +8,7 @@ import {
   DEFAULT_HEARTBEAT_CONFIG,
   DEFAULT_OUTPUTS,
   DEFAULT_PUMP_CONFIG,
+  DEFAULT_SAFETY_CONFIG,
   type AlarmConfig,
   type HeartbeatConfig,
   type HeatingCommandPayload,
@@ -25,6 +26,9 @@ import { AlarmControl } from './components/AlarmControl';
 import { HeartbeatControl } from './components/HeartbeatControl';
 import { BoilerControl } from './components/BoilerControl';
 import { BoilerStatus } from './components/BoilerStatus';
+import { LogsView } from './components/LogsView';
+
+type ActiveView = 'dashboard' | 'logs';
 
 function isUsableStatus(
   candidate: Partial<HeatingStatusPayload> | null | undefined
@@ -49,6 +53,8 @@ function formatTimestamp(ms: number | null): string {
 }
 
 export default function App() {
+  const [activeView, setActiveView] = useState<ActiveView>('dashboard');
+  const [logsRefreshSignal, setLogsRefreshSignal] = useState<number>(0);
   const [status, setStatus] = useState<HeatingStatusPayload | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null);
   const [socketConnected, setSocketConnected] = useState<boolean>(false);
@@ -70,6 +76,7 @@ export default function App() {
         pumpConfig: candidate.pumpConfig ?? DEFAULT_PUMP_CONFIG,
         pumpState: candidate.pumpState ?? (candidate.kimenetek.szivattyu ? 'futes' : 'varakozas'),
         alarmConfig: candidate.alarmConfig ?? DEFAULT_ALARM_CONFIG,
+        safety: candidate.safety ?? DEFAULT_SAFETY_CONFIG,
         alarmState: candidate.alarmState ?? DEFAULT_ALARM_STATE,
         heartbeat: candidate.heartbeat ?? DEFAULT_HEARTBEAT_CONFIG,
       });
@@ -321,7 +328,12 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => void fetchInitialState()}
+              onClick={() => {
+                void fetchInitialState();
+                if (activeView === 'logs') {
+                  setLogsRefreshSignal((prev) => prev + 1);
+                }
+              }}
               disabled={isRefreshing}
               className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-sm font-medium text-slate-200 whitespace-nowrap shrink-0 transition-colors hover:bg-slate-800 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
             >
@@ -333,6 +345,45 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {/* Nézet választó */}
+        <nav aria-label="Nézetek" className="mt-4 flex items-center justify-between gap-4">
+          <div
+            role="tablist"
+            aria-label="Fő nézetek"
+            className="inline-flex items-center gap-1 rounded-lg border border-slate-800 bg-slate-900 p-1"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeView === 'dashboard'}
+              onClick={() => setActiveView('dashboard')}
+              className={`inline-flex min-h-[44px] items-center gap-2 rounded-md px-4 py-2 text-sm font-semibold whitespace-nowrap shrink-0 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
+                activeView === 'dashboard'
+                  ? 'bg-orange-500 text-slate-950'
+                  : 'text-slate-300 hover:bg-slate-800 hover:text-slate-100'
+              }`}
+            >
+              <LayoutDashboard className="h-4 w-4" aria-hidden="true" />
+              <span>Vezérlőpult</span>
+            </button>
+
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeView === 'logs'}
+              onClick={() => setActiveView('logs')}
+              className={`inline-flex min-h-[44px] items-center gap-2 rounded-md px-4 py-2 text-sm font-semibold whitespace-nowrap shrink-0 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
+                activeView === 'logs'
+                  ? 'bg-orange-500 text-slate-950'
+                  : 'text-slate-300 hover:bg-slate-800 hover:text-slate-100'
+              }`}
+            >
+              <ScrollText className="h-4 w-4" aria-hidden="true" />
+              <span>Napló</span>
+            </button>
+          </div>
+        </nav>
 
         {/* Hibák és figyelmeztetések */}
         {errorMsg && (
@@ -366,7 +417,11 @@ export default function App() {
         )}
 
         {/* Tartalom */}
-        {loadingInitial ? (
+        {activeView === 'logs' ? (
+          <main className="mt-6">
+            <LogsView refreshSignal={logsRefreshSignal} />
+          </main>
+        ) : loadingInitial ? (
           <div className="mt-6 rounded-xl border border-slate-800 bg-slate-900 p-8 text-center text-sm text-slate-400">
             Állapot betöltése...
           </div>
@@ -398,7 +453,7 @@ export default function App() {
             <PumpControl
               pumpConfig={status.pumpConfig ?? DEFAULT_PUMP_CONFIG}
               pumpState={status.pumpState ?? 'varakozas'}
-              alarmConfig={status.alarmConfig ?? DEFAULT_ALARM_CONFIG}
+              safety={status.safety ?? DEFAULT_SAFETY_CONFIG}
               kazanTemp={status.homersekletek?.kazan ?? null}
               sending={sendingPump}
               onSendPumpConfig={handleSendPumpConfig}
@@ -407,6 +462,7 @@ export default function App() {
             <AlarmControl
               alarmConfig={status.alarmConfig ?? DEFAULT_ALARM_CONFIG}
               alarmState={status.alarmState ?? DEFAULT_ALARM_STATE}
+              safety={status.safety ?? DEFAULT_SAFETY_CONFIG}
               kazanTemp={status.homersekletek?.kazan ?? null}
               sending={sendingAlarm}
               onSendAlarmConfig={handleSendAlarmConfig}

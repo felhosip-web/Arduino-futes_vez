@@ -1,4 +1,7 @@
-import { Router } from 'express';
+import { timingSafeEqual } from 'node:crypto';
+import { Router, type NextFunction, type Request, type Response } from 'express';
+import { normalizeLogLevel } from './logsStore.ts';
+import type { LogLevel } from './logsStore.ts';
 import type { HeatingMqttBridge } from './mqttBridge.ts';
 import {
   buildAlarmUpdateCommand,
@@ -9,6 +12,11 @@ import {
   validateHeatingCommand,
   validateSingleOutputBody,
 } from './validation.ts';
+
+export interface HeatingRouterOptions {
+  host?: string;
+  apiKey?: string;
+}
 
 const deviceLocks = new Map<string, Promise<void>>();
 
@@ -32,19 +40,139 @@ async function withDeviceLock<T>(deviceId: string, fn: () => Promise<T>): Promis
   }
 }
 
-export function createHeatingRouter(bridge: HeatingMqttBridge): Router {
+function isValidBearerToken(authHeader: string | undefined, expectedKey: string): boolean {
+  if (!authHeader || !expectedKey) return false;
+  const match = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
+  if (!match) return false;
+  const providedBuf = Buffer.from(match[1].trim(), 'utf8');
+  const expectedBuf = Buffer.from(expectedKey, 'utf8');
+  if (providedBuf.length !== expectedBuf.length) return false;
+  return timingSafeEqual(providedBuf, expectedBuf);
+}
+
+function getClientIp(req: Request): string {
+  return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+export function createHeatingRouter(
+  bridge: HeatingMqttBridge,
+  options: HeatingRouterOptions = {}
+): Router {
   const router = Router();
+  const host = (options.host ?? process.env.HOST ?? '127.0.0.1').trim() || '127.0.0.1';
+  const apiKey = (options.apiKey ?? process.env.HEATING_API_KEY ?? '').trim();
+  const isLocalhost = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+
+  const requireBearerAuth = (req: Request, res: Response, next: NextFunction): void => {
+    if (!apiKey && isLocalhost) {
+      next();
+      return;
+    }
+    if (!isValidBearerToken(req.headers.authorization, apiKey)) {
+      bridge.logBackendEvent(
+        'WARN',
+        'API_401',
+        `Unauthorized ${req.method} ${req.originalUrl} IP=${getClientIp(req)}`
+      );
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    next();
+  };
+
+  const requireGetAuth = (req: Request, res: Response, next: NextFunction): void => {
+    if (isLocalhost) {
+      next();
+      return;
+    }
+    if (!isValidBearerToken(req.headers.authorization, apiKey)) {
+      bridge.logBackendEvent(
+        'WARN',
+        'API_401',
+        `Unauthorized ${req.method} ${req.originalUrl} IP=${getClientIp(req)}`
+      );
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    next();
+  };
+
+  // Minden POST /api/heating/:id/* végpont védelme Bearer tokennel
+  router.post('/:id/*', requireBearerAuth);
+
+  // GET /api/heating/:id/logs/export - szöveges (.txt) napló letöltés (Bearer auth-os)
+  router.get('/:id/logs/export', requireBearerAuth, (req, res) => {
+    const { id } = req.params;
+    const rawLevel = typeof req.query.level === 'string' ? req.query.level.trim() : '';
+    let levelFilter: LogLevel | undefined;
+    if (rawLevel.length > 0) {
+      const parsedLevel = normalizeLogLevel(rawLevel);
+      if (!parsedLevel) {
+        res.status(400).json({ error: 'Érvénytelen level szűrő. Engedélyezett: INFO, WARN, ERROR.' });
+        return;
+      }
+      levelFilter = parsedLevel;
+    }
+
+    const safeId = id.replace(/[^a-zA-Z0-9_-]/g, '_') || 'device';
+    const text = bridge.getLogsStore().exportText(levelFilter);
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="heating-logs-${safeId}.txt"`);
+    res.send(text);
+  });
+
+  // GET /api/heating/:id/logs?page=1&limit=20&level=ERROR (Bearer auth-os)
+  router.get('/:id/logs', requireBearerAuth, (req, res) => {
+    const pageRaw = typeof req.query.page === 'string' ? Number(req.query.page) : 1;
+    const limitRaw = typeof req.query.limit === 'string' ? Number(req.query.limit) : 20;
+    const rawLevel = typeof req.query.level === 'string' ? req.query.level.trim() : '';
+
+    let levelFilter: LogLevel | undefined;
+    if (rawLevel.length > 0) {
+      const parsedLevel = normalizeLogLevel(rawLevel);
+      if (!parsedLevel) {
+        res.status(400).json({ error: 'Érvénytelen level szűrő. Engedélyezett: INFO, WARN, ERROR.' });
+        return;
+      }
+      levelFilter = parsedLevel;
+    }
+
+    const result = bridge.getLogsStore().query({
+      page: Number.isFinite(pageRaw) ? pageRaw : 1,
+      limit: Number.isFinite(limitRaw) ? limitRaw : 20,
+      level: levelFilter,
+    });
+
+    res.json(result);
+  });
+
+  // DELETE /api/heating/:id/logs - backend + ESP naplópuffer kiürítése (Bearer auth-os)
+  router.delete('/:id/logs', requireBearerAuth, async (req, res) => {
+    const { id } = req.params;
+    const deleted = bridge.getLogsStore().clear();
+
+    if (bridge.isConnected()) {
+      try {
+        await bridge.publishAction(id, { action: 'clearLogs' });
+      } catch (err) {
+        console.warn('[MQTT] ESP clearLogs parancs küldése sikertelen:', err);
+      }
+    }
+
+    bridge.logBackendEvent('INFO', 'LOGS_CLEARED_BY_USER', `Naplo uritve (${id})`);
+
+    res.json({ ok: true, deleted });
+  });
 
   // Összes ismert eszköz állapota
-  router.get('/', (_req, res) => {
+  router.get('/', requireGetAuth, (_req, res) => {
     res.json({
       mqttConnected: bridge.isConnected(),
       devices: bridge.getAllStates(),
     });
   });
 
-  // GET /api/heating/:id - utolsó ismert ESP állapot lekérdezése
-  router.get('/:id', (req, res) => {
+  const handleGetStatus = (req: Request, res: Response): void => {
     const { id } = req.params;
     const state = bridge.getDeviceState(id);
 
@@ -56,16 +184,24 @@ export function createHeatingRouter(bridge: HeatingMqttBridge): Router {
     }
 
     res.json(state);
-  });
+  };
+
+  // GET /api/heating/:id és /api/heating/:id/status - utolsó ismert ESP állapot lekérdezése
+  router.get('/:id', requireGetAuth, handleGetStatus);
+  router.get('/:id/status', requireGetAuth, handleGetStatus);
 
   // POST /api/heating/:id/command - teljes vagy részleges CMD JSON validálása és továbbítása MQTT-re
   router.post('/:id/command', async (req, res) => {
     const { id } = req.params;
 
     try {
+      const validationOptions = {
+        onWarn: (code: string, message: string) => bridge.logBackendEvent('WARN', code, message),
+      };
+
       const result = await withDeviceLock(id, async () => {
         const current = bridge.getDeviceState(id);
-        const validation = validateHeatingCommand(req.body, current);
+        const validation = validateHeatingCommand(req.body, current, validationOptions);
         if (!validation.ok) {
           return { ok: false as const, error: validation.error };
         }
@@ -77,6 +213,8 @@ export function createHeatingRouter(bridge: HeatingMqttBridge): Router {
         res.status(400).json({ error: result.error });
         return;
       }
+
+      bridge.logBackendEvent('INFO', 'API_CMD', 'POST /command OK');
 
       res.json({
         ok: true,
@@ -147,13 +285,17 @@ export function createHeatingRouter(bridge: HeatingMqttBridge): Router {
     }
 
     try {
+      const validationOptions = {
+        onWarn: (code: string, message: string) => bridge.logBackendEvent('WARN', code, message),
+      };
+
       const result = await withDeviceLock(id, async () => {
         const current = bridge.getDeviceState(id);
         if (!hasValidEspStatus(current)) {
           return { status: 409 as const, error: 'Nincs még ESP állapot' };
         }
 
-        const built = buildPumpUpdateCommand(current, req.body);
+        const built = buildPumpUpdateCommand(current, req.body, validationOptions);
         if (!built.ok) {
           return { status: 400 as const, error: built.error };
         }
@@ -196,13 +338,17 @@ export function createHeatingRouter(bridge: HeatingMqttBridge): Router {
     }
 
     try {
+      const validationOptions = {
+        onWarn: (code: string, message: string) => bridge.logBackendEvent('WARN', code, message),
+      };
+
       const result = await withDeviceLock(id, async () => {
         const current = bridge.getDeviceState(id);
         if (!hasValidEspStatus(current)) {
           return { status: 409 as const, error: 'Nincs még ESP állapot' };
         }
 
-        const built = buildAlarmUpdateCommand(current, req.body);
+        const built = buildAlarmUpdateCommand(current, req.body, validationOptions);
         if (!built.ok) {
           return { status: 400 as const, error: built.error };
         }
@@ -245,13 +391,17 @@ export function createHeatingRouter(bridge: HeatingMqttBridge): Router {
     }
 
     try {
+      const validationOptions = {
+        onWarn: (code: string, message: string) => bridge.logBackendEvent('WARN', code, message),
+      };
+
       const result = await withDeviceLock(id, async () => {
         const current = bridge.getDeviceState(id);
         if (!hasValidEspStatus(current)) {
           return { status: 409 as const, error: 'Nincs még ESP állapot' };
         }
 
-        const built = buildHeartbeatUpdateCommand(current, req.body);
+        const built = buildHeartbeatUpdateCommand(current, req.body, validationOptions);
         if (!built.ok) {
           return { status: 400 as const, error: built.error };
         }
@@ -264,6 +414,12 @@ export function createHeatingRouter(bridge: HeatingMqttBridge): Router {
         res.status(result.status).json({ error: result.error });
         return;
       }
+
+      bridge.logBackendEvent(
+        'INFO',
+        'API_HEARTBEAT',
+        `POST /heartbeat OK (${result.command.heartbeat.intervalSec}s)`
+      );
 
       res.json({
         ok: true,

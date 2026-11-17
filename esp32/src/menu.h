@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "config.h"
 #include "lcd.h"
+#include "log.h"
 #include "../../nano/src/common.h"
 
 // ============================================================================
@@ -71,6 +72,7 @@ enum MenuState : uint8_t {
     MENU_STATUS,       // STATUS almenü (csak lekérdezés)
     MENU_BEALLITAS,    // BEALLITAS almenü (szerkeszthető)
     MENU_KIMENETEK,    // KIMENETEK almenü (kapcsolható)
+    MENU_LOGS,         // STATUS -> NAPLO (utolsó 5 naplóbejegyzés lapozása)
     MENU_EDIT          // Érték szerkesztés (BEALLITAS pont)
 };
 
@@ -101,6 +103,12 @@ struct MenuCallbacks {
     void (*onFactoryReset)(void);
 };
 
+// Egységes NVS mentő függvények (implementáció: main.cpp)
+bool saveSetting(const char* key, float value);
+bool saveSetting(const char* key, uint32_t value);
+bool saveSetting(const char* key, bool value);
+bool saveSetting(const char* key, const char* value);
+
 class MenuController {
 public:
     void begin(HeatingLcd* lcd, SystemState* state, const MenuCallbacks& callbacks);
@@ -113,6 +121,7 @@ public:
 
     void update(uint32_t now, bool alarmBlinkPhase);
     void requestRedraw();
+    void showErrorBanner(const char* line1, const char* line2, uint32_t durationMs = 2000);
 
     MenuState getState() const { return _menuState; }
     bool isEditing() const { return _menuState == MENU_EDIT; }
@@ -122,6 +131,7 @@ public:
     void drawMainScreen(bool alarmBlinkPhase);
     void drawMenu();
     void drawEditValue(bool editBlinkPhase);
+    void drawLogViewer();
 
 private:
     HeatingLcd*   _lcd   = nullptr;
@@ -131,6 +141,7 @@ private:
     MenuState _menuState      = MENU_HOME;
     uint8_t   _cursor         = 0;
     uint8_t   _mainCursor     = 0;
+    uint8_t   _logCursor      = 0;
 
     // Szerkesztési puffer (MQTT CMD vagy 20mp timeout nem írja felül félbehagyva)
     uint8_t _editItemIndex    = 0;
@@ -144,6 +155,7 @@ private:
     uint32_t _lastMainDrawMs  = 0;
     uint32_t _lastEditBlinkMs = 0;
     uint32_t _bannerUntilMs   = 0;
+    uint32_t _alertUntilMs    = 0;
 
     bool _editBlinkOn       = true;
     bool _lastAlarmBlink    = false;
