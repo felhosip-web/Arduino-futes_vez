@@ -1,5 +1,12 @@
 import { timingSafeEqual } from 'node:crypto';
 import { Router, type NextFunction, type Request, type Response } from 'express';
+import {
+  DEFAULT_RESOLUTION_FOR_RANGE,
+  normalizeHistoryRange,
+  normalizeHistoryResolution,
+  normalizeHistorySensor,
+} from './historyStore.ts';
+import type { HistoryRange, HistoryResolution, HistorySensorFilter } from './historyStore.ts';
 import { normalizeLogLevel } from './logsStore.ts';
 import type { LogLevel } from './logsStore.ts';
 import type { HeatingMqttBridge } from './mqttBridge.ts';
@@ -162,6 +169,95 @@ export function createHeatingRouter(
     bridge.logBackendEvent('INFO', 'LOGS_CLEARED_BY_USER', `Naplo uritve (${id})`);
 
     res.json({ ok: true, deleted });
+  });
+
+  // POST /api/heating/:id/sync - azonnali ESP-Nano időszinkronizáció indítása (Bearer auth-os)
+  router.post('/:id/sync', async (req, res) => {
+    const { id } = req.params;
+    const body = req.body as Record<string, unknown> | undefined;
+    if (body && typeof body === 'object' && !Array.isArray(body) && body.action !== undefined) {
+      if (body.action !== 'forceSync') {
+        res.status(400).json({ error: 'Érvénytelen action. Engedélyezett: forceSync.' });
+        return;
+      }
+    }
+
+    try {
+      await bridge.publishAction(id, { action: 'forceSync' });
+      bridge.logBackendEvent('INFO', 'SYNC_FORCED_BY_USER', `Idoszinkron inditva (${id})`);
+      res.json({
+        ok: true,
+        topic: `futes/${id}/cmd`,
+        action: 'forceSync',
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'MQTT küldési hiba.';
+      res.status(503).json({ error: message });
+    }
+  });
+
+  // POST /api/heating/:id/trend/reset - előremenő max/min/átlag statisztika nullázása (Bearer auth-os)
+  router.post('/:id/trend/reset', async (req, res) => {
+    const { id } = req.params;
+
+    try {
+      await bridge.publishAction(id, { action: 'resetTrend' });
+      bridge.logBackendEvent('INFO', 'TREND_RESET_BY_USER', `Eloremeno statisztika nullazva (${id})`);
+      res.json({ ok: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'MQTT küldési hiba.';
+      res.status(503).json({ error: message });
+    }
+  });
+
+  // GET /api/heating/:id/history?range=1h|6h|24h|7d&resolution=1m|5m|15m|1h&sensor=all|... (Bearer auth-os)
+  router.get('/:id/history', requireBearerAuth, (req, res) => {
+    const { id } = req.params;
+    const rawRange = typeof req.query.range === 'string' ? req.query.range.trim() : '';
+    const rawResolution =
+      typeof req.query.resolution === 'string' ? req.query.resolution.trim() : '';
+    const rawSensor = typeof req.query.sensor === 'string' ? req.query.sensor.trim() : '';
+
+    let range: HistoryRange = '24h';
+    if (rawRange.length > 0) {
+      const parsed = normalizeHistoryRange(rawRange);
+      if (!parsed) {
+        res.status(400).json({ error: 'Érvénytelen range. Engedélyezett: 1h, 6h, 24h, 7d.' });
+        return;
+      }
+      range = parsed;
+    }
+
+    let resolution: HistoryResolution = DEFAULT_RESOLUTION_FOR_RANGE[range];
+    if (rawResolution.length > 0) {
+      const parsed = normalizeHistoryResolution(rawResolution);
+      if (!parsed) {
+        res.status(400).json({ error: 'Érvénytelen resolution. Engedélyezett: 1m, 5m, 15m, 1h.' });
+        return;
+      }
+      resolution = parsed;
+    }
+
+    let sensor: HistorySensorFilter = 'all';
+    if (rawSensor.length > 0) {
+      const parsed = normalizeHistorySensor(rawSensor);
+      if (!parsed) {
+        res.status(400).json({
+          error:
+            'Érvénytelen sensor. Engedélyezett: all, eloremeno, visszatero, kazan, kulteri, szoba.',
+        });
+        return;
+      }
+      sensor = parsed;
+    }
+
+    const result = bridge.getHistoryStore(id).query({
+      range,
+      resolution,
+      sensor,
+    });
+
+    res.json(result);
   });
 
   // Összes ismert eszköz állapota

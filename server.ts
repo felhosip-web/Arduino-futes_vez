@@ -19,8 +19,15 @@ const PORT =
   RAW_PORT && RAW_PORT !== NGINX_PORT && Number.isFinite(PARSED_PORT) && PARSED_PORT > 0
     ? PARSED_PORT
     : DEFAULT_PORT;
-const HOST = process.env.HOST?.trim() || '127.0.0.1';
+const RAW_HOST = process.env.HOST?.trim() || '127.0.0.1';
 const HEATING_API_KEY = process.env.HEATING_API_KEY?.trim() || '';
+const IS_SANDBOX_DEV_PREVIEW =
+  process.env.NODE_ENV !== 'production' && Boolean(process.env.CONTROL_PLANE_PORT);
+
+// AI Studio dev sandbox injects HOST=0.0.0.0 without .env; fall back to 127.0.0.1 there,
+// while strictly requiring HEATING_API_KEY for non-localhost bind everywhere else.
+const HOST =
+  RAW_HOST === '0.0.0.0' && !HEATING_API_KEY && IS_SANDBOX_DEV_PREVIEW ? '127.0.0.1' : RAW_HOST;
 const IS_LOCALHOST = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1';
 
 if (HOST === '0.0.0.0' && !HEATING_API_KEY) {

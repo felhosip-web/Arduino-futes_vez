@@ -13,13 +13,18 @@
 // Méret audit (NanoToEspPayload):
 //   4x float (16B) + uint32_t seq (4B) + uint32_t counter (4B) +
 //   uint8_t kazanStatusMask (1B -> ESP32-n 8 elemű kazan_status[8] tömbbé bővítve) +
-//   uint8_t sensorValidMask (1B) + AlarmStatePacked (2B) + reserved[3] (3B) = 31 byte.
+//   uint8_t sensorValidMask (1B) + AlarmStatePacked (2B) +
+//   uint8_t syncFlags (1B) + uint16_t syncEpochLow16 (2B) = 31 byte.
 //   NrfPacket = 1 byte packetType + 31 byte union = pontosan 32 byte!
 
 constexpr uint8_t PKT_TYPE_REQUEST  = 0xA1; // Master -> Slave
 constexpr uint8_t PKT_TYPE_RESPONSE = 0xB2; // Slave  -> Master
 
 constexpr float SENSOR_DISCONNECTED_VAL = -127.0f;
+
+// Időszinkron nyugta bitek a NanoToEspPayload.syncFlags mezőben
+constexpr uint8_t SYNC_FLAG_ACK   = 0x01; // bit0: Nano kapott érvényes timeSyncEpoch-ot
+constexpr uint8_t SYNC_FLAG_STALE = 0x02; // bit1: >13 órája nem érkezett friss szinkron
 
 #ifndef SAFETY_OVERHEAT_TEMP_DEFINED
 #define SAFETY_OVERHEAT_TEMP_DEFINED
@@ -103,7 +108,7 @@ struct __attribute__((packed)) EspToNanoPayload {
     AlarmConfigPacked alarmConfig;          // 5 byte
     uint8_t           heartbeatIntervalSec; // 5, 10, 15, 20, 25, 30 mp (alap: 5)
     uint32_t          seq;                  // Növekvő kérés sorszám
-    uint8_t           reserved[4];          // Kitöltés 31 byte-ra
+    uint32_t          timeSyncEpoch;        // 0 ha nincs időszinkron ebben a csomagban, különben UTC epoch (4 byte)
 };
 
 struct __attribute__((packed)) NanoToEspPayload {
@@ -116,7 +121,8 @@ struct __attribute__((packed)) NanoToEspPayload {
     uint32_t         seq;             // UGYANAZ a seq, mint a kérésben
     uint8_t          sensorValidMask; // bit0: eloremeno, bit1: visszatero, bit2: kazan, bit3: kulteri
     AlarmStatePacked alarmState;      // 2 byte (active + reason)
-    uint8_t          reserved[3];     // Kitöltés 31 byte-ra
+    uint8_t          syncFlags;       // bit0: SYNC_FLAG_ACK, bit1: SYNC_FLAG_STALE (1 byte)
+    uint16_t         syncEpochLow16;  // Utolsó kapott timeSyncEpoch alsó 16 bitje nyugtázáshoz (2 byte)
 };
 
 struct __attribute__((packed)) NrfPacket {

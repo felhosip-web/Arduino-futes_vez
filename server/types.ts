@@ -67,6 +67,38 @@ export interface HeatingTemperatures {
   kulteri: number | null;
 }
 
+export interface EspTimeInfo {
+  espNtpSynced: boolean;
+  espTime: string;
+  espUptimeSec: number;
+}
+
+export interface TimeSyncInfo {
+  ntpSynced: boolean;
+  espTime: string;
+  nanoSynced: boolean;
+  nanoTime: string | null;
+  nanoStale: boolean;
+  lastSync: string | null;
+  nextSync: string | null;
+  syncSuccess: boolean;
+  millisOverflowInDays: number;
+  pingAgeSec: number | null;
+}
+
+export type TrendDirection = 'up' | 'down' | 'flat';
+
+export interface TrendStats {
+  eloremeno: TrendDirection;
+  delta: number;
+  max: number | null;
+  min: number | null;
+  avg: number | null;
+  maxAt?: string | null;
+  minAt?: string | null;
+  since: string | null;
+}
+
 export interface HeatingStatusPayload {
   currentTemp: number;
   targetTemp: number;
@@ -86,6 +118,9 @@ export interface HeatingStatusPayload {
   error: string | null;
   manualHeating?: boolean;
   nanoCounter?: number;
+  time?: EspTimeInfo;
+  sync?: TimeSyncInfo;
+  trend?: TrendStats;
 }
 
 export interface StoredDeviceState {

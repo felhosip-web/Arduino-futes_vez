@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
 import { io } from 'socket.io-client';
-import { AlertTriangle, LayoutDashboard, RefreshCw, ScrollText, Wifi, WifiOff } from 'lucide-react';
+import {
+  AlertTriangle,
+  LayoutDashboard,
+  LineChart,
+  RefreshCw,
+  ScrollText,
+  Wifi,
+  WifiOff,
+} from 'lucide-react';
 import { API_URL, DEVICE_ID } from './config';
 import {
   DEFAULT_ALARM_CONFIG,
@@ -21,14 +29,17 @@ import {
 } from './types/heating';
 import { HeatingControl } from './components/HeatingControl';
 import { Temperatures } from './components/Temperatures';
+import { EloremenoStats } from './components/EloremenoStats';
 import { PumpControl } from './components/PumpControl';
 import { AlarmControl } from './components/AlarmControl';
 import { HeartbeatControl } from './components/HeartbeatControl';
 import { BoilerControl } from './components/BoilerControl';
 import { BoilerStatus } from './components/BoilerStatus';
+import { SystemCheck } from './components/SystemCheck';
 import { LogsView } from './components/LogsView';
+import { ChartsView } from './components/ChartsView';
 
-type ActiveView = 'dashboard' | 'logs';
+type ActiveView = 'dashboard' | 'logs' | 'charts';
 
 function isUsableStatus(
   candidate: Partial<HeatingStatusPayload> | null | undefined
@@ -55,6 +66,7 @@ function formatTimestamp(ms: number | null): string {
 export default function App() {
   const [activeView, setActiveView] = useState<ActiveView>('dashboard');
   const [logsRefreshSignal, setLogsRefreshSignal] = useState<number>(0);
+  const [chartsRefreshSignal, setChartsRefreshSignal] = useState<number>(0);
   const [status, setStatus] = useState<HeatingStatusPayload | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null);
   const [socketConnected, setSocketConnected] = useState<boolean>(false);
@@ -138,7 +150,12 @@ export default function App() {
       setErrorMsg(null);
     });
 
+    const pollTimer = window.setInterval(() => {
+      void fetchInitialState();
+    }, 30_000);
+
     return () => {
+      window.clearInterval(pollTimer);
       socket.disconnect();
     };
   }, [applyDeviceState, fetchInitialState]);
@@ -288,6 +305,27 @@ export default function App() {
     }
   }, []);
 
+  const handleResetTrendStats = useCallback(async (): Promise<boolean> => {
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/trend/reset`, {
+        method: 'POST',
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error || `Statisztika nullázási hiba (HTTP ${res.status})`);
+      }
+      setLogsRefreshSignal((prev) => prev + 1);
+      await fetchInitialState();
+      return true;
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Hiba a statisztika nullázása közben.';
+      setErrorMsg(message);
+      return false;
+    }
+  }, [fetchInitialState]);
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <div className="mx-auto max-w-5xl px-4 py-6 sm:px-6 lg:px-8">
@@ -332,6 +370,8 @@ export default function App() {
                 void fetchInitialState();
                 if (activeView === 'logs') {
                   setLogsRefreshSignal((prev) => prev + 1);
+                } else if (activeView === 'charts') {
+                  setChartsRefreshSignal((prev) => prev + 1);
                 }
               }}
               disabled={isRefreshing}
@@ -382,6 +422,21 @@ export default function App() {
               <ScrollText className="h-4 w-4" aria-hidden="true" />
               <span>Napló</span>
             </button>
+
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeView === 'charts'}
+              onClick={() => setActiveView('charts')}
+              className={`inline-flex min-h-[44px] items-center gap-2 rounded-md px-4 py-2 text-sm font-semibold whitespace-nowrap shrink-0 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
+                activeView === 'charts'
+                  ? 'bg-orange-500 text-slate-950'
+                  : 'text-slate-300 hover:bg-slate-800 hover:text-slate-100'
+              }`}
+            >
+              <LineChart className="h-4 w-4" aria-hidden="true" />
+              <span>Grafikonok</span>
+            </button>
           </div>
         </nav>
 
@@ -418,8 +473,17 @@ export default function App() {
 
         {/* Tartalom */}
         {activeView === 'logs' ? (
-          <main className="mt-6">
+          <main className="mt-6 space-y-6">
+            <SystemCheck
+              status={status}
+              lastUpdatedAt={lastUpdatedAt}
+              onSyncTriggered={() => setLogsRefreshSignal((prev) => prev + 1)}
+            />
             <LogsView refreshSignal={logsRefreshSignal} />
+          </main>
+        ) : activeView === 'charts' ? (
+          <main className="mt-6 space-y-6">
+            <ChartsView liveStatus={status} refreshSignal={chartsRefreshSignal} />
           </main>
         ) : loadingInitial ? (
           <div className="mt-6 rounded-xl border border-slate-800 bg-slate-900 p-8 text-center text-sm text-slate-400">
@@ -448,7 +512,9 @@ export default function App() {
               onSendRoomCommand={handleSendRoomCommand}
             />
 
-            <Temperatures temperatures={status.homersekletek} />
+            <Temperatures temperatures={status.homersekletek} trend={status.trend} />
+
+            <EloremenoStats trend={status.trend} onResetStats={handleResetTrendStats} />
 
             <PumpControl
               pumpConfig={status.pumpConfig ?? DEFAULT_PUMP_CONFIG}

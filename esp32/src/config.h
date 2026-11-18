@@ -24,9 +24,13 @@ constexpr const char* TOPIC_LOG       = "futes/haz-futes/log";       // ERROR es
 constexpr const char* TOPIC_LOGS      = "futes/haz-futes/logs";      // getLogs válasz
 
 // --- NTP időszinkron ---
-constexpr const char* NTP_SERVER_1    = "pool.ntp.org";
-constexpr const char* NTP_SERVER_2    = "time.nist.gov";
-constexpr const char* NTP_TZ_INFO     = "CET-1CEST,M3.5.0,M10.5.0/3";
+constexpr const char* NTP_SERVER_1           = "pool.ntp.org";
+constexpr const char* NTP_SERVER_2           = "time.nist.gov";
+constexpr const char* NTP_TZ_INFO            = "CET-1CEST,M3.5.0,M10.5.0/3";
+constexpr uint32_t    NTP_TIMEOUT_MS         = 5000UL;     // Max 5 mp NTP timeout
+constexpr uint32_t    NTP_RETRY_INTERVAL_MS  = 60000UL;    // 60 mp NTP újrapróbálkozás
+constexpr uint32_t    SYNC_RETRY_INTERVAL_MS = 3600000UL;  // 1 óra múlva újrapróba sikertelen Nano szinkronnál
+constexpr uint32_t    NANO_SYNC_STALE_SEC    = 46800UL;    // 13 óra (2x12h + 1h tűrés)
 
 // --- PIN-ek (ESP32-C3, ütközésmentes kiosztás) ---
 constexpr uint8_t PIN_LM35      = 2;  // ADC1_CH2
@@ -114,3 +118,14 @@ constexpr uint32_t WIFI_RECONNECT_MS      = 10000UL; // 10 mp nem-blokkoló WiFi
 constexpr uint32_t WIFI_PORTAL_TIMEOUT_MS = 30000UL; // 30 mp sikertelen WiFi után beállító portál
 constexpr uint32_t MQTT_RECONNECT_MS      = 5000UL;  // 5 mp nem-blokkoló MQTT retry
 constexpr uint32_t BTN_DEBOUNCE_MS        = 50UL;
+
+// --- Előremenő hőmérséklet trend és napi statisztika ---
+constexpr uint32_t TREND_SAMPLE_INTERVAL_MS = 60000UL; // 1 perces mintavétel
+constexpr uint8_t  TREND_BUFFER_SIZE        = 20;      // 20 perc (10+10 perc)
+constexpr float    TREND_THRESHOLD_C        = 0.5f;    // ±0.5 °C küszöb
+
+enum TrendDirection : uint8_t {
+    TREND_FLAT = 0,
+    TREND_UP   = 1,
+    TREND_DOWN = 2
+};

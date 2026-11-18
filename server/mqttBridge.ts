@@ -1,6 +1,7 @@
 import mqtt from 'mqtt';
 import type { MqttClient } from 'mqtt';
 import type { Server as SocketIOServer } from 'socket.io';
+import { HistoryStore } from './historyStore.ts';
 import { LogsStore, normalizeLogLevel } from './logsStore.ts';
 import type { LogLevel } from './logsStore.ts';
 import { VALID_HEARTBEAT_INTERVALS } from './types.ts';
@@ -68,6 +69,10 @@ export function mergeHeatingStatus(
     }
   }
 
+  const mergedTime = mergeDefined(prevStatus.time, parsed.time);
+  const mergedSync = mergeDefined(prevStatus.sync, parsed.sync);
+  const mergedTrend = mergeDefined(prevStatus.trend, parsed.trend);
+
   return {
     ...prevStatus,
     ...cleanTop,
@@ -78,6 +83,9 @@ export function mergeHeatingStatus(
     safety: { safetyOverheatTemp: SAFETY_OVERHEAT_TEMP },
     alarmState: mergeDefined(prevStatus.alarmState, parsed.alarmState)!,
     heartbeat: mergeDefined(prevStatus.heartbeat, parsed.heartbeat)!,
+    ...(mergedTime ? { time: mergedTime } : {}),
+    ...(mergedSync ? { sync: mergedSync } : {}),
+    ...(mergedTrend ? { trend: mergedTrend } : {}),
   };
 }
 
@@ -144,8 +152,10 @@ export class HeatingMqttBridge {
   private readonly io: SocketIOServer;
   private readonly logsStore: LogsStore;
   private readonly states = new Map<string, StoredDeviceState>();
+  private readonly historyStores = new Map<string, HistoryStore>();
   private readonly lastCommands = new Map<string, { command: HeatingCommand; sentAt: number }>();
   private readonly onlineStates = new Map<string, boolean>();
+  private readonly lastActiveTrends = new Map<string, 'up' | 'down'>();
   private connected = false;
 
   constructor(io: SocketIOServer, logsStore: LogsStore = new LogsStore()) {
@@ -155,6 +165,15 @@ export class HeatingMqttBridge {
 
   public getLogsStore(): LogsStore {
     return this.logsStore;
+  }
+
+  public getHistoryStore(deviceId: string): HistoryStore {
+    let store = this.historyStores.get(deviceId);
+    if (!store) {
+      store = new HistoryStore();
+      this.historyStores.set(deviceId, store);
+    }
+    return store;
   }
 
   public logBackendEvent(level: LogLevel, code: string, message: string): void {
@@ -270,6 +289,7 @@ export class HeatingMqttBridge {
     };
 
     this.states.set(deviceId, nextState);
+    this.getHistoryStore(deviceId).recordFromStatus(mergedStatus, nowMs);
 
     if (messageType === 'status' && typeof parsed.online === 'boolean') {
       const prevOnline = this.onlineStates.get(deviceId);
@@ -280,6 +300,32 @@ export class HeatingMqttBridge {
         this.logBackendEvent('WARN', 'ESP_OFFLINE', `${deviceId}: ${reason}`);
       }
       this.onlineStates.set(deviceId, parsed.online);
+    }
+
+    const incomingTrend = parsed.trend?.eloremeno;
+    if (incomingTrend === 'up' || incomingTrend === 'down') {
+      const prevActiveTrend = this.lastActiveTrends.get(deviceId);
+      if (prevActiveTrend && prevActiveTrend !== incomingTrend) {
+        const deltaVal =
+          typeof parsed.trend?.delta === 'number' && Number.isFinite(parsed.trend.delta)
+            ? parsed.trend.delta
+            : 0;
+        const deltaSign = deltaVal > 0 ? '+' : '';
+        if (incomingTrend === 'up') {
+          this.logBackendEvent(
+            'INFO',
+            'TREND_UP',
+            `${deviceId} előremenő trend: FEL (${deltaSign}${deltaVal.toFixed(1)}°C)`
+          );
+        } else {
+          this.logBackendEvent(
+            'INFO',
+            'TREND_DOWN',
+            `${deviceId} előremenő trend: LE (${deltaSign}${deltaVal.toFixed(1)}°C)`
+          );
+        }
+      }
+      this.lastActiveTrends.set(deviceId, incomingTrend);
     }
 
     const eventPayload: HeatingUpdateEvent = {

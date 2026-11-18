@@ -60,6 +60,29 @@ struct SystemState {
         0,
         ALARM_REASON_NONE
     };
+
+    // NTP és ESP-Nano időszinkron állapot (CHECK menü + STATUS JSON)
+    bool     hasNrfResponse      = false;
+    uint32_t lastNrfResponseMs   = 0;
+    bool     ntpSynced           = false;
+    uint32_t lastNtpSyncEpoch    = 0;
+    bool     nanoSynced          = false;
+    bool     nanoSyncStale       = false;
+    bool     lastNanoSyncSuccess = false;
+    uint32_t lastNanoSyncEpoch   = 0;
+    uint32_t lastNanoSyncMs      = 0;
+
+    // Előremenő trend (20 perces puffer) és napi max-min-átlag statisztika
+    uint8_t  trendDir            = TREND_FLAT;
+    float    trendDelta          = 0.0f;
+    uint8_t  trendSampleCount    = 0;
+    float    eloremenoMax        = -999.0f;
+    float    eloremenoMin        = 999.0f;
+    double   eloremenoSum        = 0.0;
+    uint32_t eloremenoCount      = 0;
+    char     eloremenoMaxAt[6]   = { 0 };
+    char     eloremenoMinAt[6]   = { 0 };
+    char     statsSinceStr[24]   = { 0 };
 };
 
 // ============================================================================
@@ -73,6 +96,8 @@ enum MenuState : uint8_t {
     MENU_BEALLITAS,    // BEALLITAS almenü (szerkeszthető)
     MENU_KIMENETEK,    // KIMENETEK almenü (kapcsolható)
     MENU_LOGS,         // STATUS -> NAPLO (utolsó 5 naplóbejegyzés lapozása)
+    MENU_CHECK,        // STATUS -> CHECK (NTP, Nano, Radio, Millis ellenőrzés)
+    MENU_TREND,        // FOKOK -> TREND (trend, delta, max/min, átlag)
     MENU_EDIT          // Érték szerkesztés (BEALLITAS pont)
 };
 
@@ -101,6 +126,7 @@ struct MenuItem {
 struct MenuCallbacks {
     void (*onSettingCommitted)(void);
     void (*onFactoryReset)(void);
+    void (*onTrendReset)(void);
 };
 
 // Egységes NVS mentő függvények (implementáció: main.cpp)
@@ -132,6 +158,8 @@ public:
     void drawMenu();
     void drawEditValue(bool editBlinkPhase);
     void drawLogViewer();
+    void drawCheckViewer();
+    void drawTrendViewer();
 
 private:
     HeatingLcd*   _lcd   = nullptr;
@@ -142,6 +170,8 @@ private:
     uint8_t   _cursor         = 0;
     uint8_t   _mainCursor     = 0;
     uint8_t   _logCursor      = 0;
+    uint8_t   _checkCursor    = 0;
+    uint8_t   _trendCursor    = 0;
 
     // Szerkesztési puffer (MQTT CMD vagy 20mp timeout nem írja felül félbehagyva)
     uint8_t _editItemIndex    = 0;
@@ -154,8 +184,13 @@ private:
     uint32_t _lastMenuDrawMs  = 0;
     uint32_t _lastMainDrawMs  = 0;
     uint32_t _lastEditBlinkMs = 0;
-    uint32_t _bannerUntilMs   = 0;
-    uint32_t _alertUntilMs    = 0;
+    bool     _bannerActive       = false;
+    uint32_t _bannerStartMs      = 0;
+    bool     _alertActive        = false;
+    uint32_t _alertStartMs       = 0;
+    uint32_t _alertDurationMs    = 0;
+    bool     _trendConfirmActive = false;
+    uint32_t _trendConfirmStartMs = 0;
 
     bool _editBlinkOn       = true;
     bool _lastAlarmBlink    = false;

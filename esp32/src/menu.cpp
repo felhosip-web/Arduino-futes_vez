@@ -1,6 +1,7 @@
 #include "menu.h"
 #include <math.h>
 #include <stdio.h>
+#include <time.h>
 
 // ============================================================================
 // BELSŐ AZONOSÍTÓ KONSTANSOK A MENÜPONTOKHOZ
@@ -81,15 +82,22 @@ void MenuController::begin(HeatingLcd* lcd, SystemState* state, const MenuCallba
     _cursor          = 0;
     _mainCursor      = 0;
     _logCursor       = 0;
+    _checkCursor     = 0;
+    _trendCursor     = 0;
     _lastActivityMs  = millis();
     _lastMenuDrawMs  = 0;
     _lastMainDrawMs  = 0;
     _lastEditBlinkMs = 0;
-    _bannerUntilMs   = 0;
-    _alertUntilMs    = 0;
-    _editBlinkOn     = true;
-    _menuDirty       = true;
-    _mainDirty       = true;
+    _bannerActive        = false;
+    _bannerStartMs       = 0;
+    _alertActive         = false;
+    _alertStartMs        = 0;
+    _alertDurationMs     = 0;
+    _trendConfirmActive  = false;
+    _trendConfirmStartMs = 0;
+    _editBlinkOn         = true;
+    _menuDirty           = true;
+    _mainDirty           = true;
 
     buildItemsForState(MENU_MAIN);
     drawMainScreen(false);
@@ -101,8 +109,10 @@ void MenuController::requestRedraw() {
 }
 
 void MenuController::showErrorBanner(const char* line1, const char* line2, uint32_t durationMs) {
-    uint32_t until = millis() + durationMs;
-    _alertUntilMs = (until == 0) ? 1 : until;
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    _alertStartMs    = millis();
+    _alertDurationMs = durationMs;
+    _alertActive     = true;
     if (_lcd) {
         _lcd->printLinesImmediate(line1 ? line1 : "HIBA!", line2 ? line2 : "");
     }
@@ -136,6 +146,7 @@ void MenuController::buildItemsForState(MenuState targetState) {
             _items[_itemCount++] = { "Kazan",      ITEM_READONLY_TEMP, &_state->kazan,       0, 0, 0, SENSOR_SRC_NANO };
             _items[_itemCount++] = { "Kulteri",    ITEM_READONLY_TEMP, &_state->kulteri,     0, 0, 0, SENSOR_SRC_NANO };
             _items[_itemCount++] = { "Szoba",      ITEM_READONLY_TEMP, &_state->currentTemp, 0, 0, 0, SENSOR_SRC_ROOM };
+            _items[_itemCount++] = { "TREND",      ITEM_SUBMENU,       nullptr,              0, 0, 0, MENU_TREND };
             _items[_itemCount++] = { "VISSZA",     ITEM_ACTION_BACK,   nullptr,              0, 0, 0, MENU_MAIN };
             break;
 
@@ -147,6 +158,7 @@ void MenuController::buildItemsForState(MenuState targetState) {
             _items[_itemCount++] = { "Radio",         ITEM_READONLY_STATUS, &_state->nrf24Ok,    0, 0, 0, STAT_RADIO };
             _items[_itemCount++] = { "Bizt. Hatar",   ITEM_READONLY_STATUS, nullptr,             0, 0, 0, STAT_SAFETY_TEMP };
             _items[_itemCount++] = { "NAPLO",         ITEM_SUBMENU,         nullptr,             0, 0, 0, MENU_LOGS };
+            _items[_itemCount++] = { "CHECK",         ITEM_SUBMENU,         nullptr,             0, 0, 0, MENU_CHECK };
             _items[_itemCount++] = { "VISSZA",        ITEM_ACTION_BACK,     nullptr,             0, 0, 0, MENU_MAIN };
             break;
 
@@ -179,6 +191,8 @@ void MenuController::buildItemsForState(MenuState targetState) {
 
         case MENU_HOME:
         case MENU_LOGS:
+        case MENU_CHECK:
+        case MENU_TREND:
         case MENU_EDIT:
         default:
             break;
@@ -194,6 +208,20 @@ void MenuController::enterSubmenu(MenuState sub, uint8_t initialCursor, uint32_t
         _logCursor      = 0;
         _lastActivityMs = now;
         _menuDirty      = true;
+        return;
+    }
+    if (sub == MENU_CHECK) {
+        _checkCursor    = 0;
+        _lastActivityMs = now;
+        _menuDirty      = true;
+        return;
+    }
+    if (sub == MENU_TREND) {
+        _trendCursor         = 0;
+        _trendConfirmActive  = false;
+        _trendConfirmStartMs = 0;
+        _lastActivityMs      = now;
+        _menuDirty           = true;
         return;
     }
     buildItemsForState(sub);
@@ -473,6 +501,17 @@ void MenuController::navigateBack(uint32_t now) {
             enterSubmenu(MENU_STATUS, 6, now);
             break;
 
+        case MENU_CHECK:
+            // CHECK nézetből vissza STATUS almenübe (CHECK pontra)
+            enterSubmenu(MENU_STATUS, 7, now);
+            break;
+
+        case MENU_TREND:
+            _trendConfirmActive = false;
+            // TREND nézetből vissza FOKOK almenübe (TREND pontra)
+            enterSubmenu(MENU_FOKOK, 5, now);
+            break;
+
         case MENU_FOKOK:
         case MENU_STATUS:
         case MENU_BEALLITAS:
@@ -500,7 +539,7 @@ void MenuController::handleInput(int8_t encSteps,
     if (!_state) return;
 
     // Gyári visszaállítás vagy hibajelző banner alatt ne reagáljon navigációra
-    if (_bannerUntilMs != 0 || _alertUntilMs != 0) {
+    if (_bannerActive || _alertActive) {
         return;
     }
 
@@ -514,7 +553,9 @@ void MenuController::handleInput(int8_t encSteps,
         if (_callbacks.onFactoryReset) {
             _callbacks.onFactoryReset();
         }
-        _bannerUntilMs = now + FACTORY_BANNER_MS;
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        _bannerStartMs = now;
+        _bannerActive  = true;
         _menuState     = MENU_HOME;
         _cursor        = 0;
         _mainCursor    = 0;
@@ -617,6 +658,77 @@ void MenuController::handleInput(int8_t encSteps,
         return;
     }
 
+    // 4c. CHECK diagnosztikai néző (`MENU_CHECK` - 4 görgethető sor)
+    if (_menuState == MENU_CHECK) {
+        constexpr uint8_t CHECK_LINES = 4;
+        if (steps != 0) {
+            _lastActivityMs = now;
+            int16_t next = static_cast<int16_t>(_checkCursor) + steps;
+            while (next < 0) next += CHECK_LINES;
+            _checkCursor = static_cast<uint8_t>(next % CHECK_LINES);
+            _menuDirty   = true;
+        }
+        if (shortPress) {
+            _lastActivityMs = now;
+            _checkCursor    = static_cast<uint8_t>((_checkCursor + 1) % CHECK_LINES);
+            _menuDirty      = true;
+        }
+        return;
+    }
+
+    // 4d. TREND néző (`MENU_TREND` - 3 lapozható képernyő + 4. NULLAZAS kétlépcsős megerősítéssel)
+    if (_menuState == MENU_TREND) {
+        constexpr uint8_t TREND_PAGES = 4;
+        if (_trendConfirmActive) {
+            if (steps != 0) {
+                // Tekerésre visszalép megerősítés nélkül, nem nulláz, nem logol
+                _trendConfirmActive = false;
+                _lastActivityMs     = now;
+                _menuDirty          = true;
+                return;
+            }
+            if (shortPress) {
+                _trendConfirmActive = false;
+                _lastActivityMs     = now;
+                // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+                if (static_cast<uint32_t>(now - _trendConfirmStartMs) < 5000UL) {
+                    if (_callbacks.onTrendReset) {
+                        _callbacks.onTrendReset();
+                    }
+                    _trendCursor = 0;
+                    _menuDirty   = true;
+                    showErrorBanner("NULLAZVA!", "Statisztika torol", 2000);
+                } else {
+                    _menuDirty = true;
+                }
+                return;
+            }
+            return;
+        }
+
+        if (steps != 0) {
+            _lastActivityMs = now;
+            int16_t next = static_cast<int16_t>(_trendCursor) + steps;
+            while (next < 0) next += TREND_PAGES;
+            _trendCursor = static_cast<uint8_t>(next % TREND_PAGES);
+            _menuDirty   = true;
+        }
+        if (shortPress) {
+            _lastActivityMs = now;
+            if (_trendCursor == 3) {
+                // Első rövid nyomás a NULLAZAS ponton -> 5 mp kétlépcsős megerősítés
+                // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+                _trendConfirmActive  = true;
+                _trendConfirmStartMs = now;
+                _menuDirty           = true;
+            } else {
+                _trendCursor = static_cast<uint8_t>((_trendCursor + 1) % TREND_PAGES);
+                _menuDirty   = true;
+            }
+        }
+        return;
+    }
+
     // 5. Lista navigáció (`MENU_MAIN`, `MENU_FOKOK`, `MENU_STATUS`, `MENU_BEALLITAS`, `MENU_KIMENETEK`)
     if (steps != 0 && _itemCount > 0) {
         _lastActivityMs = now;
@@ -672,10 +784,11 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
     if (!_lcd || !_state) return;
 
     // 1. "GYARI BEALLITAS!" 2 mp-es nem-blokkoló banner kezelése
-    if (_bannerUntilMs != 0) {
-        if (static_cast<int32_t>(now - _bannerUntilMs) >= 0) {
-            _bannerUntilMs = 0;
-            _mainDirty     = true;
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (_bannerActive) {
+        if (static_cast<uint32_t>(now - _bannerStartMs) >= FACTORY_BANNER_MS) {
+            _bannerActive   = false;
+            _mainDirty      = true;
             _lastMainDrawMs = 0;
         } else {
             return;
@@ -683,9 +796,10 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
     }
 
     // 1b. 2 mp-es NVS / NRF hibajelző banner (a menüállapotot megőrzi)
-    if (_alertUntilMs != 0) {
-        if (static_cast<int32_t>(now - _alertUntilMs) >= 0) {
-            _alertUntilMs   = 0;
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (_alertActive) {
+        if (static_cast<uint32_t>(now - _alertStartMs) >= _alertDurationMs) {
+            _alertActive    = false;
             _menuDirty      = true;
             _mainDirty      = true;
             _lastMainDrawMs = 0;
@@ -695,12 +809,23 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
         }
     }
 
+    // 1c. TREND NULLAZAS 5 mp-es visszaszámlálás időtúllépése (ha nem volt 2. nyomás -> vissza a TREND listába, nem nulláz)
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (_menuState == MENU_TREND && _trendConfirmActive) {
+        if (static_cast<uint32_t>(now - _trendConfirmStartMs) >= 5000UL) {
+            _trendConfirmActive = false;
+            _menuDirty          = true;
+        }
+    }
+
     // 2. 20 mp tétlenség ellenőrzése: vissza a főképernyőre, félbehagyott szerkesztés eldobva
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
     if (_menuState != MENU_HOME) {
-        if (now - _lastActivityMs >= MENU_TIMEOUT_MS) {
-            _menuState      = MENU_HOME;
-            _mainDirty      = true;
-            _lastMainDrawMs = 0;
+        if (static_cast<uint32_t>(now - _lastActivityMs) >= MENU_TIMEOUT_MS) {
+            _trendConfirmActive = false;
+            _menuState          = MENU_HOME;
+            _mainDirty          = true;
+            _lastMainDrawMs     = 0;
             logEvent(LOG_INFO, "MENU_TIMEOUT", "Menu 20s inaktivitas timeout");
         }
     }
@@ -714,7 +839,8 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
             _mainDirty      = true;
         }
 
-        if (_mainDirty || (now - _lastMainDrawMs >= LCD_MAIN_REFRESH_MS)) {
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        if (_mainDirty || (static_cast<uint32_t>(now - _lastMainDrawMs) >= LCD_MAIN_REFRESH_MS)) {
             _lastMainDrawMs = now;
             _mainDirty      = false;
             drawMainScreen(alarmBlinkPhase);
@@ -724,28 +850,36 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
 
     // 4. Szerkesztés közbeni < > jel 500ms-os villogása
     if (_menuState == MENU_EDIT) {
-        if (now - _lastEditBlinkMs >= EDIT_BLINK_INTERVAL_MS) {
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        if (static_cast<uint32_t>(now - _lastEditBlinkMs) >= EDIT_BLINK_INTERVAL_MS) {
             _lastEditBlinkMs = now;
             _editBlinkOn     = !_editBlinkOn;
             _menuDirty       = true;
         }
     }
 
-    // 5. Menü LCD frissítése 100ms-enként, ha változott (vagy lekérdező/napló menüben 1mp-enként)
-    if (_menuState == MENU_FOKOK || _menuState == MENU_STATUS || _menuState == MENU_LOGS) {
-        if (now - _lastMainDrawMs >= LCD_MAIN_REFRESH_MS) {
+    // 5. Menü LCD frissítése 100ms-enként, ha változott (vagy lekérdező/napló/check/trend menüben 1mp-enként)
+    if (_menuState == MENU_FOKOK || _menuState == MENU_STATUS || _menuState == MENU_LOGS ||
+        _menuState == MENU_CHECK || _menuState == MENU_TREND) {
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        if (static_cast<uint32_t>(now - _lastMainDrawMs) >= LCD_MAIN_REFRESH_MS) {
             _lastMainDrawMs = now;
             _menuDirty      = true;
         }
     }
 
-    if (_menuDirty && (now - _lastMenuDrawMs >= LCD_MENU_REFRESH_MS)) {
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (_menuDirty && (static_cast<uint32_t>(now - _lastMenuDrawMs) >= LCD_MENU_REFRESH_MS)) {
         _lastMenuDrawMs = now;
         _menuDirty      = false;
         if (_menuState == MENU_EDIT) {
             drawEditValue(_editBlinkOn);
         } else if (_menuState == MENU_LOGS) {
             drawLogViewer();
+        } else if (_menuState == MENU_CHECK) {
+            drawCheckViewer();
+        } else if (_menuState == MENU_TREND) {
+            drawTrendViewer();
         } else {
             drawMenu();
         }
@@ -871,6 +1005,136 @@ void MenuController::drawLogViewer() {
     char line2[24];
     snprintf(line1, sizeof(line1), "%c %s", Logger::levelToShortChar(entry.level), entry.code);
     snprintf(line2, sizeof(line2), "%.20s", entry.message);
+    _lcd->printLines(line1, line2);
+}
+
+void MenuController::drawCheckViewer() {
+    if (!_lcd || !_state) return;
+
+    if (_checkCursor >= 4) {
+        _checkCursor = 0;
+    }
+
+    char line1[24];
+    char line2[24];
+    uint32_t now = millis();
+
+    snprintf(line1, sizeof(line1), "CHECK (%u/4)", static_cast<unsigned>(_checkCursor + 1));
+
+    switch (_checkCursor) {
+        case 0: {
+            struct tm timeinfo{};
+            if (_state->ntpSynced && getLocalTime(&timeinfo, 0) && (timeinfo.tm_year + 1900) >= 2024) {
+                snprintf(line2, sizeof(line2), "NTP: OK %02d:%02d:%02d",
+                         timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            } else {
+                snprintf(line2, sizeof(line2), "NTP: NINCS");
+            }
+            break;
+        }
+
+        case 1: {
+            if (!_state->nanoSynced || _state->lastNanoSyncEpoch == 0) {
+                snprintf(line2, sizeof(line2), "Nano: NINCS");
+            } else if (_state->nanoSyncStale || !_state->lastNanoSyncSuccess) {
+                snprintf(line2, sizeof(line2), "Nano: ELAVULT");
+            } else {
+                // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+                uint32_t elapsedSec = static_cast<uint32_t>(now - _state->lastNanoSyncMs) / 1000UL;
+                time_t nanoEpoch = static_cast<time_t>(_state->lastNanoSyncEpoch + elapsedSec);
+                struct tm nanoTm{};
+                localtime_r(&nanoEpoch, &nanoTm);
+                snprintf(line2, sizeof(line2), "Nano: OK %02d:%02d:%02d",
+                         nanoTm.tm_hour, nanoTm.tm_min, nanoTm.tm_sec);
+            }
+            break;
+        }
+
+        case 2: {
+            if (_state->nrf24Ok && _state->hasNrfResponse) {
+                // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+                unsigned long ageSec = static_cast<unsigned long>(
+                    static_cast<uint32_t>(now - _state->lastNrfResponseMs) / 1000UL);
+                snprintf(line2, sizeof(line2), "Radio: OK %lump", ageSec);
+            } else {
+                snprintf(line2, sizeof(line2), "Radio: HIBA");
+            }
+            break;
+        }
+
+        case 3:
+        default: {
+            unsigned long daysLeft = (4294967295UL - static_cast<unsigned long>(now)) / 86400000UL;
+            snprintf(line2, sizeof(line2), "Millis: %lu nap", daysLeft);
+            break;
+        }
+    }
+
+    _lcd->printLines(line1, line2);
+}
+
+void MenuController::drawTrendViewer() {
+    if (!_lcd || !_state) return;
+
+    if (_trendCursor >= 4) {
+        _trendCursor = 0;
+    }
+
+    char line1[24];
+    char line2[24];
+
+    if (_trendConfirmActive) {
+        uint32_t now = millis();
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        uint32_t elapsedMs = static_cast<uint32_t>(now - _trendConfirmStartMs);
+        uint32_t remSec    = (elapsedMs < 5000UL) ? ((5000UL - elapsedMs + 999UL) / 1000UL) : 0UL;
+        if (remSec < 1UL) remSec = 1UL;
+        snprintf(line1, sizeof(line1), "BIZTOS? %lump...", static_cast<unsigned long>(remSec));
+        snprintf(line2, sizeof(line2), "Nyomd meg ujra");
+        _lcd->printLines(line1, line2);
+        return;
+    }
+
+    switch (_trendCursor) {
+        case 0: {
+            const char* dirLabel = "LAPOS";
+            if (_state->trendDir == TREND_UP)        dirLabel = "FEL";
+            else if (_state->trendDir == TREND_DOWN) dirLabel = "LE";
+            snprintf(line1, sizeof(line1), "Trend: %s", dirLabel);
+            snprintf(line2, sizeof(line2), "Delta: %+.1fC", _state->trendDelta);
+            break;
+        }
+
+        case 1: {
+            if (_state->eloremenoCount > 0) {
+                snprintf(line1, sizeof(line1), "Max: %.1fC", _state->eloremenoMax);
+                snprintf(line2, sizeof(line2), "Min: %.1fC", _state->eloremenoMin);
+            } else {
+                snprintf(line1, sizeof(line1), "Max: --.-C");
+                snprintf(line2, sizeof(line2), "Min: --.-C");
+            }
+            break;
+        }
+
+        case 2: {
+            if (_state->eloremenoCount > 0) {
+                float avg = static_cast<float>(_state->eloremenoSum / static_cast<double>(_state->eloremenoCount));
+                snprintf(line1, sizeof(line1), "Atlag: %.1fC", avg);
+            } else {
+                snprintf(line1, sizeof(line1), "Atlag: --.-C");
+            }
+            snprintf(line2, sizeof(line2), "Meres: Boot ota");
+            break;
+        }
+
+        case 3:
+        default: {
+            snprintf(line1, sizeof(line1), "NULLAZAS");
+            snprintf(line2, sizeof(line2), "> Nyomd meg");
+            break;
+        }
+    }
+
     _lcd->printLines(line1, line2);
 }
 

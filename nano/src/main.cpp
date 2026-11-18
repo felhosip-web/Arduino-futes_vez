@@ -47,10 +47,11 @@ constexpr uint8_t PIN_TARTALEK5  = 18; // A4
 // Relé logika: állítsd true-ra, ha a relémodul LOW jellel húz be
 constexpr bool RELAY_ACTIVE_LOW = false;
 
-constexpr uint32_t TEMP_READ_INTERVAL_MS   = 10000UL; // 10 mp-enként DS18B20 olvasás
-constexpr uint32_t DS18B20_CONV_TIME_MS    = 800UL;   // 12-bit konverzió (~750ms)
-constexpr uint32_t ALARM_BLINK_INTERVAL_MS = 500UL;   // 500ms BE / 500ms KI
-constexpr uint32_t SLAVE_TX_TURNAROUND_MS  = 5UL;     // 5ms szünet, hogy a Master biztosan RX módban legyen (< 200ms)
+constexpr uint32_t TEMP_READ_INTERVAL_MS   = 10000UL;    // 10 mp-enként DS18B20 olvasás
+constexpr uint32_t DS18B20_CONV_TIME_MS    = 800UL;      // 12-bit konverzió (~750ms)
+constexpr uint32_t ALARM_BLINK_INTERVAL_MS = 500UL;      // 500ms BE / 500ms KI
+constexpr uint32_t SLAVE_TX_TURNAROUND_MS  = 5UL;        // 5ms szünet, hogy a Master biztosan RX módban legyen (< 200ms)
+constexpr uint32_t NANO_SYNC_STALE_MS      = 46800000UL; // 13 óra (2x12h + 1h tűrés) -> syncStale = true
 
 constexpr float ALARM_OVERHEAT_DEFAULT = 85.0f;
 constexpr float ALARM_OVERHEAT_MIN     = 70.0f;
@@ -108,6 +109,18 @@ bool     failsafeActive       = true; // Induláskor nincs még ESP kapcsolat ->
 
 uint32_t lastAlarmBlinkMs     = 0;
 bool     alarmBlinkOn         = true;
+
+// --- ESP -> Nano időszinkron (49 napos millis() túlcsordulás-biztos) ---
+uint32_t syncEpoch            = 0;
+uint32_t syncMillis           = 0;
+bool     hasTimeSync          = false;
+bool     syncStale            = false;
+
+uint32_t getNanoEpoch(uint32_t now) {
+    if (!hasTimeSync) return 0UL;
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    return syncEpoch + (static_cast<uint32_t>(now - syncMillis) / 1000UL);
+}
 
 // ============================================================================
 // KIMENETEK ÉS RIASZTÁSI VILLOGÁS KEZELÉSE
@@ -185,7 +198,8 @@ void refreshHardwareOutputs(uint32_t now) {
         alarmBlinkOn = false;
         pirosOn = false;
     } else if (currentAlarmState.active != 0 || !hasEspRequest || failsafeActive) {
-        if (now - lastAlarmBlinkMs >= ALARM_BLINK_INTERVAL_MS) {
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        if (static_cast<uint32_t>(now - lastAlarmBlinkMs) >= ALARM_BLINK_INTERVAL_MS) {
             lastAlarmBlinkMs = now;
             alarmBlinkOn = !alarmBlinkOn;
         }
@@ -293,6 +307,12 @@ void buildResponsePacket(uint32_t seq) {
     lastResponsePacket.nano.seq             = seq;
     lastResponsePacket.nano.sensorValidMask = latestSensorValidMask;
     lastResponsePacket.nano.alarmState      = currentAlarmState;
+
+    uint8_t sFlags = 0;
+    if (hasTimeSync) sFlags |= SYNC_FLAG_ACK;
+    if (syncStale)   sFlags |= SYNC_FLAG_STALE;
+    lastResponsePacket.nano.syncFlags      = sFlags;
+    lastResponsePacket.nano.syncEpochLow16 = hasTimeSync ? static_cast<uint16_t>(syncEpoch & 0xFFFFU) : 0U;
 }
 
 void sendResponseToMaster(const NrfPacket& resp) {
@@ -371,13 +391,15 @@ void loop() {
     handleSerialCommands();
 
     // 1. Nem-blokkoló DS18B20 mérés 10 másodpercenként (ne blokkolja az RF24 vételt!)
-    if (!conversionRequested && (now - lastTempCycleMs >= TEMP_READ_INTERVAL_MS)) {
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (!conversionRequested && (static_cast<uint32_t>(now - lastTempCycleMs) >= TEMP_READ_INTERVAL_MS)) {
         sensors.requestTemperatures();
         conversionRequested = true;
         conversionReqMs = now;
     }
 
-    if (conversionRequested && (now - conversionReqMs >= DS18B20_CONV_TIME_MS)) {
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (conversionRequested && (static_cast<uint32_t>(now - conversionReqMs) >= DS18B20_CONV_TIME_MS)) {
         conversionRequested = false;
         lastTempCycleMs = now;
         updateAllTemperatures();
@@ -414,6 +436,15 @@ void loop() {
                 heartbeatIntervalSec = sanitizeHeartbeatIntervalSec(rxPacket.esp.heartbeatIntervalSec);
                 lastEspOutputsMask   = rxPacket.esp.outputsMask;
 
+                if (rxPacket.esp.timeSyncEpoch > 0UL) {
+                    syncEpoch   = rxPacket.esp.timeSyncEpoch;
+                    syncMillis  = now;
+                    hasTimeSync = true;
+                    syncStale   = false;
+                    Serial.print(F("[NANO] Idoszinkron OK epoch="));
+                    Serial.println(syncEpoch);
+                }
+
                 evaluateLocalSafetyAndAlarm();
                 refreshHardwareOutputs(now);
 
@@ -424,14 +455,22 @@ void loop() {
         }
     }
 
-    // 3. V5 Fail-safe: ha (millis() - lastRequestMs) > 3 * heartbeatIntervalSec * 1000 + 2000
+    // 3. V5 Fail-safe: ha (uint32_t)(now - lastRequestMs) > 3 * heartbeatIntervalSec * 1000 + 2000
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
     uint32_t failsafeTimeoutMs =
         (3UL * static_cast<uint32_t>(heartbeatIntervalSec) * 1000UL) + 2000UL;
 
-    if (!failsafeActive && (now - lastRequestMs > failsafeTimeoutMs)) {
+    if (!failsafeActive && (static_cast<uint32_t>(now - lastRequestMs) > failsafeTimeoutMs)) {
         failsafeActive = true;
         evaluateLocalSafetyAndAlarm();
         Serial.println(F("[NANO] FAIL-SAFE AKTIV: Szivattyu BE, Piros LED villog (nrf_fail)"));
+    }
+
+    // 3b. Időszinkron elavulás ellenőrzése (13 óra szinkron nélkül -> syncStale = true, pumpavédelem érintetlen)
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (hasTimeSync && !syncStale && (static_cast<uint32_t>(now - syncMillis) >= NANO_SYNC_STALE_MS)) {
+        syncStale = true;
+        Serial.println(F("[NANO] Idoszinkron elavult (>13h) - pumpa es fail-safe tovabbra is aktiv."));
     }
 
     // 4. Kimenetek és nem-blokkoló 500ms riasztási villogás frissítése

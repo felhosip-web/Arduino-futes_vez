@@ -121,11 +121,8 @@ private:
     static void formatTimestamp(uint32_t uptimeSec, char* buf, size_t bufLen) {
         if (bufLen == 0) return;
 
-        time_t nowEpoch = time(nullptr);
         struct tm timeinfo{};
-        localtime_r(&nowEpoch, &timeinfo);
-
-        if ((timeinfo.tm_year + 1900) >= 2024) {
+        if (getLocalTime(&timeinfo, 0) && (timeinfo.tm_year + 1900) >= 2024) {
             snprintf(buf, bufLen, "%04d-%02d-%02d %02d:%02d:%02d",
                      timeinfo.tm_year + 1900,
                      timeinfo.tm_mon + 1,

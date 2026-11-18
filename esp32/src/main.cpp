@@ -49,18 +49,31 @@ constexpr uint8_t WIFI_DNS_PORT = 53;
 constexpr const char* WIFI_PORTAL_IP = "192.168.4.1";
 
 // --- Időzítők ---
-uint32_t lastLm35Ms       = 0;
-uint32_t lastHeartbeatMs  = 0;
-uint32_t lastTelemetryMs  = 0;
-uint32_t lastWifiTryMs       = 0;
-uint32_t lastMqttTryMs       = 0;
-uint32_t mqttRetryIntervalMs = MQTT_RECONNECT_MS;
-bool     mqttAttemptedOnce   = false;
-uint32_t lastAlarmBlinkMs    = 0;
+uint32_t lastLm35Ms              = 0;
+uint32_t lastHeartbeatMs         = 0;
+uint32_t lastTelemetryMs         = 0;
+uint32_t lastWifiTryMs           = 0;
+uint32_t lastMqttTryMs           = 0;
+uint32_t mqttRetryIntervalMs     = MQTT_RECONNECT_MS;
+bool     mqttAttemptedOnce       = false;
+uint32_t lastAlarmBlinkMs        = 0;
 uint32_t wifiDisconnectStartedMs = 0;
-uint32_t lastWifiPortalTryMs = 0;
-bool     alarmBlinkOn     = false;
-bool     wifiPortalActive = false;
+uint32_t lastWifiPortalTryMs     = 0;
+uint32_t lastNtpAttemptMs        = 0;
+uint32_t syncRetryStartMs        = 0;
+uint32_t pendingTimeSyncEpoch    = 0;
+uint32_t lastTrendSampleMs       = 0;
+uint32_t uptimePrevMs            = 0;
+uint64_t uptimeTotalMs           = 0;
+int      lastScheduledYday       = -1;
+int      lastScheduledSlot       = -1;
+float    trendSamples[TREND_BUFFER_SIZE] = { 0 };
+uint8_t  trendHead               = 0;
+bool     bootSyncDone            = false;
+bool     syncRetryWaiting        = false;
+bool     ntpInitialTimeoutLogged = false;
+bool     alarmBlinkOn            = false;
+bool     wifiPortalActive        = false;
 bool     wifiDisconnectTimerActive = false;
 bool     wifiConnectionFailureReported = false;
 bool     mqttStatusPendingRetry    = false;
@@ -172,7 +185,8 @@ void IRAM_ATTR isrEncoderRotate() {
 
 void IRAM_ATTR isrEncoderButton() {
     uint32_t now = millis();
-    if (now - isrBtnEdgeMs >= BTN_DEBOUNCE_MS) {
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (static_cast<uint32_t>(now - isrBtnEdgeMs) >= BTN_DEBOUNCE_MS) {
         isrBtnLevelLow    = (digitalRead(PIN_ENC_SW) == LOW);
         isrBtnEdgeMs      = now;
         isrBtnEdgePending = true;
@@ -764,8 +778,9 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
     bool modeAutoRestored = false;
 
     // 10 perces manual_off automatikus visszaállás
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
     if (state.pumpConfig.pumpMode == PUMP_MODE_MANUAL_OFF) {
-        if (now - state.manualOffStartMs >= PUMP_MANUAL_OFF_TIMEOUT_MS) {
+        if (static_cast<uint32_t>(now - state.manualOffStartMs) >= PUMP_MANUAL_OFF_TIMEOUT_MS) {
             state.pumpConfig.pumpMode = PUMP_MODE_AUTO;
             modeAutoRestored = true;
             logEvent(LOG_INFO, "PUMP_AUTO", "10p letelt, manual_off->auto");
@@ -882,12 +897,16 @@ void updateAlarmBlinkAndLed(uint32_t now) {
         return;
     }
 
-    if (now - lastAlarmBlinkMs >= ALARM_BLINK_INTERVAL_MS) {
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (static_cast<uint32_t>(now - lastAlarmBlinkMs) >= ALARM_BLINK_INTERVAL_MS) {
         lastAlarmBlinkMs = now;
         alarmBlinkOn = !alarmBlinkOn;
     }
     digitalWrite(PIN_ALARM_LED, alarmBlinkOn ? HIGH : LOW);
 }
+
+// Forward declarations a szinkronizációhoz
+bool publishMqttStatus();
 
 // ============================================================================
 // V5 MASTER-SLAVE NRF24 KOMMUNIKÁCIÓ (REQUEST 0xA1 -> RESPONSE 0xB2)
@@ -897,6 +916,8 @@ bool sendRequestToNano() {
     if (state.txSeq == 0) {
         state.txSeq = 1;
     }
+
+    uint32_t syncEpochToSend = pendingTimeSyncEpoch;
 
     NrfPacket tx{};
     tx.packetType               = PKT_TYPE_REQUEST;
@@ -908,6 +929,7 @@ bool sendRequestToNano() {
     tx.esp.alarmConfig          = state.alarmConfig;
     tx.esp.heartbeatIntervalSec = state.heartbeatIntervalSec;
     tx.esp.seq                  = state.txSeq;
+    tx.esp.timeSyncEpoch        = syncEpochToSend;
 
     bool anyWriteOk = false;
 
@@ -923,7 +945,8 @@ bool sendRequestToNano() {
         radio.startListening();
 
         uint32_t waitStartMs = millis();
-        while (millis() - waitStartMs < NRF_RESPONSE_TIMEOUT_MS) {
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        while (static_cast<uint32_t>(millis() - waitStartMs) < NRF_RESPONSE_TIMEOUT_MS) {
             updateAlarmBlinkAndLed(millis());
 
             if (radio.available()) {
@@ -933,6 +956,7 @@ bool sendRequestToNano() {
                 if (rx.packetType == PKT_TYPE_RESPONSE && rx.nano.seq == tx.esp.seq) {
                     radio.stopListening();
 
+                    uint32_t rxNowMs      = millis();
                     state.eloremeno       = rx.nano.eloremeno;
                     state.visszatero      = rx.nano.visszatero;
                     state.kazan           = rx.nano.kazan;
@@ -940,9 +964,67 @@ bool sendRequestToNano() {
                     state.nanoCounter     = rx.nano.counter;
                     state.sensorValidMask = rx.nano.sensorValidMask;
                     state.nanoAlarmState  = rx.nano.alarmState;
+                    state.hasNrfResponse  = true;
+                    state.lastNrfResponseMs = rxNowMs;
 
                     for (uint8_t b = 0; b < 8; b++) {
                         state.kazanStatus[b] = getBit(rx.nano.kazanStatusMask, b) ? 1 : 0;
+                    }
+
+                    // Napi max/min/átlag frissítése minden érvényes előremenő mérésnél
+                    if (isSensorValid(state.eloremeno)) {
+                        char hhmm[6] = { 0 };
+                        if (state.ntpSynced) {
+                            struct tm tmStat{};
+                            if (getLocalTime(&tmStat, 0) && (tmStat.tm_year + 1900 >= 2024)) {
+                                snprintf(hhmm, sizeof(hhmm), "%02d:%02d", tmStat.tm_hour, tmStat.tm_min);
+                            }
+                        }
+                        if (state.eloremenoCount == 0 || state.eloremeno > state.eloremenoMax) {
+                            state.eloremenoMax = state.eloremeno;
+                            if (hhmm[0] != '\0') {
+                                strncpy(state.eloremenoMaxAt, hhmm, sizeof(state.eloremenoMaxAt) - 1);
+                            } else {
+                                state.eloremenoMaxAt[0] = '\0';
+                            }
+                        }
+                        if (state.eloremenoCount == 0 || state.eloremeno < state.eloremenoMin) {
+                            state.eloremenoMin = state.eloremeno;
+                            if (hhmm[0] != '\0') {
+                                strncpy(state.eloremenoMinAt, hhmm, sizeof(state.eloremenoMinAt) - 1);
+                            } else {
+                                state.eloremenoMinAt[0] = '\0';
+                            }
+                        }
+                        state.eloremenoSum += static_cast<double>(state.eloremeno);
+                        state.eloremenoCount++;
+                    }
+
+                    bool ackFlag   = (rx.nano.syncFlags & SYNC_FLAG_ACK) != 0;
+                    bool staleFlag = (rx.nano.syncFlags & SYNC_FLAG_STALE) != 0;
+                    state.nanoSynced    = ackFlag;
+                    state.nanoSyncStale = staleFlag;
+
+                    if (syncEpochToSend != 0) {
+                        uint16_t expectedLow16 = static_cast<uint16_t>(syncEpochToSend & 0xFFFFU);
+                        if (ackFlag && rx.nano.syncEpochLow16 == expectedLow16) {
+                            state.lastNanoSyncEpoch   = syncEpochToSend;
+                            state.lastNanoSyncMs      = rxNowMs;
+                            state.lastNanoSyncSuccess = true;
+                            pendingTimeSyncEpoch      = 0;
+                            syncRetryWaiting          = false;
+                            logEvent(LOG_INFO, "NANO_SYNC", "Nano idoszinkron OK");
+                        } else {
+                            state.lastNanoSyncSuccess = false;
+                            pendingTimeSyncEpoch      = 0;
+                            syncRetryWaiting          = true;
+                            syncRetryStartMs          = rxNowMs;
+                            logEvent(LOG_WARN, "SYNC_FAIL", "Nano szinkron ACK hiba, 1h mulva ujra");
+                        }
+                    } else if (!ackFlag && state.ntpSynced && state.lastNanoSyncEpoch != 0 && !syncRetryWaiting) {
+                        // A Nano újraindult és elvesztette a szinkront: következő ciklusban automatikus újraszinkron
+                        state.lastNanoSyncEpoch = 0;
+                        bootSyncDone = false;
                     }
 
                     state.consecutiveMissedPings = 0;
@@ -959,6 +1041,14 @@ bool sendRequestToNano() {
         }
 
         radio.stopListening();
+    }
+
+    if (syncEpochToSend != 0) {
+        state.lastNanoSyncSuccess = false;
+        pendingTimeSyncEpoch      = 0;
+        syncRetryWaiting          = true;
+        syncRetryStartMs          = millis();
+        logEvent(LOG_WARN, "SYNC_FAIL", "Nano szinkron sikertelen, 1h mulva ujra");
     }
 
     if (!anyWriteOk) {
@@ -1003,9 +1093,65 @@ bool sendRequestToNano() {
 }
 
 // ============================================================================
-// MQTT JSON STATUS & TELEMETRY PUBLISH (V5)
+// IDŐFORMÁZÓ SEGÉDEK + MQTT JSON STATUS & TELEMETRY PUBLISH (V5)
 // ============================================================================
+void formatEpochTimeStr(uint32_t epochSec, char* out, size_t len) {
+    if (!out || len == 0) return;
+    time_t t = static_cast<time_t>(epochSec);
+    struct tm tmLocal{};
+    if (localtime_r(&t, &tmLocal)) {
+        strftime(out, len, "%Y-%m-%d %H:%M:%S", &tmLocal);
+    } else {
+        snprintf(out, len, "UP %lus", static_cast<unsigned long>(uptimeTotalMs / 1000ULL));
+    }
+}
+
+void formatEspCurrentTimeStr(char* out, size_t len, uint32_t uptimeSec) {
+    if (!out || len == 0) return;
+    if (state.ntpSynced) {
+        struct tm tmLocal{};
+        if (getLocalTime(&tmLocal, 0) && (tmLocal.tm_year + 1900 >= 2024)) {
+            strftime(out, len, "%Y-%m-%d %H:%M:%S", &tmLocal);
+            return;
+        }
+    }
+    snprintf(out, len, "UP %lus", static_cast<unsigned long>(uptimeSec));
+}
+
+bool computeNextSyncTimeStr(char* out, size_t len) {
+    if (!out || len == 0 || !state.ntpSynced) return false;
+    struct tm tmNow{};
+    if (!getLocalTime(&tmNow, 0) || (tmNow.tm_year + 1900 < 2024)) {
+        return false;
+    }
+
+    struct tm tmTarget = tmNow;
+    tmTarget.tm_sec = 0;
+    tmTarget.tm_min = 0;
+    tmTarget.tm_isdst = -1;
+    if (tmNow.tm_hour < 12) {
+        tmTarget.tm_hour = 12;
+    } else {
+        tmTarget.tm_hour = 0;
+        tmTarget.tm_mday += 1;
+    }
+
+    time_t nextEpoch = mktime(&tmTarget);
+    if (nextEpoch == static_cast<time_t>(-1)) {
+        return false;
+    }
+    struct tm tmNext{};
+    if (!localtime_r(&nextEpoch, &tmNext)) {
+        return false;
+    }
+    strftime(out, len, "%Y-%m-%d %H:%M:%S", &tmNext);
+    return true;
+}
+
 void buildStatusJson(JsonDocument& doc) {
+    uint32_t now = millis();
+    uint32_t uptimeSec = static_cast<uint32_t>(uptimeTotalMs / 1000ULL);
+
     doc["currentTemp"] = round1(state.currentTemp);
     doc["targetTemp"]  = round1(state.targetTemp);
     doc["heatingOn"]   = state.heatingOn;
@@ -1057,6 +1203,93 @@ void buildStatusJson(JsonDocument& doc) {
 
     doc["nrf24_ok"] = state.nrf24Ok;
 
+    char espTimeBuf[24];
+    formatEspCurrentTimeStr(espTimeBuf, sizeof(espTimeBuf), uptimeSec);
+
+    JsonObject timeObj = doc["time"].to<JsonObject>();
+    timeObj["espNtpSynced"] = state.ntpSynced;
+    timeObj["espTime"]      = espTimeBuf;
+    timeObj["espUptimeSec"] = uptimeSec;
+
+    JsonObject syncObj = doc["sync"].to<JsonObject>();
+    syncObj["ntpSynced"]  = state.ntpSynced;
+    syncObj["espTime"]    = espTimeBuf;
+    syncObj["nanoSynced"] = state.nanoSynced;
+
+    if (state.nanoSynced && state.lastNanoSyncEpoch > 0) {
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        uint32_t elapsedSec = static_cast<uint32_t>(now - state.lastNanoSyncMs) / 1000UL;
+        uint32_t nanoEpoch  = state.lastNanoSyncEpoch + elapsedSec;
+        char nanoTimeBuf[24];
+        formatEpochTimeStr(nanoEpoch, nanoTimeBuf, sizeof(nanoTimeBuf));
+        syncObj["nanoTime"]  = nanoTimeBuf;
+        syncObj["nanoStale"] = state.nanoSyncStale || (elapsedSec >= NANO_SYNC_STALE_SEC);
+    } else {
+        syncObj["nanoTime"]  = nullptr;
+        syncObj["nanoStale"] = false;
+    }
+
+    if (state.lastNanoSyncEpoch > 0) {
+        char lastSyncBuf[24];
+        formatEpochTimeStr(state.lastNanoSyncEpoch, lastSyncBuf, sizeof(lastSyncBuf));
+        syncObj["lastSync"] = lastSyncBuf;
+    } else {
+        syncObj["lastSync"] = nullptr;
+    }
+
+    char nextSyncBuf[24];
+    if (computeNextSyncTimeStr(nextSyncBuf, sizeof(nextSyncBuf))) {
+        syncObj["nextSync"] = nextSyncBuf;
+    } else {
+        syncObj["nextSync"] = nullptr;
+    }
+
+    syncObj["syncSuccess"] = state.lastNanoSyncSuccess;
+    syncObj["millisOverflowInDays"] =
+        static_cast<uint32_t>((4294967295ULL - static_cast<uint64_t>(now)) / 86400000ULL);
+
+    if (state.hasNrfResponse) {
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        syncObj["pingAgeSec"] = static_cast<uint32_t>(now - state.lastNrfResponseMs) / 1000UL;
+    } else {
+        syncObj["pingAgeSec"] = nullptr;
+    }
+
+    const char* trendDirStr = "flat";
+    if (state.trendDir == TREND_UP)        trendDirStr = "up";
+    else if (state.trendDir == TREND_DOWN) trendDirStr = "down";
+
+    JsonObject trendObj = doc["trend"].to<JsonObject>();
+    trendObj["eloremeno"] = trendDirStr;
+    trendObj["delta"]     = round1(state.trendDelta);
+    if (state.eloremenoCount > 0) {
+        float avg = static_cast<float>(state.eloremenoSum / static_cast<double>(state.eloremenoCount));
+        trendObj["max"] = round1(state.eloremenoMax);
+        trendObj["min"] = round1(state.eloremenoMin);
+        trendObj["avg"] = round1(avg);
+    } else {
+        trendObj["max"] = nullptr;
+        trendObj["min"] = nullptr;
+        trendObj["avg"] = nullptr;
+    }
+    if (state.ntpSynced && state.eloremenoMaxAt[0] != '\0') {
+        trendObj["maxAt"] = state.eloremenoMaxAt;
+    } else {
+        trendObj["maxAt"] = nullptr;
+    }
+    if (state.ntpSynced && state.eloremenoMinAt[0] != '\0') {
+        trendObj["minAt"] = state.eloremenoMinAt;
+    } else {
+        trendObj["minAt"] = nullptr;
+    }
+    if (state.ntpSynced && state.statsSinceStr[0] != '\0') {
+        char sinceWithSuffix[32];
+        snprintf(sinceWithSuffix, sizeof(sinceWithSuffix), "%s \xC3\xB3ta", state.statsSinceStr);
+        trendObj["since"] = sinceWithSuffix;
+    } else {
+        trendObj["since"] = "Boot \xC3\xB3ta";
+    }
+
     if (!state.nrf24Ok && state.consecutiveMissedPings >= NRF_MAX_MISSED_CYCLES) {
         doc["error"] = "NRF24 kommunikacios hiba (3 ping kimaradt)";
     } else if (state.safetyOverheat) {
@@ -1075,7 +1308,7 @@ bool publishMqttStatus() {
     }
     JsonDocument doc;
     buildStatusJson(doc);
-    char payload[1536];
+    char payload[2048];
     size_t n = serializeJson(doc, payload, sizeof(payload));
     if (n == 0) {
         mqttStatusPendingRetry = true;
@@ -1101,7 +1334,7 @@ bool publishMqttTelemetry() {
     JsonDocument doc;
     buildStatusJson(doc);
     doc["nanoCounter"] = state.nanoCounter;
-    char payload[1536];
+    char payload[2048];
     size_t n = serializeJson(doc, payload, sizeof(payload));
     if (n == 0) {
         mqttTelemetryPendingRetry = true;
@@ -1212,6 +1445,36 @@ void onMenuFactoryReset() {
     publishMqttStatus();
 }
 
+void resetEloremenoStats(const char* logCode, const char* logMsg) {
+    state.eloremenoMax      = -999.0f;
+    state.eloremenoMin      = 999.0f;
+    state.eloremenoSum      = 0.0;
+    state.eloremenoCount    = 0;
+    state.eloremenoMaxAt[0] = '\0';
+    state.eloremenoMinAt[0] = '\0';
+
+    if (state.ntpSynced) {
+        time_t epochNow = time(nullptr);
+        if (epochNow >= 1700000000) {
+            formatEpochTimeStr(static_cast<uint32_t>(epochNow),
+                               state.statsSinceStr,
+                               sizeof(state.statsSinceStr));
+        } else {
+            state.statsSinceStr[0] = '\0';
+        }
+    } else {
+        state.statsSinceStr[0] = '\0';
+    }
+
+    logEvent(LOG_INFO, logCode, logMsg);
+    publishMqttStatus();
+    menu.requestRedraw();
+}
+
+void onMenuTrendReset() {
+    resetEloremenoStats("TREND_RESET_BY_MENU", "Statisztika nullazva (menu)");
+}
+
 // ============================================================================
 // MQTT CMD FELDOLGOZÁS (Frontend -> ESP)
 // ============================================================================
@@ -1274,6 +1537,27 @@ void logMqttSettingChanges(const SystemState& prev, const SystemState& next) {
     }
 }
 
+void triggerNanoTimeSync() {
+    if (!state.ntpSynced) {
+        return;
+    }
+    time_t epochNow = time(nullptr);
+    if (epochNow < 1700000000) {
+        return;
+    }
+    uint32_t now = millis();
+    pendingTimeSyncEpoch = static_cast<uint32_t>(epochNow);
+    syncRetryWaiting     = false;
+
+    sendRequestToNano();
+    lastHeartbeatMs = millis();
+    evaluateBoilerPumpProtection(lastHeartbeatMs);
+    updateAlarmBlinkAndLed(lastHeartbeatMs);
+    publishMqttStatus();
+    menu.requestRedraw();
+    (void)now;
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if (strcmp(topic, TOPIC_CMD) != 0) return;
 
@@ -1298,6 +1582,36 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             logger.clear();
             logEvent(LOG_INFO, "LOGS_CLEARED", "Naplo uritve (mqtt)");
             menu.requestRedraw();
+            return;
+        }
+        if (strcmp(action, "forceSync") == 0) {
+            logEvent(LOG_INFO, "FORCE_SYNC", "Idoszinkron keres (mqtt)");
+            if (!state.ntpSynced && WiFi.status() == WL_CONNECTED) {
+                configTime(3600, 3600, NTP_SERVER_1, NTP_SERVER_2);
+                setenv("TZ", NTP_TZ_INFO, 1);
+                tzset();
+                ntpConfigured = true;
+                ntpInitialTimeoutLogged = false;
+                lastNtpAttemptMs = millis();
+                struct tm tmCheck{};
+                if (getLocalTime(&tmCheck, 0) && (tmCheck.tm_year + 1900 >= 2024)) {
+                    state.ntpSynced = true;
+                    state.lastNtpSyncEpoch = static_cast<uint32_t>(time(nullptr));
+                    logEvent(LOG_INFO, "NTP_OK", "NTP idoszinkron kesz");
+                }
+            }
+            if (state.ntpSynced) {
+                bootSyncDone = true;
+                triggerNanoTimeSync();
+            } else {
+                bootSyncDone = false;
+                syncRetryWaiting = false;
+                publishMqttStatus();
+            }
+            return;
+        }
+        if (strcmp(action, "resetTrend") == 0) {
+            resetEloremenoStats("TREND_RESET_BY_FRONTEND", "Statisztika nullazva (frontend)");
             return;
         }
     }
@@ -1524,6 +1838,79 @@ void loadWifiCredentials() {
     wifiPrefs.end();
 }
 
+void startNtpSync(uint32_t now) {
+    configTime(3600, 3600, NTP_SERVER_1, NTP_SERVER_2);
+    setenv("TZ", NTP_TZ_INFO, 1);
+    tzset();
+    ntpConfigured    = true;
+    lastNtpAttemptMs = now;
+}
+
+void maintainTimeAndSync(uint32_t now) {
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!ntpConfigured) {
+            startNtpSync(now);
+        }
+
+        struct tm tmNow{};
+        if (getLocalTime(&tmNow, 0) && (tmNow.tm_year + 1900 >= 2024)) {
+            time_t epochNow = time(nullptr);
+            if (!state.ntpSynced) {
+                state.ntpSynced = true;
+                state.lastNtpSyncEpoch = static_cast<uint32_t>(epochNow);
+                logEvent(LOG_INFO, "NTP_OK", "NTP idoszinkron kesz");
+                publishMqttStatus();
+                menu.requestRedraw();
+            } else {
+                state.lastNtpSyncEpoch = static_cast<uint32_t>(epochNow);
+            }
+
+            // Statisztika kezdőidőpont beállítása egyszer (boot időpont NTP-vel, nincs éjféli nullázás)
+            if (state.statsSinceStr[0] == '\0') {
+                uint32_t upSec = static_cast<uint32_t>(uptimeTotalMs / 1000ULL);
+                uint32_t startEp = (static_cast<uint32_t>(epochNow) > upSec)
+                                       ? (static_cast<uint32_t>(epochNow) - upSec)
+                                       : static_cast<uint32_t>(epochNow);
+                formatEpochTimeStr(startEp, state.statsSinceStr, sizeof(state.statsSinceStr));
+            }
+
+            // Boot utáni egyszeri ESP-Nano szinkronizáció
+            if (!bootSyncDone) {
+                bootSyncDone = true;
+                triggerNanoTimeSync();
+            }
+
+            // Naponta 2x (00:00 és 12:00 helyi idő szerint) szinkronizáció
+            if ((tmNow.tm_hour == 0 || tmNow.tm_hour == 12) && tmNow.tm_min == 0) {
+                int slot = tmNow.tm_hour;
+                if (lastScheduledYday != tmNow.tm_yday || lastScheduledSlot != slot) {
+                    lastScheduledYday = tmNow.tm_yday;
+                    lastScheduledSlot = slot;
+                    triggerNanoTimeSync();
+                }
+            }
+
+            // Sikertelen szinkron 1 óra múlva történő újrapróbálása
+            // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+            if (syncRetryWaiting &&
+                static_cast<uint32_t>(now - syncRetryStartMs) >= SYNC_RETRY_INTERVAL_MS) {
+                triggerNanoTimeSync();
+            }
+        } else if (!state.ntpSynced) {
+            // Nem-blokkoló max 5 mp timeout ellenőrzés + 60 mp újrapróbálkozás
+            // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+            if (!ntpInitialTimeoutLogged &&
+                static_cast<uint32_t>(now - lastNtpAttemptMs) >= NTP_TIMEOUT_MS) {
+                ntpInitialTimeoutLogged = true;
+                logEvent(LOG_WARN, "NTP_WAIT", "NTP varakozas, ujraproba 60mp");
+            }
+            if (static_cast<uint32_t>(now - lastNtpAttemptMs) >= NTP_RETRY_INTERVAL_MS) {
+                startNtpSync(now);
+            }
+        }
+    }
+}
+
 void maintainConnectivity(uint32_t now) {
     if (wifiPortalActive) {
         wifiPortalDns.processNextRequest();
@@ -1540,8 +1927,9 @@ void maintainConnectivity(uint32_t now) {
             logEvent(LOG_WARN, "MQTT_LOST", "MQTT kapcsolat megszakadt");
         }
 
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
         if (wifiSsid.length() == 0) {
-            if (!wifiPortalActive && now - lastWifiPortalTryMs >= WIFI_RECONNECT_MS) {
+            if (!wifiPortalActive && static_cast<uint32_t>(now - lastWifiPortalTryMs) >= WIFI_RECONNECT_MS) {
                 beginWifiPortal("Válaszd ki az otthoni Wi-Fi hálózatot.");
             }
             return;
@@ -1553,18 +1941,18 @@ void maintainConnectivity(uint32_t now) {
         }
 
         if (wifiPortalActive && !wifiConnectionFailureReported &&
-            now - wifiDisconnectStartedMs >= WIFI_PORTAL_TIMEOUT_MS) {
+            static_cast<uint32_t>(now - wifiDisconnectStartedMs) >= WIFI_PORTAL_TIMEOUT_MS) {
             wifiPortalMessage = "Nem sikerült csatlakozni. Ellenőrizd a hálózatnevet/jelszót, majd próbáld újra.";
             wifiConnectionFailureReported = true;
         }
 
         if (!wifiPortalActive &&
-            now - wifiDisconnectStartedMs >= WIFI_PORTAL_TIMEOUT_MS &&
-            now - lastWifiPortalTryMs >= WIFI_RECONNECT_MS) {
+            static_cast<uint32_t>(now - wifiDisconnectStartedMs) >= WIFI_PORTAL_TIMEOUT_MS &&
+            static_cast<uint32_t>(now - lastWifiPortalTryMs) >= WIFI_RECONNECT_MS) {
             beginWifiPortal("Nem sikerült csatlakozni a mentett hálózathoz. Add meg a Wi-Fi adatokat.");
         }
 
-        if (now - lastWifiTryMs >= WIFI_RECONNECT_MS) {
+        if (static_cast<uint32_t>(now - lastWifiTryMs) >= WIFI_RECONNECT_MS) {
             lastWifiTryMs = now;
             logEvent(LOG_INFO, "WIFI_RETRY", "WiFi ujracsatlakozas");
             WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
@@ -1575,8 +1963,7 @@ void maintainConnectivity(uint32_t now) {
     if (!prevWifiConnected) {
         prevWifiConnected = true;
         if (!ntpConfigured) {
-            configTzTime(NTP_TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
-            ntpConfigured = true;
+            startNtpSync(now);
         }
         logEvent(LOG_INFO, "WIFI_OK", "WiFi csatlakozva");
     }
@@ -1592,7 +1979,8 @@ void maintainConnectivity(uint32_t now) {
             logEvent(LOG_WARN, "MQTT_LOST", "MQTT kapcsolat megszakadt");
         }
 
-        if (!mqttAttemptedOnce || (now - lastMqttTryMs >= mqttRetryIntervalMs)) {
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        if (!mqttAttemptedOnce || (static_cast<uint32_t>(now - lastMqttTryMs) >= mqttRetryIntervalMs)) {
             mqttAttemptedOnce = true;
             lastMqttTryMs     = now;
 
@@ -1668,7 +2056,8 @@ void processEncoderAndButton(uint32_t now) {
             btnLongFired    = false;
             btnFactoryFired = false;
         } else if (!edgeLow && btnIsDown) {
-            uint32_t heldMs = edgeMs - btnDownStartMs;
+            // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+            uint32_t heldMs = static_cast<uint32_t>(edgeMs - btnDownStartMs);
             if (!btnLongFired && !btnFactoryFired) {
                 if (heldMs < SHORT_PRESS_MAX_MS) {
                     shortPress = true;
@@ -1683,8 +2072,9 @@ void processEncoderAndButton(uint32_t now) {
     // Folyamatos nyomva tartás kezelése (hosszú nyomás >1000ms vagy 3mp gyári visszaállítás)
     if (btnIsDown) {
         // Védelem esetleges elmaradt felfutó él ellen
-        if (digitalRead(PIN_ENC_SW) == HIGH && (now - lastBtnPollGuardMs >= BTN_DEBOUNCE_MS)) {
-            uint32_t heldMs = now - btnDownStartMs;
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        if (digitalRead(PIN_ENC_SW) == HIGH && (static_cast<uint32_t>(now - lastBtnPollGuardMs) >= BTN_DEBOUNCE_MS)) {
+            uint32_t heldMs = static_cast<uint32_t>(now - btnDownStartMs);
             if (!btnLongFired && !btnFactoryFired) {
                 if (heldMs < SHORT_PRESS_MAX_MS) {
                     shortPress = true;
@@ -1695,7 +2085,7 @@ void processEncoderAndButton(uint32_t now) {
             btnIsDown = false;
         } else {
             lastBtnPollGuardMs = now;
-            uint32_t heldMs = now - btnDownStartMs;
+            uint32_t heldMs = static_cast<uint32_t>(now - btnDownStartMs);
             if (menu.isOnFactoryResetItem()) {
                 if (!btnFactoryFired && heldMs >= FACTORY_RESET_HOLD_MS) {
                     btnFactoryFired = true;
@@ -1742,7 +2132,7 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_SW),  isrEncoderButton, CHANGE);
 
     lcd.begin();
-    menu.begin(&lcd, &state, { onMenuSettingCommitted, onMenuFactoryReset });
+    menu.begin(&lcd, &state, { onMenuSettingCommitted, onMenuFactoryReset, onMenuTrendReset });
 
     spiNrf.begin(PIN_NRF_SCK, PIN_NRF_MISO, PIN_NRF_MOSI, PIN_NRF_CSN);
     if (!radio.begin(&spiNrf)) {
@@ -1762,7 +2152,10 @@ void setup() {
     }
 
     uint32_t now = millis();
+    uptimePrevMs     = now;
+    uptimeTotalMs    = now;
     lastAlarmBlinkMs = now;
+    lastTrendSampleMs = now;
     evaluateRoomHeatingIndicator();
     evaluateBoilerPumpProtection(now);
     sendRequestToNano();
@@ -1770,6 +2163,7 @@ void setup() {
     evaluateBoilerPumpProtection(lastHeartbeatMs);
     updateAlarmBlinkAndLed(lastHeartbeatMs);
     lcd.setStatusIcons(state.pumpOn, state.nrf24Ok, false);
+    lcd.setTrend(state.trendDir);
     menu.requestRedraw();
     menu.update(lastHeartbeatMs, alarmBlinkOn);
     lcd.refresh(lastHeartbeatMs);
@@ -1801,6 +2195,9 @@ void setup() {
 
 void loop() {
     uint32_t now = millis();
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    uptimeTotalMs += static_cast<uint32_t>(now - uptimePrevMs);
+    uptimePrevMs = now;
 
     // 0. Nem-blokkoló 500ms riasztási LED villogás
     updateAlarmBlinkAndLed(now);
@@ -1812,7 +2209,8 @@ void loop() {
     processEncoderAndButton(now);
 
     // 2. LM35 szobahő mérés és szobafűtés-jelzés (1 mp-enként)
-    if (now - lastLm35Ms >= LM35_READ_INTERVAL_MS) {
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (static_cast<uint32_t>(now - lastLm35Ms) >= LM35_READ_INTERVAL_MS) {
         lastLm35Ms = now;
         float prevTemp = state.currentTemp;
         bool prevHeat  = state.heatingOn;
@@ -1836,7 +2234,8 @@ void loop() {
 
     // 3. V5 Master-Slave Heartbeat ping minden heartbeatIntervalSec másodpercben
     uint32_t heartbeatIntervalMs = static_cast<uint32_t>(state.heartbeatIntervalSec) * 1000UL;
-    if (now - lastHeartbeatMs >= heartbeatIntervalMs) {
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (static_cast<uint32_t>(now - lastHeartbeatMs) >= heartbeatIntervalMs) {
         lastHeartbeatMs = now;
 
         bool prevNrfOk       = state.nrf24Ok;
@@ -1868,17 +2267,60 @@ void loop() {
         }
     }
 
-    // 4. Nem-blokkoló LCD és menü frissítés (ikonok + 100ms-es millis() ciklus)
+    // 4. Nem-blokkoló LCD és menü frissítés (ikonok + trend + 100ms-es millis() ciklus)
     bool wifiMqttOk = (WiFi.status() == WL_CONNECTED) && mqtt.connected();
     lcd.setStatusIcons(state.pumpOn, state.nrf24Ok, wifiMqttOk);
+    lcd.setTrend(state.trendDir);
     menu.update(now, alarmBlinkOn);
     lcd.refresh(now);
 
-    // 5. WiFi és HiveMQ Cloud MQTT karbantartás
+    // 5. WiFi, NTP, ESP-Nano szinkron és HiveMQ Cloud MQTT karbantartás
     maintainConnectivity(now);
+    maintainTimeAndSync(now);
 
-    // 6. Telemetry 30 másodpercenként
-    if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+    // 6. Előremenő trend mintavétel és számítás (60 mp-enként, 20 elemű körkörös puffer)
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (static_cast<uint32_t>(now - lastTrendSampleMs) >= TREND_SAMPLE_INTERVAL_MS) {
+        lastTrendSampleMs = now;
+        if (state.nrf24Ok && isSensorValid(state.eloremeno)) {
+            trendSamples[trendHead] = state.eloremeno;
+            trendHead = static_cast<uint8_t>((trendHead + 1) % TREND_BUFFER_SIZE);
+            if (state.trendSampleCount < TREND_BUFFER_SIZE) {
+                state.trendSampleCount++;
+            }
+        }
+
+        uint8_t prevTrendDir = state.trendDir;
+        if (state.trendSampleCount < TREND_BUFFER_SIZE) {
+            state.trendDir   = TREND_FLAT;
+            state.trendDelta = 0.0f;
+        } else {
+            float sumPrev10 = 0.0f;
+            float sumLast10 = 0.0f;
+            for (uint8_t i = 0; i < 10; i++) {
+                sumPrev10 += trendSamples[(trendHead + i) % TREND_BUFFER_SIZE];
+                sumLast10 += trendSamples[(trendHead + 10 + i) % TREND_BUFFER_SIZE];
+            }
+            float delta = (sumLast10 / 10.0f) - (sumPrev10 / 10.0f);
+            state.trendDelta = round1(delta);
+            if (delta > TREND_THRESHOLD_C) {
+                state.trendDir = TREND_UP;
+            } else if (delta < -TREND_THRESHOLD_C) {
+                state.trendDir = TREND_DOWN;
+            } else {
+                state.trendDir = TREND_FLAT;
+            }
+        }
+
+        lcd.setTrend(state.trendDir);
+        if (prevTrendDir != state.trendDir) {
+            publishMqttStatus();
+        }
+    }
+
+    // 7. Telemetry 30 másodpercenként
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (static_cast<uint32_t>(now - lastTelemetryMs) >= TELEMETRY_INTERVAL_MS) {
         lastTelemetryMs = now;
         publishMqttTelemetry();
     }

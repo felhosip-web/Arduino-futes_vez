@@ -103,8 +103,8 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 
 | Struktúra (31 byte payload) | Mezők pontos sorrendben | Leírás |
 | :--- | :--- | :--- |
-| **`EspToNanoPayload`** | `outputsMask`, `targetTemp`, `mode`, `manualHeating`, `pumpConfig`, `alarmConfig`, `heartbeatIntervalSec`, `seq`, `reserved[4]` | Az ESP32 kimeneti bitmaszkja, termosztát, szivattyú-, riasztás- és ping beállításai, valamint a növekvő `seq` sorszám. |
-| **`NanoToEspPayload`** | `eloremeno`, `visszatero`, `kazan`, `kulteri`, `kazanStatusMask`, `counter`, `seq`, `sensorValidMask`, `alarmState`, `reserved[3]` | A 4 mért hőfok (`-127.0f` hiba esetén), az 1 byte-os `kazanStatusMask` (amelyet az ESP32 bont vissza 8 elemű `kazan_status` tömbbé), a válasz `counter`, a szenzor-érvényességi maszk, az `alarmState`, és az eredeti `seq`. |
+| **`EspToNanoPayload`** | `outputsMask`, `targetTemp`, `mode`, `manualHeating`, `pumpConfig`, `alarmConfig`, `heartbeatIntervalSec`, `seq`, `timeSyncEpoch` | Az ESP32 kimeneti bitmaszkja, termosztát, szivattyú-, riasztás- és ping beállításai, a növekvő `seq` sorszám, valamint a 4 byte-os `timeSyncEpoch` időszinkron érték. |
+| **`NanoToEspPayload`** | `eloremeno`, `visszatero`, `kazan`, `kulteri`, `kazanStatusMask`, `counter`, `seq`, `sensorValidMask`, `alarmState`, `syncFlags`, `syncEpochLow16` | A 4 mért hőfok (`-127.0f` hiba esetén), az 1 byte-os `kazanStatusMask` (amelyet az ESP32 bont vissza 8 elemű `kazan_status` tömbbé), a válasz `counter`, a szenzor-érvényességi maszk, az `alarmState`, a `syncFlags` (`ACK`/`STALE`) + `syncEpochLow16`, és az eredeti `seq`. |
 
 ### MQTT topicok (HiveMQ Cloud TLS 8883)
 
@@ -195,6 +195,33 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
     "intervalSec": 5
   },
   "nrf24_ok": true,
+  "time": {
+    "espNtpSynced": true,
+    "espTime": "2026-11-17 12:00:00",
+    "espUptimeSec": 12345
+  },
+  "sync": {
+    "ntpSynced": true,
+    "espTime": "2026-11-17 12:00:00",
+    "nanoSynced": true,
+    "nanoTime": "2026-11-17 12:00:02",
+    "nanoStale": false,
+    "lastSync": "2026-11-17 12:00:00",
+    "nextSync": "2026-11-18 00:00:00",
+    "syncSuccess": true,
+    "millisOverflowInDays": 42,
+    "pingAgeSec": 3
+  },
+  "trend": {
+    "eloremeno": "up",
+    "delta": 1.2,
+    "max": 58.4,
+    "min": 22.1,
+    "avg": 41.3,
+    "maxAt": "14:32",
+    "minAt": "06:15",
+    "since": "2026-11-17 08:12:00 óta"
+  },
   "error": null
 }
 ```
@@ -269,6 +296,12 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 | `25 s` | `3 × 25 + 2` | `77 mp` |
 | **`30 s`** | `3 × 30 + 2` | **`92 mp`** |
 
+### 6.1 NTP + millis túlcsordulás
+
+- **NTP szinkronizáció (ESP32-C3)**: WiFi csatlakozás után az ESP32 nem-blokkoló módon szinkronizál az `pool.ntp.org` és `time.nist.gov` szerverekről (`Europe/Budapest` időzóna + automatikus téli/nyári DST átállás). Sikertelen szinkronnál 60 mp-enként újrapróbál; WiFi vagy NTP hiányában minden naplóbejegyzés és állapot `UP <sec>s` formátumot használ, és a `setup()` sosem akad el.
+- **49 napos `millis()` túlcsordulás-védelem**: Mind az ESP32-C3, mind az Arduino Nano **kizárólag előjel nélküli kivonást** (`static_cast<uint32_t>(now - last) >= INTERVAL`) használ minden időzítőnél (NRF fail-safe, ping ciklus, 20 mp menü timeout, 500 ms riasztás LED, 10 mp DS18B20 olvasás, 10 perces `manual_off`, 30 mp telemetria, hosszú/gyári gombnyomás). Ez a 32 bites számláló ~49,7 napos körbefordulásakor is pontos marad.
+- **ESP–Nano időszinkron (naponta 2×)**: Az ESP32 boot-kor egyszer, majd naponta `00:00`-kor és `12:00`-kor (valamint kézi `POST /api/heating/:id/sync` vagy `{"action": "forceSync"}` parancsra azonnal) elküldi az aktuális epoch időt a 32 byte-os `REQUEST` csomag `timeSyncEpoch` mezőjében. A Nano a `RESPONSE` csomagban (`syncFlags` + `syncEpochLow16`) visszaigazolja a szinkront, és `(uint32_t)(millis() - syncMillis) / 1000` képlettel számolja tovább az idejét. Sikertelen szinkronnál (`3` próba után) 1 óra múlva automatikus újrapróba történik; ha 13 órán át nem kap friss szinkront, `nanoStale = true` jelzés jelenik meg, miközben a kazánvédelem és fail-safe zavartalanul működik tovább.
+
 ---
 
 ## 7. LCD Menü + Ikonok (Szobai vezérlés)
@@ -278,7 +311,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 ```text
 +--------------------+
 |E:45.2C K: 2.5C  ▮◉ᯤ|   <- 1. sor: 0..16 szöveg, 17..19 állapot ikonok
-|Sz:20.8C C:21.5C    |   <- 2. sor: szoba & célhőmérséklet (riasztáskor 500ms váltakozás)
+|Sz:20.8C C:21.5C   =|   <- 2. sor: 0..18 szöveg, 19 trend nyíl (=, ↑, ↓)
 +--------------------+
 ```
 
@@ -286,6 +319,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 - **`K`** = Kültéri hőfok (`kulteri`)
 - **`Sz`** = Szobai hőmérséklet az LM35 szenzorról (`currentTemp`, **10 mV / °C**, `tempC = mV / 10 + OFFSET`, érvényes tartomány: `-10..60 °C`)
 - **`C`** = Célhőmérséklet (`targetTemp`)
+- **2. sor 20. karakter (index `19`)**: minden képernyőn az `eloremeno` 20 perces trendje (`↑` slot `6`, `↓` slot `7`, vagy `=` ha `FLAT`).
 - Ha nincs érvényes rádiókapcsolat (`nrf24_ok == false`), az előremenő és kültéri helyén **`E: --.- K: --.-`** jelenik meg.
 
 ### 7.2 Állapot ikonok (felső sor jobb széle: `17, 18, 19` pozíció)
@@ -317,6 +351,7 @@ FŐKÉPERNYŐ
       │    ├── Kazan
       │    ├── Kulteri
       │    ├── Szoba
+      │    ├── TREND              (Trend/Delta, Max/Min, Átlag/Bootóta, NULLAZAS 2 lépésben)
       │    └── VISSZA
       ├── STATUS
       │    ├── Szivattyu
@@ -326,6 +361,7 @@ FŐKÉPERNYŐ
       │    ├── Radio
       │    ├── Bizt. Hatar        (95.0C (FIX), csak olvasható)
       │    ├── NAPLO
+      │    ├── CHECK              (NTP, Nano, Radio, Millis)
       │    └── VISSZA
       ├── BEALLITAS
       │    ├── Celhofok           (16.0 - 26.0 °C, lépés: 0.5 °C)
@@ -366,7 +402,21 @@ FŐKÉPERNYŐ
   - `heartbeatIntervalSec`: **`5 mp`**
 - **A szivattyú kimeneti bitet (`OUT_BIT_SZIVATTYU`) NEM menti el** a `Preferences`, azt minden indítás után és működés közben a kazánvédelem állapotgépe számolja újra.
 
-### 7.6 Mentés ellenőrzés és hibajelzés
+### 7.6 Trend (Előremenő figyelés és napi statisztika)
+
+- **Figyelt szenzor**: kizárólag az **`eloremeno`** vízhőfok (a kazán és a szoba nem szól bele a trendbe).
+- **20 perces mozgóátlag**: az ESP32 **60 másodpercenként** elment egy érvényes `eloremeno` mintát egy 20 elemű körkörös pufferbe (`-127 °C` szenzorhiba kihagyva). Az első 20 minta összegyűjtéséig a trend fixen **`FLAT` (`=`)**, így induláskor nem mutat hamis nyilat.
+- **Irány meghatározása**: a 60 mp-enkénti újraszámítás az utolsó 10 minta átlagát veti össze az azt megelőző 10 minta átlagával (`delta = utolsó10 - előző10`):
+  - `delta > +0.5 °C` → **`UP`** (`↑`, LCD slot `6`)
+  - `delta < -0.5 °C` → **`DOWN`** (`↓`, LCD slot `7`)
+  - `-0.5 °C <= delta <= +0.5 °C` → **`FLAT`** (beépített `'='` karakter, nem foglal saját CGRAM slotot)
+- **LCD 2. sor 20. karakter (oszlop `19`)**: minden képernyőn (főképernyő, menü, szerkesztés, riasztás) megjeleníti az aktuális trend nyilat; a 2. sor szövege max. 19 karakterre korlátozott.
+- **Napi/futásidejű Max / Min / Átlag (NINCS automatikus éjféli nullázás)**: a `Max`, `Min` és `Átlag` minden érvényes `eloremeno` olvasáskor frissül, a **boot óta folyamatosan gyűlik**, és **NEM nullázódik éjfélkor**. Kizárólag szándékos nullázással törölhető:
+  - **Menüből**: `FOKOK -> TREND -> NULLAZAS` ponton kétlépcsős megerősítéssel (`BIZTOS?` + 5 mp visszaszámlálás, 2. rövid nyomásra `NULLAZVA!`, egyébként nem nulláz).
+  - **Frontendről**: az **`Előremenő statisztika`** kártya **`Nullázás`** gombjával (kétlépcsős megerősítés, `POST /api/heating/:id/trend/reset` → `{"action": "resetTrend"}`).
+- **Backend naplózás**: a backend kizárólag a **`UP ↔ DOWN`** irányváltásokat rögzíti `INFO` szinten (`TREND_UP` / `TREND_DOWN`), valamint naplózza a szándékos nullázásokat (`TREND_RESET_BY_USER`).
+
+### 7.7 Mentés ellenőrzés és hibajelzés
 
 Az ESP32-C3 firmware a `saveSetting(...)` egységes NVS-kezelőn keresztül minden írási és kommunikációs művelet visszatérési értékét ellenőrzi, hogy ne maradjon észrevétlen adatvesztés:
 
@@ -485,12 +535,12 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
 │   └── src/
 │       ├── config.h                # WiFi, HiveMQ TLS, GPIO kiosztás, kalibráció
 │       ├── config.h.example        # (Ajánlott sablon jelszavak nélkül Git-hez)
-│       ├── lcd.h                   # 2x20 I2C LCD + 0..5 saját ikonok + 100ms refresh
+│       ├── lcd.h                   # 2x20 I2C LCD + 0..5 állapot + 6..7 trend ikonok + 100ms refresh
 │       ├── menu.h                  # Menürendszer típusok és osztálydeklaráció
-│       ├── menu.cpp                # Főképernyő, almenük, szerkesztés, 20s timeout
-│       └── main.cpp                # LM35, NRF24 master, MQTT TLS, Preferences NVS
+│       ├── menu.cpp                # Főképernyő, almenük, TREND nézet, szerkesztés, 20s timeout
+│       └── main.cpp                # LM35, NRF24 master, MQTT TLS, NVS, NTP, trend & statisztika
 ├── server/                         # Backend modulok
-│   ├── types.ts                    # V4 + alarm + heartbeat TypeScript típusok
+│   ├── types.ts                    # V4 + alarm + heartbeat + trend TypeScript típusok
 │   ├── validation.ts               # Validáció és frissességi alapú parancsépítés
 │   ├── mqttBridge.ts               # HiveMQ TLS kliens, mély merge, eszköz mutex
 │   └── heatingRoutes.ts            # REST API (/api/heating/:id/*)
@@ -501,12 +551,15 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
     │   └── heating.ts              # Frontend típusdefiníciók
     └── components/
         ├── HeatingControl.tsx      # Szobatermosztát és üzemmód vezérlő
-        ├── Temperatures.tsx        # 4 kazánoldali + szobai hőmérséklet kijelzés
+        ├── Temperatures.tsx        # 4 kazánoldali + szobai hőmérséklet + előremenő trend nyíl
+        ├── EloremenoStats.tsx      # Előremenő napi Max / Min / Átlag statisztikai kártya
         ├── BoilerControl.tsx       # 8 kimenet kapcsolása (szivattyú zárolással)
         ├── BoilerStatus.tsx        # 8 bites kazán státusz bitek
         ├── PumpControl.tsx         # Kazánvédelem szivattyú beállítások
         ├── AlarmControl.tsx        # Túlmelegedés riasztás és villogó állapotjelző
-        └── HeartbeatControl.tsx    # V5 NRF24 életjel és ping intervallum (5–30s)
+        ├── HeartbeatControl.tsx    # V5 NRF24 életjel és ping intervallum (5–30s)
+        ├── SystemCheck.tsx         # Rendszer ellenőrzés (NTP, Nano, Radio, Millis + kézi szinkron)
+        └── LogsView.tsx            # Esemény és hiba napló szűréssel, lapozással és .txt exporttal
 ```
 
 ---
@@ -529,3 +582,7 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
 | **LCD-n `"TLS HIBA!"`** | A CA tanúsítvány nem stimmel, hiányzik a `TODO` helyéről vagy lejárt | Töltsd le újra a HiveMQ CA-t (`HiveMQ Console -> Cluster -> Details`) és írd be a `esp32/src/hivemq_ca.h`-ba; **ne** kapcsold vissza a `setInsecure()` módot! |
 | **POST `401 Unauthorized`** | Hiányzik vagy hibás az `Authorization: Bearer <HEATING_API_KEY>` fejléc | Ellenőrizd az `.env` fájl `HEATING_API_KEY` értékét és a kérés `Authorization` fejlécét. |
 | **Szerver nem indul: `"HEATING_API_KEY kötelező"`** | `HOST=0.0.0.0` van beállítva, de nincs megadva `HEATING_API_KEY` | Állíts be erős `HEATING_API_KEY` kulcsot az `.env`-ben, vagy tedd vissza `HOST=127.0.0.1`-re. |
+| **Logban `UP` idő van dátum helyett** | Az ESP32 még nem kapott NTP időszinkront (nincs WiFi vagy nem érhető el a `pool.ntp.org`) | Ellenőrizd a WiFi kapcsolatot és az NTP szerver elérhetőségét (`pool.ntp.org` / `time.nist.gov`); szinkron után a dátum automatikusan `YYYY-MM-DD HH:MM:SS` formátumra vált. |
+| **Nano szinkron `ELAVULT`** | Több mint 13 órája nem érkezett sikeres `timeSyncEpoch` frissítés a Nano-hoz | Ellenőrizd az NRF24 rádiót a `STATUS -> CHECK` menüben vagy a **Rendszer ellenőrzés** kártyán, és indíts kézi frissítést a **Szinkronizálás most** gombbal; a kazánvédelem és fail-safe közben aktív marad. |
+| **Trend nyíl villog fel-le** | Túl rövid mintavétel / szenzor ugrál | Ellenőrizd, hogy a 20 perces puffer megvan-e (`TREND_BUFFER_SIZE = 20`, `TREND_SAMPLE_INTERVAL_MS = 60000`), ne 1 perces különbséget nézz. |
+| **Reggelre eltűnt a tegnapi max** | Ez nem hiba, boot volt éjszaka (áramkimaradás) | Ha áramkimaradás volt, a statisztika újraindul, ez normális (nincs éjféli automatikus nullázás). |
