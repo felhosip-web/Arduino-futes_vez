@@ -430,8 +430,8 @@ void MenuController::toggleOutput(uint8_t itemIndex, uint32_t now) {
     char logMsg[48] = { 0 };
 
     if (bit == OUT_BIT_SZIVATTYU) {
-        // AUTO módban zárolva, csak manual_on / manual_off módban kapcsolható
-        if (_state->pumpConfig.pumpMode == PUMP_MODE_AUTO) {
+        // Szerviz módban és AUTO módban zárolva, csak manual_on / manual_off módban kapcsolható
+        if (_state->serviceMode || _state->pumpConfig.pumpMode == PUMP_MODE_AUTO) {
             return;
         }
         uint8_t nextPumpMode = _state->pumpOn ? PUMP_MODE_MANUAL_OFF : PUMP_MODE_MANUAL_ON;
@@ -658,9 +658,9 @@ void MenuController::handleInput(int8_t encSteps,
         return;
     }
 
-    // 4c. CHECK diagnosztikai néző (`MENU_CHECK` - 4 görgethető sor)
+    // 4c. CHECK diagnosztikai néző (`MENU_CHECK` - 5 görgethető sor)
     if (_menuState == MENU_CHECK) {
-        constexpr uint8_t CHECK_LINES = 4;
+        constexpr uint8_t CHECK_LINES = 5;
         if (steps != 0) {
             _lastActivityMs = now;
             int16_t next = static_cast<int16_t>(_checkCursor) + steps;
@@ -919,29 +919,50 @@ void MenuController::drawMainScreen(bool alarmBlinkPhase) {
         snprintf(line1, sizeof(line1), "E:%s K:%s", eStr, kStr);
     }
 
-    // 2. sor: normál esetben "Sz:20.8C C:21.5C", riasztáskor 500ms-enként váltakozva
+    // 2. sor (0..18 szöveg, 19 trend nyíl): normál esetben "Sz:20.8C C:21.5C",
+    //    szerviz módban "SZERVIZ ..." az elején, riasztáskor 500ms-enként váltakozva
     bool showAlarmLine = (_state->alarmConfig.alarmEnabled != 0) &&
                          (_state->alarmState.active != 0) &&
                          alarmBlinkPhase;
 
     if (showAlarmLine) {
-        switch (_state->alarmState.reason) {
-            case ALARM_REASON_OVERHEAT: {
-                if (isTempValid(_state->kazan)) {
-                    snprintf(line2, sizeof(line2), "RIASZTAS! Kaz %dC",
-                             static_cast<int>(lroundf(_state->kazan)));
-                } else {
-                    snprintf(line2, sizeof(line2), "RIASZTAS! Kaz --C");
-                }
-                break;
+        if (_state->serviceMode) {
+            switch (_state->alarmState.reason) {
+                case ALARM_REASON_OVERHEAT:
+                    if (isTempValid(_state->kazan)) {
+                        snprintf(line2, sizeof(line2), "SZERVIZ TULM! %dC",
+                                 static_cast<int>(lroundf(_state->kazan)));
+                    } else {
+                        snprintf(line2, sizeof(line2), "SZERVIZ TULMEL!");
+                    }
+                    break;
+                case ALARM_REASON_SENSOR_FAIL:
+                    snprintf(line2, sizeof(line2), "SZERVIZ SZENZOR!");
+                    break;
+                case ALARM_REASON_NRF_FAIL:
+                default:
+                    snprintf(line2, sizeof(line2), "SZERVIZ NRF HIBA!");
+                    break;
             }
-            case ALARM_REASON_SENSOR_FAIL:
-                snprintf(line2, sizeof(line2), "RIASZTAS! SZENZOR!");
-                break;
-            case ALARM_REASON_NRF_FAIL:
-            default:
-                snprintf(line2, sizeof(line2), "RIASZTAS! NRF HIBA!");
-                break;
+        } else {
+            switch (_state->alarmState.reason) {
+                case ALARM_REASON_OVERHEAT: {
+                    if (isTempValid(_state->kazan)) {
+                        snprintf(line2, sizeof(line2), "RIASZTAS! Kaz %dC",
+                                 static_cast<int>(lroundf(_state->kazan)));
+                    } else {
+                        snprintf(line2, sizeof(line2), "RIASZTAS! Kaz --C");
+                    }
+                    break;
+                }
+                case ALARM_REASON_SENSOR_FAIL:
+                    snprintf(line2, sizeof(line2), "RIASZTAS! SZENZOR!");
+                    break;
+                case ALARM_REASON_NRF_FAIL:
+                default:
+                    snprintf(line2, sizeof(line2), "RIASZTAS! NRF HIBA!");
+                    break;
+            }
         }
     } else {
         char szStr[10];
@@ -950,7 +971,11 @@ void MenuController::drawMainScreen(bool alarmBlinkPhase) {
         } else {
             snprintf(szStr, sizeof(szStr), "--.-C");
         }
-        snprintf(line2, sizeof(line2), "Sz:%s C:%4.1fC", szStr, _state->targetTemp);
+        if (_state->serviceMode) {
+            snprintf(line2, sizeof(line2), "SZERVIZ Sz:%s", szStr);
+        } else {
+            snprintf(line2, sizeof(line2), "Sz:%s C:%4.1fC", szStr, _state->targetTemp);
+        }
     }
 
     _lcd->printLines(line1, line2);
@@ -1011,7 +1036,7 @@ void MenuController::drawLogViewer() {
 void MenuController::drawCheckViewer() {
     if (!_lcd || !_state) return;
 
-    if (_checkCursor >= 4) {
+    if (_checkCursor >= 5) {
         _checkCursor = 0;
     }
 
@@ -1019,7 +1044,7 @@ void MenuController::drawCheckViewer() {
     char line2[24];
     uint32_t now = millis();
 
-    snprintf(line1, sizeof(line1), "CHECK (%u/4)", static_cast<unsigned>(_checkCursor + 1));
+    snprintf(line1, sizeof(line1), "CHECK (%u/5)", static_cast<unsigned>(_checkCursor + 1));
 
     switch (_checkCursor) {
         case 0: {
@@ -1062,10 +1087,15 @@ void MenuController::drawCheckViewer() {
             break;
         }
 
-        case 3:
-        default: {
+        case 3: {
             unsigned long daysLeft = (4294967295UL - static_cast<unsigned long>(now)) / 86400000UL;
             snprintf(line2, sizeof(line2), "Millis: %lu nap", daysLeft);
+            break;
+        }
+
+        case 4:
+        default: {
+            snprintf(line2, sizeof(line2), "Szerviz: %s", _state->serviceMode ? "BE" : "KI");
             break;
         }
     }
@@ -1261,7 +1291,9 @@ void MenuController::formatMenuItemValue(const MenuItem& item, char* buf, size_t
         case ITEM_OUTPUT_BOOL: {
             uint8_t bit = item.extraId;
             if (bit == OUT_BIT_SZIVATTYU) {
-                if (_state->pumpConfig.pumpMode == PUMP_MODE_AUTO) {
+                if (_state->serviceMode) {
+                    snprintf(buf, bufLen, "SZERVIZ - ZAROLVA");
+                } else if (_state->pumpConfig.pumpMode == PUMP_MODE_AUTO) {
                     snprintf(buf, bufLen, "AUTO - ZAROLVA");
                 } else {
                     snprintf(buf, bufLen, "%s", _state->pumpOn ? "BE" : "KI");

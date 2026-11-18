@@ -155,6 +155,7 @@ export class HeatingMqttBridge {
   private readonly historyStores = new Map<string, HistoryStore>();
   private readonly lastCommands = new Map<string, { command: HeatingCommand; sentAt: number }>();
   private readonly onlineStates = new Map<string, boolean>();
+  private readonly serviceModeStates = new Map<string, boolean>();
   private readonly lastActiveTrends = new Map<string, 'up' | 'down'>();
   private connected = false;
 
@@ -300,6 +301,16 @@ export class HeatingMqttBridge {
         this.logBackendEvent('WARN', 'ESP_OFFLINE', `${deviceId}: ${reason}`);
       }
       this.onlineStates.set(deviceId, parsed.online);
+    }
+
+    if (typeof parsed.serviceMode === 'boolean') {
+      const prevServiceMode = this.serviceModeStates.get(deviceId);
+      if (parsed.serviceMode && prevServiceMode !== true) {
+        this.logBackendEvent('INFO', 'SERVICE_MODE_ON', `${deviceId} szerviz kapcsoló BE (Slave)`);
+      } else if (!parsed.serviceMode && prevServiceMode === true) {
+        this.logBackendEvent('INFO', 'SERVICE_MODE_OFF', `${deviceId} szerviz kapcsoló KI (Slave)`);
+      }
+      this.serviceModeStates.set(deviceId, parsed.serviceMode);
     }
 
     const incomingTrend = parsed.trend?.eloremeno;

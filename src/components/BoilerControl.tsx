@@ -10,6 +10,7 @@ interface BoilerControlProps {
   outputs: HeatingOutputs;
   pumpMode: PumpMode;
   pendingKey: OutputKey | null;
+  disabled?: boolean;
   onToggleOutput: (key: OutputKey, nextVal: boolean) => Promise<void>;
 }
 
@@ -17,6 +18,7 @@ export function BoilerControl({
   outputs,
   pumpMode,
   pendingKey,
+  disabled = false,
   onToggleOutput,
 }: BoilerControlProps) {
   const isPumpAuto = pumpMode === 'auto';
@@ -40,8 +42,9 @@ export function BoilerControl({
           const isOn = Boolean(outputs?.[item.key]);
           const isPumpRow = item.key === 'szivattyu';
           const isLockedByAuto = isPumpRow && isPumpAuto;
+          const isLockedByService = Boolean(disabled);
           const isPending = pendingKey === item.key;
-          const disabled = isLockedByAuto || isPending;
+          const rowDisabled = isLockedByAuto || isPending || isLockedByService;
 
           return (
             <button
@@ -49,15 +52,15 @@ export function BoilerControl({
               type="button"
               role="switch"
               aria-checked={isOn}
-              disabled={disabled}
+              disabled={rowDisabled}
               onClick={() => {
-                if (!disabled) {
+                if (!rowDisabled) {
                   void onToggleOutput(item.key, !isOn);
                 }
               }}
               className={`flex min-h-[60px] w-full items-center justify-between gap-3 rounded-lg border px-4 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
-                isLockedByAuto
-                  ? 'cursor-not-allowed border-slate-800 bg-slate-950/60 opacity-75'
+                isLockedByService || isLockedByAuto
+                  ? 'cursor-not-allowed border-slate-800 bg-slate-950/60 opacity-60'
                   : isOn
                     ? 'border-emerald-500/40 bg-emerald-950/30 hover:bg-emerald-950/45'
                     : 'border-slate-800 bg-slate-950/60 hover:border-slate-700 hover:bg-slate-800/70'
@@ -66,16 +69,20 @@ export function BoilerControl({
               <div className="min-w-0">
                 <div className="flex items-center gap-1.5 text-sm font-medium text-slate-100">
                   <span className="truncate">{item.label}</span>
-                  {isLockedByAuto && (
+                  {(isLockedByAuto || isLockedByService) && (
                     <Lock className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden="true" />
                   )}
                 </div>
                 <div className="mt-0.5 text-xs text-slate-400">
-                  {isLockedByAuto
-                    ? 'AUTO - Kazánvédelem vezérli'
-                    : isOn
-                      ? 'Bekapcsolva'
-                      : 'Kikapcsolva'}
+                  {isLockedByService
+                    ? isPumpRow
+                      ? 'SZERVIZ - Nano vezérli'
+                      : 'Szerviz módban letiltva'
+                    : isLockedByAuto
+                      ? 'AUTO - Kazánvédelem vezérli'
+                      : isOn
+                        ? 'Bekapcsolva'
+                        : 'Kikapcsolva'}
                 </div>
               </div>
 

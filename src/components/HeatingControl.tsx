@@ -5,6 +5,7 @@ import type { HeatingMode, HeatingStatusPayload } from '../types/heating';
 interface HeatingControlProps {
   status: HeatingStatusPayload;
   sending: boolean;
+  disabled?: boolean;
   onSendRoomCommand: (patch: {
     targetTemp: number;
     mode: HeatingMode;
@@ -30,11 +31,13 @@ function clampTarget(value: number): number {
 export function HeatingControl({
   status,
   sending,
+  disabled = false,
   onSendRoomCommand,
 }: HeatingControlProps) {
   const [draftTargetTemp, setDraftTargetTemp] = useState<number>(status.targetTemp);
   const debounceTimerRef = useRef<number | null>(null);
   const isSlidingRef = useRef<boolean>(false);
+  const actionDisabled = sending || disabled;
 
   // Az ESP-től jövő status mindig elsőbbséget élvez (encoder felülírhatja)
   useEffect(() => {
@@ -179,7 +182,7 @@ export function HeatingControl({
               <button
                 type="button"
                 onClick={() => handleStepTemp(-TARGET_STEP)}
-                disabled={draftTargetTemp <= TARGET_MIN}
+                disabled={disabled || draftTargetTemp <= TARGET_MIN}
                 aria-label="Célhőmérséklet csökkentése 0.5 fokkal"
                 className="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-slate-700 bg-slate-800 text-slate-100 transition-colors hover:bg-slate-700 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
               >
@@ -188,7 +191,7 @@ export function HeatingControl({
               <button
                 type="button"
                 onClick={() => handleStepTemp(TARGET_STEP)}
-                disabled={draftTargetTemp >= TARGET_MAX}
+                disabled={disabled || draftTargetTemp >= TARGET_MAX}
                 aria-label="Célhőmérséklet növelése 0.5 fokkal"
                 className="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-slate-700 bg-slate-800 text-slate-100 transition-colors hover:bg-slate-700 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
               >
@@ -208,6 +211,7 @@ export function HeatingControl({
               max={TARGET_MAX}
               step={TARGET_STEP}
               value={draftTargetTemp}
+              disabled={disabled}
               onPointerDown={() => {
                 isSlidingRef.current = true;
               }}
@@ -221,7 +225,7 @@ export function HeatingControl({
                 isSlidingRef.current = false;
               }}
               onChange={(e) => handleSliderChange(parseFloat(e.target.value))}
-              className="w-full cursor-pointer"
+              className="w-full cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
             />
             <div className="mt-1.5 flex justify-between text-xs tabular-nums text-slate-500">
               <span>16.0 °C</span>
@@ -245,8 +249,8 @@ export function HeatingControl({
                   key={opt.value}
                   type="button"
                   onClick={() => handleModeChange(opt.value)}
-                  disabled={sending}
-                  className={`min-h-[44px] rounded-md px-4 py-2 text-sm font-semibold whitespace-nowrap shrink-0 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
+                  disabled={actionDisabled}
+                  className={`min-h-[44px] rounded-md px-4 py-2 text-sm font-semibold whitespace-nowrap shrink-0 transition-colors disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
                     active
                       ? 'bg-orange-500 text-slate-950'
                       : 'text-slate-300 hover:bg-slate-800 hover:text-slate-100'
@@ -262,8 +266,8 @@ export function HeatingControl({
             <button
               type="button"
               onClick={handleManualHeatingToggle}
-              disabled={sending}
-              className={`min-h-[44px] rounded-lg border px-4 py-2 text-xs font-semibold whitespace-nowrap shrink-0 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
+              disabled={actionDisabled}
+              className={`min-h-[44px] rounded-lg border px-4 py-2 text-xs font-semibold whitespace-nowrap shrink-0 transition-colors disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
                 status.manualHeating ?? status.heatingOn
                   ? 'border-orange-500/50 bg-orange-500/20 text-orange-200 hover:bg-orange-500/30'
                   : 'border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700'

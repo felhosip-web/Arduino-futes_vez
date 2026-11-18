@@ -59,8 +59,9 @@ A 4 db **DS18B20** hőmérséklet-szenzor közös **OneWire** buszon van a **D2*
 | **NRF24L01+ MOSI** | `D11` | Hardveres SPI | Master Out Slave In |
 | **NRF24L01+ MISO** | `D12` | Hardveres SPI | Master In Slave Out |
 | **NRF24L01+ SCK** | `D13` | Hardveres SPI | SPI órajel |
-| **Zöld LED (`led_zold`)** | `D5` | Kimenet | Állapot / felhasználói kimenet |
-| **Piros LED (`led_piros`)** | `D6` | Kimenet | Riasztás jelzés (aktív riasztáskor 500 ms BE / 500 ms KI villogás) |
+| **Zöld LED (`led_zold`)** | `D5` | Kimenet | Állapot / felhasználói kimenet (Szerviz módban folyamatos BE) |
+| **Szerviz kapcsoló (`serviceMode`)** | `D6` | Bemenet (`INPUT_PULLUP`) | SPST billenőkapcsoló **GND-re** (`LOW` = Szerviz BE, 50 ms szoftveres debounce) |
+| **Piros LED (`led_piros`)** | `A2` (`16`) | Kimenet | Riasztás jelzés (aktív riasztáskor 500 ms BE / 500 ms KI villogás; a `D6` átadva a szerviz kapcsolónak) |
 | **Szivattyú relé (`szivattyu`)** | `D7` | Kimenet | Keringető szivattyú relévezérlés |
 | **Tartalék 1 (`tartalek1`)** | `D8` | Kimenet | Szabadon kapcsolható kimenet |
 | **Tartalék 2 (`tartalek2`)** | `D9` | Kimenet | Szabadon kapcsolható kimenet |
@@ -104,7 +105,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 | Struktúra (31 byte payload) | Mezők pontos sorrendben | Leírás |
 | :--- | :--- | :--- |
 | **`EspToNanoPayload`** | `outputsMask`, `targetTemp`, `mode`, `manualHeating`, `pumpConfig`, `alarmConfig`, `heartbeatIntervalSec`, `seq`, `timeSyncEpoch` | Az ESP32 kimeneti bitmaszkja, termosztát, szivattyú-, riasztás- és ping beállításai, a növekvő `seq` sorszám, valamint a 4 byte-os `timeSyncEpoch` időszinkron érték. |
-| **`NanoToEspPayload`** | `eloremeno`, `visszatero`, `kazan`, `kulteri`, `kazanStatusMask`, `counter`, `seq`, `sensorValidMask`, `alarmState`, `syncFlags`, `syncEpochLow16` | A 4 mért hőfok (`-127.0f` hiba esetén), az 1 byte-os `kazanStatusMask` (amelyet az ESP32 bont vissza 8 elemű `kazan_status` tömbbé), a válasz `counter`, a szenzor-érvényességi maszk, az `alarmState`, a `syncFlags` (`ACK`/`STALE`) + `syncEpochLow16`, és az eredeti `seq`. |
+| **`NanoToEspPayload`** | `eloremeno`, `visszatero`, `kazan`, `kulteri`, `kazanStatusMask`, `counter`, `seq`, `sensorValidMask`, `alarmState`, `syncFlags`, `syncEpochLow16` | A 4 mért hőfok (`-127.0f` hiba esetén), az 1 byte-os `kazanStatusMask` (amelyet az ESP32 bont vissza 8 elemű `kazan_status` tömbbé), a válasz `counter`, a szenzor-érvényességi maszk, az `alarmState`, a `syncFlags` (`bit0`: `ACK`, `bit1`: `STALE`, `bit2`: `SYNC_FLAG_SERVICE_MODE`) + `syncEpochLow16`, és az eredeti `seq`. |
 
 ### MQTT topicok (HiveMQ Cloud TLS 8883)
 
@@ -154,6 +155,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
   "currentTemp": 20.8,
   "targetTemp": 21.5,
   "heatingOn": true,
+  "serviceMode": false,
   "mode": "auto",
   "online": true,
   "homersekletek": {
@@ -180,6 +182,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
     "pumpStartSensor": "kazan"
   },
   "pumpState": "futes",
+  "pumpControl": "AUTO",
   "alarmConfig": {
     "alarmTemp": 85.0,
     "alarmEnabled": true
@@ -361,7 +364,7 @@ FŐKÉPERNYŐ
       │    ├── Radio
       │    ├── Bizt. Hatar        (95.0C (FIX), csak olvasható)
       │    ├── NAPLO
-      │    ├── CHECK              (NTP, Nano, Radio, Millis)
+      │    ├── CHECK              (5 sor: NTP, Nano, Radio, Millis, Szerviz)
       │    └── VISSZA
       ├── BEALLITAS
       │    ├── Celhofok           (16.0 - 26.0 °C, lépés: 0.5 °C)
@@ -377,7 +380,7 @@ FŐKÉPERNYŐ
       │    ├── Gyari visszaallit  (Tartsd 3mp-ig!)
       │    └── VISSZA
       └── KIMENETEK
-           ├── Szivattyu          (AUTO módban ZÁROLVA, csak manual_on/off esetén kapcsolható)
+           ├── Szivattyu          (AUTO vagy SZERVIZ módban ZÁROLVA)
            ├── LED Zold
            ├── LED Piros          (Aktív riasztás alatt a riasztás vezérli!)
            ├── Tartalek1
@@ -425,6 +428,14 @@ Az ESP32-C3 firmware a `saveSetting(...)` egységes NVS-kezelőn keresztül mind
 - **Visszagörgetés és egyszeri újrapróbálkozás**: sikertelen NVS íráskor az ESP32 **nem jelöli elmentettnek** a módosítást, megtartja a régi értéket a RAM-ban, a következő `loop()` ciklusban **egyszer automatikusan újrapróbálja** az írást, és **csak akkor** hívja meg az `onMenuSettingCommitted()`-et (valamint küld MQTT `STATUS`-t), ha minden `put*` művelet sikeres volt.
 - **MQTT `publish()` ellenőrzés**: ha a `mqtt.publish()` `false` értékkel tér vissza, a soros porton **`MQTT PUBLISH FAILED topic=<topic>`** jelenik meg, a firmware pedig megjegyzi a függőben lévő státuszt, és a következő `STATUS` (heartbeat) ciklusban újraküldi, nem dobja el csendben.
 - **Miért fontos ez?**: ha írás közben megtelik az NVS partíció vagy áramszünet / flash-hiba lép fel, a felhasználó azonnal látja az LCD-n és a soros porton, hogy a `22.0 °C` nem íródott tartós memóriába (így elkerülhető a látszólagos mentés utáni váratlan visszaállás `21.5 °C`-ra).
+
+### 7.8 Szerviz kapcsoló
+
+- **Hardver (Nano `D6`)**: A kazán oldalán található egy **SPST billenőkapcsoló**, amelynek egyik lába `GND`-re, másik lába a Nano **`D6`** lábára (`INPUT_PULLUP`, aktív `LOW` = Szerviz BE) van kötve (`50 ms` túlcsordulás-biztos szoftveres debounce).
+- **Azonnali szivattyú felülbírálás (Slave)**: Bekapcsolásakor (`LOW`) a Nano **azonnal** (nem vár a következő pingre) bekapcsolja a szivattyú relét az ESP parancstól függetlenül, a zöld LED folyamatosan világít, a piros LED pedig továbbra is a riasztási állapot szerint működik. Soros porton naplózza a `SERVICE_MODE_ON` / `SERVICE_MODE_OFF` átmenetet.
+- **V5 NRF átvitel**: A 32 byte-os `NrfPacket` méretének megtartásával a `NanoToEspPayload.syncFlags` **`bit2`** (`SYNC_FLAG_SERVICE_MODE = 0x04`) viszi át a szerviz állapotot az ESP32-nek, az `ACK` és `STALE` bitek felülírása nélkül.
+- **ESP32-C3 és LCD**: Amíg `serviceMode == true`, az ESP nem próbálja kikapcsolni a szivattyút (`pumpControl: "SERVICE"`), a főképernyő 2. sorának elején a **`SZERVIZ`** felirat látszik (a 20. karakteren lévő trend nyíl megmarad), a `STATUS -> CHECK` menü 5. sora jelzi a `Szerviz: BE/KI` állapotot, és a rendszer naplózza a `SERVICE_MODE_ON_BY_SLAVE` / `SERVICE_MODE_OFF_BY_SLAVE` eseményt.
+- **Frontend modal és visszatérés**: Aktív szerviz üzemmódban a webes felületen egy **nem bezárható** (X gomb nélküli) teljes képernyős **`SZERVIZ ÜZEMMÓD - SLAVE`** modal jelenik meg az eltelt idővel (`Szervizben: X perc Y mp óta`), miközben a háttérben a vezérlők le vannak tiltva. A kapcsoló **KI** állásba kapcsolásakor a Nano azonnal visszatér az ESP vezérléshez újraindítás nélkül, a modal pedig eltűnik.
 
 ---
 
@@ -548,7 +559,8 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
     ├── App.tsx                     # Fő dashboard, Socket.IO és API kezelők
     ├── config.ts                   # Frontend konstansok (pl. heartbeat opciók)
     ├── types/
-    │   └── heating.ts              # Frontend típusdefiníciók
+    │   ├── heating.ts              # Frontend típusdefiníciók
+    │   └── notifications.ts        # Böngésző értesítési preferenciák és kritikus riasztás kiértékelés
     └── components/
         ├── HeatingControl.tsx      # Szobatermosztát és üzemmód vezérlő
         ├── Temperatures.tsx        # 4 kazánoldali + szobai hőmérséklet + előremenő trend nyíl
@@ -557,8 +569,12 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
         ├── BoilerStatus.tsx        # 8 bites kazán státusz bitek
         ├── PumpControl.tsx         # Kazánvédelem szivattyú beállítások
         ├── AlarmControl.tsx        # Túlmelegedés riasztás és villogó állapotjelző
+        ├── PushNotifications.tsx   # Böngésző értesítések (Push) konfigurációs panel
         ├── HeartbeatControl.tsx    # V5 NRF24 életjel és ping intervallum (5–30s)
         ├── SystemCheck.tsx         # Rendszer ellenőrzés (NTP, Nano, Radio, Millis + kézi szinkron)
+        ├── ServiceModeModal.tsx    # Nem bezárható szerviz üzemmód figyelmeztető modal
+        ├── ChartsView.tsx          # Hőmérséklet grafikon nézet időablakkal és felbontással
+        ├── TempChart.tsx           # Recharts vonaldiagram üres adat kezeléssel
         └── LogsView.tsx            # Esemény és hiba napló szűréssel, lapozással és .txt exporttal
 ```
 
@@ -586,3 +602,4 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
 | **Nano szinkron `ELAVULT`** | Több mint 13 órája nem érkezett sikeres `timeSyncEpoch` frissítés a Nano-hoz | Ellenőrizd az NRF24 rádiót a `STATUS -> CHECK` menüben vagy a **Rendszer ellenőrzés** kártyán, és indíts kézi frissítést a **Szinkronizálás most** gombbal; a kazánvédelem és fail-safe közben aktív marad. |
 | **Trend nyíl villog fel-le** | Túl rövid mintavétel / szenzor ugrál | Ellenőrizd, hogy a 20 perces puffer megvan-e (`TREND_BUFFER_SIZE = 20`, `TREND_SAMPLE_INTERVAL_MS = 60000`), ne 1 perces különbséget nézz. |
 | **Reggelre eltűnt a tegnapi max** | Ez nem hiba, boot volt éjszaka (áramkimaradás) | Ha áramkimaradás volt, a statisztika újraindul, ez normális (nincs éjféli automatikus nullázás). |
+| **Nem lehet kikapcsolni a szivattyút frontendről** | Szerviz kapcsoló BE van | Kapcsold KI a kapcsolót a kazánnál. |

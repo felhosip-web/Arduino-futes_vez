@@ -22,9 +22,10 @@ constexpr uint8_t PKT_TYPE_RESPONSE = 0xB2; // Slave  -> Master
 
 constexpr float SENSOR_DISCONNECTED_VAL = -127.0f;
 
-// Időszinkron nyugta bitek a NanoToEspPayload.syncFlags mezőben
-constexpr uint8_t SYNC_FLAG_ACK   = 0x01; // bit0: Nano kapott érvényes timeSyncEpoch-ot
-constexpr uint8_t SYNC_FLAG_STALE = 0x02; // bit1: >13 órája nem érkezett friss szinkron
+// Időszinkron nyugta és slave szerviz állapot bitek a NanoToEspPayload.syncFlags mezőben
+constexpr uint8_t SYNC_FLAG_ACK          = 0x01; // bit0: Nano kapott érvényes timeSyncEpoch-ot
+constexpr uint8_t SYNC_FLAG_STALE        = 0x02; // bit1: >13 órája nem érkezett friss szinkron
+constexpr uint8_t SYNC_FLAG_SERVICE_MODE = 0x04; // bit2: Kazán oldali szerviz kapcsoló (D6) BE van kapcsolva
 
 #ifndef SAFETY_OVERHEAT_TEMP_DEFINED
 #define SAFETY_OVERHEAT_TEMP_DEFINED
@@ -75,7 +76,7 @@ enum AlarmReason : uint8_t {
 // ESP -> NANO kimeneti bitmaszk bitek
 constexpr uint8_t OUT_BIT_SZIVATTYU = 0; // bit0 -> D7 relé
 constexpr uint8_t OUT_BIT_LED_ZOLD  = 1; // bit1 -> D5
-constexpr uint8_t OUT_BIT_LED_PIROS = 2; // bit2 -> D6
+constexpr uint8_t OUT_BIT_LED_PIROS = 2; // bit2 -> A2 (16) (D6 a Szerviz kapcsoló bemenete)
 constexpr uint8_t OUT_BIT_TARTALEK1 = 3; // bit3 -> D8
 constexpr uint8_t OUT_BIT_TARTALEK2 = 4; // bit4 -> D9
 constexpr uint8_t OUT_BIT_TARTALEK3 = 5; // bit5 -> D10 (OUTPUT módban AVR SPI Master feltétel miatt)
@@ -121,7 +122,7 @@ struct __attribute__((packed)) NanoToEspPayload {
     uint32_t         seq;             // UGYANAZ a seq, mint a kérésben
     uint8_t          sensorValidMask; // bit0: eloremeno, bit1: visszatero, bit2: kazan, bit3: kulteri
     AlarmStatePacked alarmState;      // 2 byte (active + reason)
-    uint8_t          syncFlags;       // bit0: SYNC_FLAG_ACK, bit1: SYNC_FLAG_STALE (1 byte)
+    uint8_t          syncFlags;       // bit0: SYNC_FLAG_ACK, bit1: SYNC_FLAG_STALE, bit2: SYNC_FLAG_SERVICE_MODE (1 byte)
     uint16_t         syncEpochLow16;  // Utolsó kapott timeSyncEpoch alsó 16 bitje nyugtázáshoz (2 byte)
 };
 

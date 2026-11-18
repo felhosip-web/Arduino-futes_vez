@@ -6,6 +6,8 @@ export type PumpStartSensor = 'kazan' | 'eloremeno' | 'max';
 
 export type PumpState = 'varakozas' | 'futes';
 
+export type PumpControlMode = 'SERVICE' | 'AUTO' | 'MANUAL';
+
 export type OutputKey =
   | 'szivattyu'
   | 'led_zold'
@@ -95,6 +97,8 @@ export interface HeatingStatusPayload {
   kazan_status: number[];
   pumpConfig: PumpConfig;
   pumpState: PumpState;
+  pumpControl?: PumpControlMode;
+  serviceMode?: boolean;
   alarmConfig: AlarmConfig;
   safety?: SafetyConfig;
   alarmState: AlarmState;

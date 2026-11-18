@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import {
   AlertTriangle,
@@ -38,6 +38,18 @@ import { BoilerStatus } from './components/BoilerStatus';
 import { SystemCheck } from './components/SystemCheck';
 import { LogsView } from './components/LogsView';
 import { ChartsView } from './components/ChartsView';
+import { ServiceModeModal } from './components/ServiceModeModal';
+import { PushNotifications } from './components/PushNotifications';
+import {
+  CRITICAL_ALERT_ITEMS,
+  evaluateCriticalAlerts,
+  loadNotificationPrefs,
+  saveNotificationPrefs,
+  type CriticalAlertKey,
+  type NotificationPrefs,
+} from './types/notifications';
+
+const ALERT_NOTIFICATION_COOLDOWN_MS = 60_000;
 
 type ActiveView = 'dashboard' | 'logs' | 'charts';
 
@@ -79,6 +91,97 @@ export default function App() {
   const [pendingOutputKey, setPendingOutputKey] = useState<OutputKey | null>(null);
   const [waitingForEsp, setWaitingForEsp] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [serviceStartedAtMs, setServiceStartedAtMs] = useState<number | null>(null);
+  const [notificationPrefs, setNotificationPrefs] = useState<NotificationPrefs>(() =>
+    loadNotificationPrefs()
+  );
+
+  const hasAlertBaselineRef = useRef<boolean>(false);
+  const prevAlertActiveRef = useRef<Partial<Record<CriticalAlertKey, boolean>>>({});
+  const lastNotifiedAtRef = useRef<Partial<Record<CriticalAlertKey, number>>>({});
+
+  const handleChangeNotificationPrefs = useCallback((next: NotificationPrefs) => {
+    setNotificationPrefs(next);
+    saveNotificationPrefs(next);
+  }, []);
+
+  const evaluatedAlerts = useMemo(
+    () => (status ? evaluateCriticalAlerts(status) : null),
+    [status]
+  );
+
+  const activeAlertsMap = useMemo(() => {
+    if (!evaluatedAlerts) return undefined;
+    return {
+      overheat: evaluatedAlerts.overheat.active,
+      pumpFault: evaluatedAlerts.pumpFault.active,
+      sensorFail: evaluatedAlerts.sensorFail.active,
+      nrfFail: evaluatedAlerts.nrfFail.active,
+      serviceMode: evaluatedAlerts.serviceMode.active,
+      espOffline: evaluatedAlerts.espOffline.active,
+    };
+  }, [evaluatedAlerts]);
+
+  useEffect(() => {
+    if (!evaluatedAlerts) return;
+
+    if (!hasAlertBaselineRef.current) {
+      for (const item of CRITICAL_ALERT_ITEMS) {
+        prevAlertActiveRef.current[item.key] = evaluatedAlerts[item.key].active;
+      }
+      hasAlertBaselineRef.current = true;
+      return;
+    }
+
+    const canDispatch =
+      notificationPrefs.enabled &&
+      typeof window !== 'undefined' &&
+      'Notification' in window &&
+      window.Notification.permission === 'granted' &&
+      (!notificationPrefs.onlyWhenHidden || document.hidden);
+
+    const now = Date.now();
+
+    for (const item of CRITICAL_ALERT_ITEMS) {
+      const key = item.key;
+      const curr = evaluatedAlerts[key];
+      const wasActive = Boolean(prevAlertActiveRef.current[key]);
+      prevAlertActiveRef.current[key] = curr.active;
+
+      const isRisingEdge = curr.active && !wasActive;
+      if (!isRisingEdge || !canDispatch || !notificationPrefs.alerts[key]) {
+        continue;
+      }
+
+      const lastSent = lastNotifiedAtRef.current[key] ?? 0;
+      if (now - lastSent < ALERT_NOTIFICATION_COOLDOWN_MS) {
+        continue;
+      }
+
+      try {
+        const notification = new window.Notification(curr.title, {
+          body: curr.body,
+          tag: `futes-alert-${key}`,
+          requireInteraction: curr.requireInteraction,
+        });
+        notification.onclick = () => {
+          window.focus();
+          notification.close();
+        };
+        lastNotifiedAtRef.current[key] = now;
+      } catch {
+        // Beágyazott környezetben a Notification példányosítása sikertelen lehet
+      }
+    }
+  }, [evaluatedAlerts, notificationPrefs]);
+
+  useEffect(() => {
+    if (status?.serviceMode) {
+      setServiceStartedAtMs((prev) => prev ?? Date.now());
+    } else {
+      setServiceStartedAtMs(null);
+    }
+  }, [status?.serviceMode]);
 
   const applyDeviceState = useCallback((deviceState: StoredDeviceState | null | undefined) => {
     const candidate = deviceState?.lastStatus ?? deviceState?.status ?? null;
@@ -509,6 +612,7 @@ export default function App() {
             <HeatingControl
               status={status}
               sending={sendingCommand}
+              disabled={Boolean(status.serviceMode)}
               onSendRoomCommand={handleSendRoomCommand}
             />
 
@@ -522,6 +626,7 @@ export default function App() {
               safety={status.safety ?? DEFAULT_SAFETY_CONFIG}
               kazanTemp={status.homersekletek?.kazan ?? null}
               sending={sendingPump}
+              disabled={Boolean(status.serviceMode)}
               onSendPumpConfig={handleSendPumpConfig}
             />
 
@@ -532,6 +637,12 @@ export default function App() {
               kazanTemp={status.homersekletek?.kazan ?? null}
               sending={sendingAlarm}
               onSendAlarmConfig={handleSendAlarmConfig}
+            />
+
+            <PushNotifications
+              prefs={notificationPrefs}
+              onChangePrefs={handleChangeNotificationPrefs}
+              activeAlerts={activeAlertsMap}
             />
 
             <HeartbeatControl
@@ -547,6 +658,7 @@ export default function App() {
               outputs={status.kimenetek ?? DEFAULT_OUTPUTS}
               pumpMode={status.pumpConfig?.pumpMode ?? 'auto'}
               pendingKey={pendingOutputKey}
+              disabled={Boolean(status.serviceMode)}
               onToggleOutput={handleToggleOutput}
             />
 
@@ -557,6 +669,11 @@ export default function App() {
           </main>
         )}
       </div>
+
+      <ServiceModeModal
+        active={Boolean(status?.serviceMode)}
+        startedAtMs={serviceStartedAtMs}
+      />
     </div>
   );
 }

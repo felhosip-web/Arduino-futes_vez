@@ -820,6 +820,12 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
         state.pumpState = PUMP_STATE_FUTES;
     }
 
+    // Ha a kazánnál lévő fizikai szerviz kapcsoló BE van kapcsolva, az ESP soha ne küldjön KI parancsot
+    if (state.serviceMode) {
+        desiredPump = true;
+        state.pumpState = PUMP_STATE_FUTES;
+    }
+
     state.pumpOn = desiredPump;
 
     if (!pumpLogInitialized) {
@@ -1000,10 +1006,21 @@ bool sendRequestToNano() {
                         state.eloremenoCount++;
                     }
 
-                    bool ackFlag   = (rx.nano.syncFlags & SYNC_FLAG_ACK) != 0;
-                    bool staleFlag = (rx.nano.syncFlags & SYNC_FLAG_STALE) != 0;
-                    state.nanoSynced    = ackFlag;
-                    state.nanoSyncStale = staleFlag;
+                    bool ackFlag         = (rx.nano.syncFlags & SYNC_FLAG_ACK) != 0;
+                    bool staleFlag       = (rx.nano.syncFlags & SYNC_FLAG_STALE) != 0;
+                    bool rxServiceMode   = (rx.nano.syncFlags & SYNC_FLAG_SERVICE_MODE) != 0;
+                    state.nanoSynced     = ackFlag;
+                    state.nanoSyncStale  = staleFlag;
+
+                    if (rxServiceMode != state.serviceMode) {
+                        state.serviceMode = rxServiceMode;
+                        if (state.serviceMode) {
+                            logEvent(LOG_INFO, "SERVICE_MODE_ON_BY_SLAVE", "Kazan oldali szerviz kapcsolo BE");
+                        } else {
+                            logEvent(LOG_INFO, "SERVICE_MODE_OFF_BY_SLAVE", "Kazan oldali szerviz kapcsolo KI");
+                        }
+                        menu.requestRedraw();
+                    }
 
                     if (syncEpochToSend != 0) {
                         uint16_t expectedLow16 = static_cast<uint16_t>(syncEpochToSend & 0xFFFFU);
@@ -1155,6 +1172,7 @@ void buildStatusJson(JsonDocument& doc) {
     doc["currentTemp"] = round1(state.currentTemp);
     doc["targetTemp"]  = round1(state.targetTemp);
     doc["heatingOn"]   = state.heatingOn;
+    doc["serviceMode"] = state.serviceMode;
     doc["mode"]        = modeToStr(state.mode);
     doc["online"]      = true;
 
@@ -1186,6 +1204,13 @@ void buildStatusJson(JsonDocument& doc) {
     pCfg["pumpStartSensor"] = pumpSensorToStr(state.pumpConfig.pumpStartSensor);
 
     doc["pumpState"] = pumpStateToStr(state.pumpState);
+    const char* pumpCtrlStr = "AUTO";
+    if (state.serviceMode) {
+        pumpCtrlStr = "SERVICE";
+    } else if (state.pumpConfig.pumpMode != PUMP_MODE_AUTO) {
+        pumpCtrlStr = "MANUAL";
+    }
+    doc["pumpControl"] = pumpCtrlStr;
 
     JsonObject aCfg = doc["alarmConfig"].to<JsonObject>();
     aCfg["alarmTemp"]    = round1(state.alarmConfig.alarmTemp);
@@ -2240,6 +2265,7 @@ void loop() {
 
         bool prevNrfOk       = state.nrf24Ok;
         bool prevPump        = state.pumpOn;
+        bool prevServiceMode = state.serviceMode;
         uint8_t prevPState   = state.pumpState;
         uint8_t prevAlarmAct = state.alarmState.active;
         uint8_t prevAlarmRsn = state.alarmState.reason;
@@ -2255,8 +2281,9 @@ void loop() {
         }
 
         if (mqttStatusPendingRetry || modeRestored || prevNrfOk != state.nrf24Ok ||
-            prevPump != state.pumpOn || prevPState != state.pumpState ||
-            prevAlarmAct != state.alarmState.active || prevAlarmRsn != state.alarmState.reason) {
+            prevPump != state.pumpOn || prevServiceMode != state.serviceMode ||
+            prevPState != state.pumpState || prevAlarmAct != state.alarmState.active ||
+            prevAlarmRsn != state.alarmState.reason) {
             publishMqttStatus();
         }
 

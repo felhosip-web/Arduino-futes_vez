@@ -11,13 +11,15 @@
 // Bekötés (Hardware SPI):
 //   DS18B20 OneWire busz    : D2 (4.7 kOhm pull-up az 5V felé)
 //   NRF24L01+ (Hardware SPI): CE=D3, CSN=D4, MOSI=D11, MISO=D12, SCK=D13
+//   Bemenetek:
+//     D6 -> Szerviz kapcsoló (SPST GND-re, INPUT_PULLUP, aktív LOW = Szerviz BE)
 //   Kimenetek:
-//     D5 -> led_zold
-//     D6 -> led_piros (aktív riasztás esetén 500ms BE / 500ms KI millis()-el villog)
-//     D7 -> szivattyu relé
-//     D8 -> tartalek1
-//     D9 -> tartalek2
-//     D10 -> tartalek3 (OUTPUT módban marad, hogy az AVR Hardware SPI Master maradjon)
+//     D5      -> led_zold (Szerviz módban folyamatos BE)
+//     A2 (16) -> led_piros (aktív riasztás esetén 500ms BE / 500ms KI villogás; D6 szabadon hagyva a szerviz kapcsolónak)
+//     D7      -> szivattyu relé
+//     D8      -> tartalek1
+//     D9      -> tartalek2
+//     D10     -> tartalek3 (OUTPUT módban marad, hogy az AVR Hardware SPI Master maradjon)
 //     A3 (17) -> tartalek4
 //     A4 (18) -> tartalek5
 //
@@ -29,20 +31,23 @@
 //   - Fail-safe: induláskor amíg nincs ESP kapcsolat, valamint ha
 //     (millis() - lastRequestMs) > 3 * heartbeatIntervalSec * 1000 + 2000:
 //     szivattyú BE, piros LED 500ms-es villogás, alarmState reason = nrf_fail.
+//   - Szerviz kapcsoló (D6): 50ms debounce után azonnali szivattyú BE + zöld LED
+//     folyamatos BE, ESP pump parancstól függetlenül.
 // ============================================================================
 
-constexpr uint8_t PIN_ONE_WIRE   = 2;
-constexpr uint8_t PIN_NRF_CE     = 3;
-constexpr uint8_t PIN_NRF_CSN    = 4;
+constexpr uint8_t PIN_ONE_WIRE       = 2;
+constexpr uint8_t PIN_NRF_CE         = 3;
+constexpr uint8_t PIN_NRF_CSN        = 4;
 
-constexpr uint8_t PIN_LED_ZOLD   = 5;
-constexpr uint8_t PIN_LED_PIROS  = 6;
-constexpr uint8_t PIN_SZIVATTYU  = 7;
-constexpr uint8_t PIN_TARTALEK1  = 8;
-constexpr uint8_t PIN_TARTALEK2  = 9;
-constexpr uint8_t PIN_TARTALEK3  = 10;
-constexpr uint8_t PIN_TARTALEK4  = 17; // A3
-constexpr uint8_t PIN_TARTALEK5  = 18; // A4
+constexpr uint8_t PIN_LED_ZOLD       = 5;
+constexpr uint8_t PIN_SERVICE_SWITCH = 6;  // D6: SPST szerviz kapcsoló GND-re (INPUT_PULLUP, aktív LOW)
+constexpr uint8_t PIN_SZIVATTYU      = 7;
+constexpr uint8_t PIN_TARTALEK1      = 8;
+constexpr uint8_t PIN_TARTALEK2      = 9;
+constexpr uint8_t PIN_TARTALEK3      = 10;
+constexpr uint8_t PIN_LED_PIROS      = 16; // A2 (D6 átadva a szerviz kapcsolónak)
+constexpr uint8_t PIN_TARTALEK4      = 17; // A3
+constexpr uint8_t PIN_TARTALEK5      = 18; // A4
 
 // Relé logika: állítsd true-ra, ha a relémodul LOW jellel húz be
 constexpr bool RELAY_ACTIVE_LOW = false;
@@ -52,6 +57,7 @@ constexpr uint32_t DS18B20_CONV_TIME_MS    = 800UL;      // 12-bit konverzió (~
 constexpr uint32_t ALARM_BLINK_INTERVAL_MS = 500UL;      // 500ms BE / 500ms KI
 constexpr uint32_t SLAVE_TX_TURNAROUND_MS  = 5UL;        // 5ms szünet, hogy a Master biztosan RX módban legyen (< 200ms)
 constexpr uint32_t NANO_SYNC_STALE_MS      = 46800000UL; // 13 óra (2x12h + 1h tűrés) -> syncStale = true
+constexpr uint32_t SERVICE_DEBOUNCE_MS     = 50UL;       // 50ms szoftveres debounce a szerviz kapcsolónak
 
 constexpr float ALARM_OVERHEAT_DEFAULT = 85.0f;
 constexpr float ALARM_OVERHEAT_MIN     = 70.0f;
@@ -110,6 +116,11 @@ bool     failsafeActive       = true; // Induláskor nincs még ESP kapcsolat ->
 uint32_t lastAlarmBlinkMs     = 0;
 bool     alarmBlinkOn         = true;
 
+// --- Hardveres szerviz kapcsoló (D6 aktív LOW, 50ms túlcsordulás-biztos debounce) ---
+bool     serviceMode          = false;
+bool     serviceRawReading    = false;
+uint32_t serviceDebounceMs    = 0;
+
 // --- ESP -> Nano időszinkron (49 napos millis() túlcsordulás-biztos) ---
 uint32_t syncEpoch            = 0;
 uint32_t syncMillis           = 0;
@@ -120,6 +131,22 @@ uint32_t getNanoEpoch(uint32_t now) {
     if (!hasTimeSync) return 0UL;
     // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
     return syncEpoch + (static_cast<uint32_t>(now - syncMillis) / 1000UL);
+}
+
+void updateServiceSwitch(uint32_t now) {
+    bool rawLow = (digitalRead(PIN_SERVICE_SWITCH) == LOW);
+    if (rawLow != serviceRawReading) {
+        serviceRawReading = rawLow;
+        serviceDebounceMs = now;
+        return;
+    }
+
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (serviceRawReading != serviceMode &&
+        (static_cast<uint32_t>(now - serviceDebounceMs) >= SERVICE_DEBOUNCE_MS)) {
+        serviceMode = serviceRawReading;
+        Serial.println(serviceMode ? F("SERVICE_MODE_ON") : F("SERVICE_MODE_OFF"));
+    }
 }
 
 // ============================================================================
@@ -192,7 +219,13 @@ void refreshHardwareOutputs(uint32_t now) {
         setBit(effectiveMask, OUT_BIT_SZIVATTYU, true);
     }
 
-    // Piros LED (D6): 500ms villogás, ha riasztás aktív és alarmEnabled=true
+    // Szerviz kapcsoló (D6 aktív LOW): szivattyú AZONNAL BE az ESP parancstól függetlenül, zöld LED folyamatos BE
+    if (serviceMode) {
+        setBit(effectiveMask, OUT_BIT_SZIVATTYU, true);
+        setBit(effectiveMask, OUT_BIT_LED_ZOLD, true);
+    }
+
+    // Piros LED (A2): 500ms villogás, ha riasztás aktív és alarmEnabled=true (szerviz módban is a riasztás szerint)
     bool pirosOn = false;
     if (currentAlarmConfig.alarmEnabled == 0) {
         alarmBlinkOn = false;
@@ -311,6 +344,8 @@ void buildResponsePacket(uint32_t seq) {
     uint8_t sFlags = 0;
     if (hasTimeSync) sFlags |= SYNC_FLAG_ACK;
     if (syncStale)   sFlags |= SYNC_FLAG_STALE;
+    sFlags = static_cast<uint8_t>((sFlags & ~SYNC_FLAG_SERVICE_MODE) |
+                                  (serviceMode ? SYNC_FLAG_SERVICE_MODE : 0U));
     lastResponsePacket.nano.syncFlags      = sFlags;
     lastResponsePacket.nano.syncEpochLow16 = hasTimeSync ? static_cast<uint16_t>(syncEpoch & 0xFFFFU) : 0U;
 }
@@ -342,6 +377,7 @@ void setup() {
     Serial.println(F("FIGYELEM: Csereld le az ADDR_* tomboket a scanner altal kiirt valos cimekre, kulonben minden szenzor -127 lesz!"));
 
     pinMode(PIN_LED_ZOLD, OUTPUT);
+    pinMode(PIN_SERVICE_SWITCH, INPUT_PULLUP);
     pinMode(PIN_LED_PIROS, OUTPUT);
     pinMode(PIN_SZIVATTYU, OUTPUT);
     pinMode(PIN_TARTALEK1, OUTPUT);
@@ -349,6 +385,14 @@ void setup() {
     pinMode(PIN_TARTALEK3, OUTPUT); // D10 OUTPUT marad (AVR SPI Master)
     pinMode(PIN_TARTALEK4, OUTPUT);
     pinMode(PIN_TARTALEK5, OUTPUT);
+
+    // Kezdeti szerviz kapcsoló állapot beolvasása induláskor
+    serviceRawReading = (digitalRead(PIN_SERVICE_SWITCH) == LOW);
+    serviceMode       = serviceRawReading;
+    serviceDebounceMs = millis();
+    if (serviceMode) {
+        Serial.println(F("SERVICE_MODE_ON"));
+    }
 
     // Indulási biztonságos alapállapot: amíg nincs ESP kapcsolat, szivattyú BE + piros LED villog
     failsafeActive = true;
@@ -389,6 +433,7 @@ void setup() {
 void loop() {
     uint32_t now = millis();
     handleSerialCommands();
+    updateServiceSwitch(now);
 
     // 1. Nem-blokkoló DS18B20 mérés 10 másodpercenként (ne blokkolja az RF24 vételt!)
     // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.

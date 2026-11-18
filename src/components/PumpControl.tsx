@@ -15,6 +15,7 @@ interface PumpControlProps {
   safety?: SafetyConfig;
   kazanTemp: number | null;
   sending: boolean;
+  disabled?: boolean;
   onSendPumpConfig: (config: PumpConfig) => Promise<void>;
 }
 
@@ -44,11 +45,13 @@ export function PumpControl({
   safety = DEFAULT_SAFETY_CONFIG,
   kazanTemp,
   sending,
+  disabled = false,
   onSendPumpConfig,
 }: PumpControlProps) {
   const [draftConfig, setDraftConfig] = useState<PumpConfig>(pumpConfig);
   const debounceTimerRef = useRef<number | null>(null);
   const isSlidingRef = useRef<boolean>(false);
+  const actionDisabled = sending || disabled;
 
   const hysteresisInvalid = hasHysteresisError(
     draftConfig.pumpStartTemp,
@@ -138,7 +141,11 @@ export function PumpControl({
             <PauseCircle className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
           )}
           <span>
-            {isPumpRunning ? 'FŰTÉS - Szivattyú BE' : 'VÁRAKOZÁS - Szivattyú KI'}
+            {disabled
+              ? 'SZERVIZ - Szivattyú BE (Nano)'
+              : isPumpRunning
+                ? 'FŰTÉS - Szivattyú BE'
+                : 'VÁRAKOZÁS - Szivattyú KI'}
           </span>
         </div>
       </div>
@@ -182,8 +189,8 @@ export function PumpControl({
                     pumpMode: opt.value,
                   })
                 }
-                disabled={sending}
-                className={`min-h-[44px] rounded-md px-3 py-2 text-xs font-semibold sm:px-4 sm:text-sm whitespace-nowrap shrink-0 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
+                disabled={actionDisabled}
+                className={`min-h-[44px] rounded-md px-3 py-2 text-xs font-semibold sm:px-4 sm:text-sm whitespace-nowrap shrink-0 transition-colors disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
                   active
                     ? opt.value === 'manual_off'
                       ? 'bg-red-500 text-white'
@@ -219,6 +226,7 @@ export function PumpControl({
             max={50}
             step={0.5}
             value={draftConfig.pumpStartTemp}
+            disabled={disabled}
             onPointerDown={() => {
               isSlidingRef.current = true;
             }}
@@ -237,7 +245,7 @@ export function PumpControl({
                 pumpStartTemp: roundHalf(parseFloat(e.target.value)),
               })
             }
-            className="mt-3 w-full cursor-pointer"
+            className="mt-3 w-full cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
           />
           <div className="mt-1.5 flex justify-between text-xs tabular-nums text-slate-500">
             <span>30.0 °C</span>
@@ -269,6 +277,7 @@ export function PumpControl({
             max={40}
             step={0.5}
             value={draftConfig.pumpStopTemp}
+            disabled={disabled}
             onPointerDown={() => {
               isSlidingRef.current = true;
             }}
@@ -287,7 +296,7 @@ export function PumpControl({
                 pumpStopTemp: roundHalf(parseFloat(e.target.value)),
               })
             }
-            className="mt-3 w-full cursor-pointer"
+            className="mt-3 w-full cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
           />
           <div className="mt-1.5 flex justify-between text-xs tabular-nums text-slate-500">
             <span>20.0 °C</span>
@@ -330,8 +339,8 @@ export function PumpControl({
               pumpStartSensor: e.target.value as PumpStartSensor,
             })
           }
-          disabled={sending}
-          className="min-h-[44px] w-full rounded-lg border border-slate-700 bg-slate-950 px-3.5 py-2 text-sm font-medium text-slate-100 sm:w-52 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
+          disabled={actionDisabled}
+          className="min-h-[44px] w-full rounded-lg border border-slate-700 bg-slate-950 px-3.5 py-2 text-sm font-medium text-slate-100 disabled:cursor-not-allowed disabled:opacity-50 sm:w-52 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
         >
           {PUMP_SENSOR_OPTIONS.map((opt) => (
             <option key={opt.value} value={opt.value}>

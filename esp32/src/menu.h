@@ -50,6 +50,7 @@ struct SystemState {
     uint32_t manualOffStartMs  = 0;
     bool     safetyOverheat    = false;
     bool     safetySensorFault = false;
+    bool     serviceMode       = false;
 
     // Riasztási konfiguráció és egyesített állapot
     AlarmConfigPacked alarmConfig = {

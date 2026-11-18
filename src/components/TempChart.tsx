@@ -18,6 +18,7 @@ interface TempChartProps {
   samples: HistorySample[];
   range: HistoryRange;
   liveValue?: number | null;
+  connectNulls?: boolean;
 }
 
 export function formatChartAxisTime(iso: string, range: HistoryRange): string {
@@ -86,7 +87,10 @@ export function TempChart({
   samples,
   range,
   liveValue,
+  connectNulls,
 }: TempChartProps) {
+  const shouldConnectNulls =
+    connectNulls ?? (sensorKey === 'kulteri' || sensorKey === 'szoba');
   const chartData = useMemo(
     () =>
       samples.map((s) => {
@@ -218,7 +222,7 @@ export function TempChart({
                 strokeWidth={2}
                 dot={false}
                 activeDot={{ r: 4, fill: color, stroke: '#0f172a', strokeWidth: 2 }}
-                connectNulls
+                connectNulls={shouldConnectNulls}
                 isAnimationActive={false}
               />
             </LineChart>
