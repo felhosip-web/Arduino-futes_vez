@@ -10,6 +10,7 @@ import type { HistoryRange, HistoryResolution, HistorySensorFilter } from './his
 import { normalizeLogLevel } from './logsStore.ts';
 import type { LogLevel } from './logsStore.ts';
 import type { HeatingMqttBridge } from './mqttBridge.ts';
+import { VALID_SENSOR_ROLES, type SensorRoleKey } from './types.ts';
 import {
   buildAlarmUpdateCommand,
   buildHeartbeatUpdateCommand,
@@ -204,6 +205,152 @@ export function createHeatingRouter(
       await bridge.publishAction(id, { action: 'resetTrend' });
       bridge.logBackendEvent('INFO', 'TREND_RESET_BY_USER', `Eloremeno statisztika nullazva (${id})`);
       res.json({ ok: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'MQTT küldési hiba.';
+      res.status(503).json({ error: message });
+    }
+  });
+
+  // GET /api/heating/:id/sensor/scan - buszon lévő DS18B20 szenzorok felderítése (Bearer auth + CMD_ACK)
+  router.get('/:id/sensor/scan', requireBearerAuth, async (req, res) => {
+    const { id } = req.params;
+
+    try {
+      const result = await withDeviceLock(id, async () => {
+        const current = bridge.getDeviceState(id);
+        if (!hasValidEspStatus(current)) {
+          return { conflict: true as const };
+        }
+        const meta = bridge.generateCmdId();
+        const waiter = bridge.createCommandAckWaiter(meta.cmdId, 4500);
+        try {
+          await bridge.publishAction(id, {
+            action: 'sensorScan',
+            cmdId: meta.cmdId,
+            cmdSeq: meta.cmdSeq,
+          });
+        } catch (err) {
+          waiter.cancel();
+          throw err;
+        }
+        return {
+          conflict: false as const,
+          cmdId: meta.cmdId,
+          ackPromise: waiter.promise,
+        };
+      });
+
+      if (result.conflict) {
+        res.status(409).json({ error: 'Nincs még ESP állapot' });
+        return;
+      }
+
+      const ack = await result.ackPromise;
+      if (!ack.acked) {
+        res.status(504).json({
+          ok: false,
+          acked: false,
+          cmdId: ack.cmdId,
+          reason: ack.reason || 'ACK_TIMEOUT',
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        acked: true,
+        cmdId: ack.cmdId,
+        ...(ack.executedAt !== undefined ? { executedAt: ack.executedAt } : {}),
+        found: ack.found ?? [],
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'MQTT küldési hiba.';
+      res.status(503).json({ error: message });
+    }
+  });
+
+  // POST /api/heating/:id/sensor/learn - DS18B20 ROM cím társítása szerephez EEPROM-ban (Bearer auth + CMD_ACK)
+  router.post('/:id/sensor/learn', async (req, res) => {
+    const { id } = req.params;
+    const body = req.body as Record<string, unknown> | undefined;
+    const rawRole = typeof body?.role === 'string' ? body.role.trim() : '';
+    const rawAddress = typeof body?.address === 'string' ? body.address.trim() : '';
+
+    if (!(VALID_SENSOR_ROLES as readonly string[]).includes(rawRole)) {
+      res.status(400).json({
+        error: 'Érvénytelen role. Engedélyezett: eloremeno, visszatero, kazan, kulteri.',
+      });
+      return;
+    }
+
+    const addrRegex = /^([0-9A-Fa-f]{2}:){7}[0-9A-Fa-f]{2}$/;
+    const normalizedAddr = rawAddress.toUpperCase();
+    if (!addrRegex.test(normalizedAddr) || normalizedAddr === '00:00:00:00:00:00:00:00') {
+      res.status(400).json({
+        error: 'Érvénytelen DS18B20 cím formátum (elvárt: XX:XX:XX:XX:XX:XX:XX:XX).',
+      });
+      return;
+    }
+
+    const role = rawRole as SensorRoleKey;
+
+    try {
+      const result = await withDeviceLock(id, async () => {
+        const current = bridge.getDeviceState(id);
+        if (!hasValidEspStatus(current)) {
+          return { conflict: true as const };
+        }
+        const meta = bridge.generateCmdId();
+        const waiter = bridge.createCommandAckWaiter(meta.cmdId, 3500);
+        try {
+          await bridge.publishAction(id, {
+            action: 'sensorLearn',
+            role,
+            address: normalizedAddr,
+            cmdId: meta.cmdId,
+            cmdSeq: meta.cmdSeq,
+          });
+        } catch (err) {
+          waiter.cancel();
+          throw err;
+        }
+        return {
+          conflict: false as const,
+          cmdId: meta.cmdId,
+          ackPromise: waiter.promise,
+        };
+      });
+
+      if (result.conflict) {
+        res.status(409).json({ error: 'Nincs még ESP állapot' });
+        return;
+      }
+
+      const ack = await result.ackPromise;
+      if (!ack.acked) {
+        res.status(504).json({
+          ok: false,
+          acked: false,
+          cmdId: ack.cmdId,
+          reason: ack.reason || 'ACK_TIMEOUT',
+        });
+        return;
+      }
+
+      bridge.logBackendEvent(
+        'INFO',
+        'SENSOR_LEARN',
+        `${id} role=${role} address=${normalizedAddr} (cmdId=${ack.cmdId})`
+      );
+
+      res.json({
+        ok: true,
+        acked: true,
+        cmdId: ack.cmdId,
+        ...(ack.executedAt !== undefined ? { executedAt: ack.executedAt } : {}),
+        role,
+        address: normalizedAddr,
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'MQTT küldési hiba.';
       res.status(503).json({ error: message });

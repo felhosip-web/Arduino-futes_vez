@@ -8,6 +8,7 @@ import {
   Gauge,
   Radio,
   RefreshCw,
+  Thermometer,
   Wrench,
 } from 'lucide-react';
 import { API_URL, DEVICE_ID } from '../config';
@@ -68,8 +69,18 @@ export function SystemCheck({ status, lastUpdatedAt, onSyncTriggered }: SystemCh
       ? status.loopLastMs
       : null;
 
+  const sensorUnknown = Boolean(status?.sensorUnknown);
+  const sensorsOkCount = status?.sensors
+    ? (['eloremeno', 'visszatero', 'kazan', 'kulteri'] as const).filter(
+        (key) => status.sensors?.[key]?.ok
+      ).length
+    : sensorUnknown
+      ? 0
+      : 4;
+
   const hasSyncData = Boolean(status && sync);
-  const allOk = hasSyncData && ntpOk && nanoOk && radioOk && !overflowWarning && !anyLoopFault;
+  const allOk =
+    hasSyncData && ntpOk && nanoOk && radioOk && !overflowWarning && !anyLoopFault && !sensorUnknown;
 
   const handleForceSync = async () => {
     setSyncing(true);
@@ -349,6 +360,39 @@ export function SystemCheck({ status, lastUpdatedAt, onSyncTriggered }: SystemCh
             <p className="mt-1 text-xs text-slate-400 tabular-nums">
               {loopMaxMs !== null ? `ESP max: ${loopMaxMs} ms` : 'ESP max: —'} · Nano:{' '}
               {nanoLoopFault ? 'LASSÚ' : 'OK'}
+            </p>
+          </div>
+
+          {/* 7. DS18B20 szenzorok */}
+          <div className="rounded-lg border border-slate-800/90 bg-slate-950/60 p-4 sm:col-span-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                <Thermometer className="h-4 w-4 text-slate-400" aria-hidden="true" />
+                DS18B20 szenzorok
+              </span>
+              <span
+                className={`rounded border px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${
+                  sensorUnknown
+                    ? 'border-red-500 bg-red-950/80 text-red-200 animate-pulse'
+                    : 'border-emerald-500/40 bg-emerald-950/60 text-emerald-300'
+                }`}
+              >
+                {sensorUnknown ? 'ISMERETLEN' : `OK (${sensorsOkCount}/4)`}
+              </span>
+            </div>
+            <p
+              className={`mt-2 text-sm font-semibold ${
+                sensorUnknown ? 'text-red-300' : 'text-emerald-300'
+              }`}
+            >
+              {sensorUnknown
+                ? 'Szenzor ismeretlen - tanítás kell'
+                : 'Mind a 4 szerep azonosítva az EEPROM-ból'}
+            </p>
+            <p className="mt-1 text-xs text-slate-400">
+              {sensorUnknown
+                ? 'Használd a Vezérlőpult „Szenzorok” kártyáját vagy az ESP32 „BEALLITAS → Szenzor Tanitas” menüjét.'
+                : 'OneWire auto-discovery egyezik a mentett címekkel'}
             </p>
           </div>
         </div>

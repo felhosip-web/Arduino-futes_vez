@@ -42,6 +42,7 @@ import { LogsView } from './components/LogsView';
 import { ChartsView } from './components/ChartsView';
 import { ServiceModeModal } from './components/ServiceModeModal';
 import { PushNotifications } from './components/PushNotifications';
+import { SensorsPanel } from './components/SensorsPanel';
 import {
   CRITICAL_ALERT_ITEMS,
   evaluateCriticalAlerts,
@@ -754,6 +755,8 @@ export default function App() {
               kazanStatus={status.kazan_status ?? [0, 0, 0, 0, 0, 0, 0, 0]}
               nrf24Ok={Boolean(status.nrf24_ok)}
             />
+
+            <SensorsPanel status={status} onSensorLearned={fetchInitialState} />
           </main>
         )}
       </div>

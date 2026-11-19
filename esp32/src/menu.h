@@ -93,6 +93,32 @@ struct SystemState {
     bool     nanoLoopFault       = false;
     uint32_t loopMaxMs           = 0;
     uint32_t loopLastMs          = 0;
+
+    // DS18B20 Auto-Discovery és tanítás állapota
+    struct SensorRoleState {
+        uint8_t address[8] = { 0 };
+        bool    assigned   = false;
+        bool    ok         = false;
+    };
+
+    struct DiscoveredSensorState {
+        uint8_t address[8] = { 0 };
+        float   temp       = SENSOR_DISCONNECTED_VAL;
+    };
+
+    SensorRoleState       sensors[SENSOR_ROLE_COUNT];
+    bool                  sensorUnknown        = false;
+    bool                  hasSensorRolesLoaded = false;
+    uint8_t               scanFoundCount       = 0;
+    DiscoveredSensorState scanFound[MAX_DISCOVERED_SENSORS];
+    bool                  scanInProgress       = false;
+    bool                  scanResultReady      = false;
+    bool                  scanLastOk           = false;
+    uint32_t              scanCompletedSeq     = 0;
+    bool                  learnInProgress      = false;
+    bool                  learnResultReady     = false;
+    bool                  learnLastOk          = false;
+    uint32_t              learnCompletedSeq    = 0;
 };
 
 // ============================================================================
@@ -106,9 +132,12 @@ enum MenuState : uint8_t {
     MENU_BEALLITAS,    // BEALLITAS almenü (szerkeszthető)
     MENU_KIMENETEK,    // KIMENETEK almenü (kapcsolható)
     MENU_LOGS,         // STATUS -> NAPLO (utolsó 5 naplóbejegyzés lapozása)
-    MENU_CHECK,        // STATUS -> CHECK (NTP, Nano, Radio, Millis ellenőrzés)
+    MENU_CHECK,        // STATUS -> CHECK (NTP, Nano, Radio, Millis, Szerviz, Loop, Szenzor)
     MENU_TREND,        // FOKOK -> TREND (trend, delta, max/min, átlag)
-    MENU_EDIT          // Érték szerkesztés (BEALLITAS pont)
+    MENU_EDIT,         // Érték szerkesztés (BEALLITAS pont)
+    MENU_SENSOR_MENU,  // BEALLITAS -> SZENZOR TANITAS almenü
+    MENU_SENSOR_SCAN,  // SZENZOR KERESES néző
+    MENU_SENSOR_TEACH  // TANITAS (10 mp melegítéses varázsló)
 };
 
 enum MenuItemType : uint8_t {
@@ -137,6 +166,8 @@ struct MenuCallbacks {
     void (*onSettingCommitted)(void);
     void (*onFactoryReset)(void);
     void (*onTrendReset)(void);
+    void (*onRequestSensorScan)(void);
+    void (*onRequestSensorLearn)(uint8_t role, const uint8_t* addr);
 };
 
 // Egységes NVS mentő függvények (implementáció: main.cpp)
@@ -170,8 +201,18 @@ public:
     void drawLogViewer();
     void drawCheckViewer();
     void drawTrendViewer();
+    void drawSensorScanViewer();
+    void drawSensorTeachViewer(uint32_t now);
 
 private:
+    enum TeachPhase : uint8_t {
+        TEACH_PHASE_INIT = 0,
+        TEACH_PHASE_HEAT_WAIT,
+        TEACH_PHASE_CONFIRM,
+        TEACH_PHASE_SAVING,
+        TEACH_PHASE_TIMEOUT
+    };
+
     HeatingLcd*   _lcd   = nullptr;
     SystemState*  _state = nullptr;
     MenuCallbacks _callbacks{};
@@ -182,6 +223,7 @@ private:
     uint8_t   _logCursor      = 0;
     uint8_t   _checkCursor    = 0;
     uint8_t   _trendCursor    = 0;
+    uint8_t   _scanCursor     = 0;
 
     // Szerkesztési puffer (MQTT CMD vagy 20mp timeout nem írja felül félbehagyva)
     uint8_t _editItemIndex    = 0;
@@ -189,6 +231,20 @@ private:
     float   _editPartnerFloat = 0.0f; // Pump Start állításakor a Pump Stop automatikus követéséhez
     uint8_t _editEnum         = 0;
     bool    _editBool         = false;
+
+    // Szenzor tanítás állapota
+    uint32_t   _seenScanSeq          = 0;
+    uint32_t   _seenLearnSeq         = 0;
+    uint8_t    _teachRole            = 0;
+    TeachPhase _teachPhase           = TEACH_PHASE_INIT;
+    uint32_t   _teachStartMs         = 0;
+    uint32_t   _teachLastPollMs      = 0;
+    uint32_t   _teachTimeoutBannerMs = 0;
+    bool       _teachBaselineReady   = false;
+    uint8_t    _teachBaseCount       = 0;
+    uint8_t    _teachBaseAddr[MAX_DISCOVERED_SENSORS][8] = { { 0 } };
+    float      _teachBaseTemp[MAX_DISCOVERED_SENSORS]    = { 0 };
+    uint8_t    _teachFoundAddr[8]    = { 0 };
 
     uint32_t _lastActivityMs  = 0;
     uint32_t _lastMenuDrawMs  = 0;
@@ -208,7 +264,7 @@ private:
     bool _mainDirty         = true;
 
     // Dinamikus menütáblák adott menüszinthez
-    static constexpr uint8_t MAX_MENU_ITEMS = 14;
+    static constexpr uint8_t MAX_MENU_ITEMS = 15;
     MenuItem _items[MAX_MENU_ITEMS];
     uint8_t  _itemCount = 0;
 
@@ -218,6 +274,7 @@ private:
     void commitEdit(uint32_t now);
     void toggleOutput(uint8_t itemIndex, uint32_t now);
     void navigateBack(uint32_t now);
+    void updateSensorTeaching(uint32_t now);
 
     void formatMenuItemValue(const MenuItem& item, char* buf, size_t bufLen) const;
     void formatEditValueString(const MenuItem& item, char* buf, size_t bufLen) const;

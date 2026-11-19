@@ -140,6 +140,40 @@ uint8_t  espFastLoopStreak           = 0;
 uint32_t espLastSlowLogMs            = 0;
 bool     espHasSlowLogYet            = false;
 
+// --- Nem-blokkoló DS18B20 Auto-Discovery / Tanítás NRF állapotgép (0xA3 / 0xB4) ---
+enum SensorJobType : uint8_t {
+    SJOB_NONE = 0,
+    SJOB_ROLES_ONLY,
+    SJOB_SCAN,
+    SJOB_LEARN
+};
+
+enum SensorJobStep : uint8_t {
+    SSTEP_IDLE = 0,
+    SSTEP_SEND_SCAN_START,
+    SSTEP_WAIT_CONV_DELAY,
+    SSTEP_FETCH_FOUND,
+    SSTEP_SEND_LEARN,
+    SSTEP_FETCH_ROLES
+};
+
+SensorJobType sensorJobType          = SJOB_NONE;
+SensorJobStep sensorJobStep          = SSTEP_IDLE;
+uint32_t      sensorJobStartedMs     = 0;
+uint32_t      sensorConvWaitStartMs  = 0;
+uint8_t       sensorFetchOffset      = 0;
+uint8_t       sensorScanReadyRetries = 0;
+uint8_t       sensorLearnRole        = 0;
+uint8_t       sensorLearnAddr[8]     = { 0 };
+uint8_t       sensorCmdSeqCounter    = 0;
+char          sensorMqttCmdId[64]    = { 0 };
+
+constexpr uint32_t SENSOR_JOB_TIMEOUT_MS = 4500UL;
+
+bool startSensorScanJob(const char* cmdId);
+bool startSensorLearnJob(uint8_t role, const uint8_t addr[8], const char* cmdId);
+bool startSensorRolesSyncJob();
+
 // ============================================================================
 // ESEMÉNY- ÉS HIBANAPLÓ (KÖRKÖRÖS PUFFER + SERIAL + AZONNALI MQTT ERROR)
 // ============================================================================
@@ -847,7 +881,8 @@ void evaluateAlarmState() {
                 logEvent(LOG_ERROR, "ALARM_OVERHEAT", msg);
                 break;
             case ALARM_REASON_SENSOR_FAIL:
-                logEvent(LOG_ERROR, "ALARM_SENSOR", "Kazan szenzor hiba (-127)");
+                logEvent(LOG_ERROR, "ALARM_SENSOR",
+                         state.sensorUnknown ? "Szenzor ismeretlen - tanitas szukseges" : "Kazan szenzor hiba (-127)");
                 break;
             case ALARM_REASON_PUMP_FAULT:
                 logEvent(LOG_ERROR, "ALARM_PUMP", "Rele / szivattyu visszacsatolasi hiba");
@@ -1057,6 +1092,51 @@ void publishMqttCmdAck(const char* cmdId, bool ok, const char* reason, bool pump
     }
 }
 
+void publishMqttSensorScanAck(const char* cmdId, bool ok, const char* reason) {
+    if (!cmdId || cmdId[0] == '\0' || !mqtt.connected()) {
+        return;
+    }
+
+    uint32_t uptimeSec = static_cast<uint32_t>(uptimeTotalMs / 1000ULL);
+    char execAt[32];
+    formatEspIsoTimeStr(execAt, sizeof(execAt), uptimeSec);
+
+    JsonDocument doc;
+    doc["cmdId"]      = cmdId;
+    doc["ok"]         = ok;
+    doc["executedAt"] = execAt;
+    if (!ok && reason && reason[0] != '\0') {
+        doc["reason"] = reason;
+    }
+
+    JsonArray arr = doc["found"].to<JsonArray>();
+    if (ok) {
+        for (uint8_t i = 0; i < state.scanFoundCount && i < MAX_DISCOVERED_SENSORS; i++) {
+            JsonObject item = arr.add<JsonObject>();
+            char addrBuf[24];
+            formatDeviceAddressHex(state.scanFound[i].address, addrBuf, sizeof(addrBuf));
+            item["address"] = addrBuf;
+            if (isSensorValid(state.scanFound[i].temp)) {
+                item["temp"] = round1(state.scanFound[i].temp);
+            } else {
+                item["temp"] = nullptr;
+            }
+        }
+    }
+
+    char payload[768];
+    size_t n = serializeJson(doc, payload, sizeof(payload));
+    if (n == 0) {
+        return;
+    }
+
+    bool ok1 = mqtt.publish(TOPIC_ACK, reinterpret_cast<const uint8_t*>(payload), n, false);
+    bool ok2 = mqtt.publish(TOPIC_ACK_ALT, reinterpret_cast<const uint8_t*>(payload), n, false);
+    if (!ok1 && !ok2) {
+        logEvent(LOG_WARN, "MQTT_PUB_FAIL", "MQTT PUBLISH FAILED sensor_scan_ack");
+    }
+}
+
 void clearPendingCmd() {
     pendingCmdActive           = false;
     pendingCmdSentInCurrentNrf = false;
@@ -1135,6 +1215,291 @@ void requestImmediateNrfSend() {
     nrfImmediatePending = true;
 }
 
+uint8_t nextSensorCmdSeq() {
+    sensorCmdSeqCounter++;
+    if (sensorCmdSeqCounter == 0) {
+        sensorCmdSeqCounter = 1;
+    }
+    return sensorCmdSeqCounter;
+}
+
+void buildSensorNrfPacket(uint8_t subCmd, uint8_t roleOrIndex, const uint8_t* addr) {
+    state.txSeq++;
+    if (state.txSeq == 0) {
+        state.txSeq = 1;
+    }
+
+    memset(&nrfTxPacket, 0, sizeof(nrfTxPacket));
+    nrfTxPacket.packetType            = PKT_TYPE_SENSOR_CMD;
+    nrfTxPacket.sensorCmd.subCmd      = subCmd;
+    nrfTxPacket.sensorCmd.cmdSeq      = nextSensorCmdSeq();
+    nrfTxPacket.sensorCmd.roleOrIndex = roleOrIndex;
+    if (addr) {
+        memcpy(nrfTxPacket.sensorCmd.address, addr, 8);
+    }
+    nrfTxPacket.sensorCmd.seq         = state.txSeq;
+}
+
+void startSensorNrfStepPacket(uint32_t now) {
+    uint8_t subCmd = SENSOR_CMD_GET_ROLES;
+    uint8_t roleOrIdx = sensorFetchOffset;
+    const uint8_t* addr = nullptr;
+
+    switch (sensorJobStep) {
+        case SSTEP_SEND_SCAN_START:
+            subCmd = SENSOR_CMD_SCAN_START;
+            roleOrIdx = 0;
+            break;
+        case SSTEP_FETCH_FOUND:
+            subCmd = SENSOR_CMD_GET_FOUND;
+            roleOrIdx = sensorFetchOffset;
+            break;
+        case SSTEP_SEND_LEARN:
+            subCmd = SENSOR_CMD_LEARN;
+            roleOrIdx = sensorLearnRole;
+            addr = sensorLearnAddr;
+            break;
+        case SSTEP_FETCH_ROLES:
+        default:
+            subCmd = SENSOR_CMD_GET_ROLES;
+            roleOrIdx = sensorFetchOffset;
+            break;
+    }
+
+    buildSensorNrfPacket(subCmd, roleOrIdx, addr);
+    nrfCycleAnyWriteOk = false;
+    nrfRetry           = 0;
+    nrfSentAt          = now;
+    nrfState           = NRF_WAITING;
+    transmitCurrentNrfPacket();
+}
+
+void finishSensorJob(bool ok, const char* errReason, uint32_t now) {
+    SensorJobType finishedType = sensorJobType;
+    char finishedCmdId[64];
+    strncpy(finishedCmdId, sensorMqttCmdId, sizeof(finishedCmdId) - 1);
+    finishedCmdId[sizeof(finishedCmdId) - 1] = '\0';
+
+    sensorJobType      = SJOB_NONE;
+    sensorJobStep      = SSTEP_IDLE;
+    sensorMqttCmdId[0] = '\0';
+
+    if (finishedType == SJOB_SCAN) {
+        state.scanInProgress  = false;
+        state.scanResultReady = true;
+        state.scanLastOk      = ok;
+        state.scanCompletedSeq++;
+        if (finishedCmdId[0] != '\0') {
+            publishMqttSensorScanAck(finishedCmdId, ok, errReason);
+        }
+        if (ok) {
+            char msg[48];
+            snprintf(msg, sizeof(msg), "DS18B20 kereses kesz (%u db)", state.scanFoundCount);
+            logEvent(LOG_INFO, "SENSOR_SCAN", msg);
+        } else {
+            logEvent(LOG_WARN, "SENSOR_SCAN_FAIL", errReason ? errReason : "Szenzor kereses hiba");
+        }
+        publishMqttStatus();
+        menu.requestRedraw();
+    } else if (finishedType == SJOB_LEARN) {
+        state.learnInProgress  = false;
+        state.learnResultReady = true;
+        state.learnLastOk      = ok;
+        state.learnCompletedSeq++;
+        if (finishedCmdId[0] != '\0') {
+            publishMqttCmdAck(finishedCmdId, ok, ok ? nullptr : (errReason ? errReason : "LEARN_FAIL"),
+                              state.relayFeedbackOn);
+        }
+        if (ok) {
+            char addrBuf[24];
+            formatDeviceAddressHex(sensorLearnAddr, addrBuf, sizeof(addrBuf));
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Tanitas OK: %s -> %s",
+                     sensorRoleToKey(sensorLearnRole), addrBuf);
+            logEvent(LOG_INFO, "SENSOR_LEARN", msg);
+            requestImmediateNrfSend();
+        } else {
+            logEvent(LOG_WARN, "SENSOR_LEARN_FAIL", errReason ? errReason : "Szenzor tanitas hiba");
+        }
+        publishMqttStatus();
+        menu.requestRedraw();
+    } else if (finishedType == SJOB_ROLES_ONLY) {
+        if (ok) {
+            publishMqttStatus();
+            menu.requestRedraw();
+        }
+    }
+    (void)now;
+}
+
+bool startSensorScanJob(const char* cmdId) {
+    if (sensorJobType == SJOB_SCAN || sensorJobType == SJOB_LEARN) {
+        return false;
+    }
+    sensorJobType          = SJOB_SCAN;
+    sensorJobStep          = SSTEP_SEND_SCAN_START;
+    sensorJobStartedMs     = millis();
+    sensorFetchOffset      = 0;
+    sensorScanReadyRetries = 0;
+    if (cmdId && cmdId[0] != '\0') {
+        strncpy(sensorMqttCmdId, cmdId, sizeof(sensorMqttCmdId) - 1);
+        sensorMqttCmdId[sizeof(sensorMqttCmdId) - 1] = '\0';
+    } else {
+        sensorMqttCmdId[0] = '\0';
+    }
+    state.scanInProgress   = true;
+    state.scanResultReady  = false;
+    state.scanLastOk       = false;
+    return true;
+}
+
+bool startSensorLearnJob(uint8_t role, const uint8_t addr[8], const char* cmdId) {
+    if (role >= SENSOR_ROLE_COUNT || !addr || !isDeviceAddressNonZero(addr)) {
+        return false;
+    }
+    if (sensorJobType == SJOB_SCAN || sensorJobType == SJOB_LEARN) {
+        return false;
+    }
+    sensorJobType      = SJOB_LEARN;
+    sensorJobStep      = SSTEP_SEND_LEARN;
+    sensorJobStartedMs = millis();
+    sensorLearnRole    = role;
+    memcpy(sensorLearnAddr, addr, 8);
+    if (cmdId && cmdId[0] != '\0') {
+        strncpy(sensorMqttCmdId, cmdId, sizeof(sensorMqttCmdId) - 1);
+        sensorMqttCmdId[sizeof(sensorMqttCmdId) - 1] = '\0';
+    } else {
+        sensorMqttCmdId[0] = '\0';
+    }
+    state.learnInProgress  = true;
+    state.learnResultReady = false;
+    state.learnLastOk      = false;
+    return true;
+}
+
+bool startSensorRolesSyncJob() {
+    if (sensorJobType != SJOB_NONE) {
+        return false;
+    }
+    sensorJobType      = SJOB_ROLES_ONLY;
+    sensorJobStep      = SSTEP_FETCH_ROLES;
+    sensorJobStartedMs = millis();
+    sensorFetchOffset  = 0;
+    sensorMqttCmdId[0] = '\0';
+    return true;
+}
+
+void tickSensorJob(uint32_t now) {
+    if (sensorJobType == SJOB_NONE) {
+        return;
+    }
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (static_cast<uint32_t>(now - sensorJobStartedMs) >= SENSOR_JOB_TIMEOUT_MS) {
+        finishSensorJob(false, "ACK_TIMEOUT", now);
+        return;
+    }
+    if (sensorJobStep == SSTEP_WAIT_CONV_DELAY &&
+        static_cast<uint32_t>(now - sensorConvWaitStartMs) >= SENSOR_SCAN_CONV_WAIT_MS) {
+        sensorFetchOffset     = 0;
+        state.scanFoundCount  = 0;
+        sensorJobStep         = SSTEP_FETCH_FOUND;
+    }
+}
+
+void processSensorNrfResponse(const NrfPacket& rx, uint32_t now) {
+    lastNrfOk                    = now;
+    state.consecutiveMissedPings = 0;
+    nrfErrorBannerShown          = false;
+    nrfFailLoggedForOutage       = false;
+    nrfTimeoutLogged             = false;
+    if (!state.nrf24Ok) {
+        state.nrf24Ok = true;
+        logEvent(LOG_INFO, "NRF_OK", "NRF24 kapcsolat helyreallt");
+    }
+
+    bool rspOk          = (rx.sensorRsp.statusFlags & SENSOR_RSP_FLAG_OK) != 0;
+    bool rspUnknown     = (rx.sensorRsp.statusFlags & SENSOR_RSP_FLAG_UNKNOWN) != 0;
+    bool rspScanReady   = (rx.sensorRsp.statusFlags & SENSOR_RSP_FLAG_SCAN_READY) != 0;
+    state.sensorUnknown = rspUnknown;
+
+    switch (rx.sensorRsp.subCmd) {
+        case SENSOR_CMD_SCAN_START:
+            sensorConvWaitStartMs  = now;
+            sensorScanReadyRetries = 0;
+            sensorJobStep          = SSTEP_WAIT_CONV_DELAY;
+            break;
+
+        case SENSOR_CMD_GET_FOUND: {
+            if (!rspScanReady && sensorScanReadyRetries < 5) {
+                sensorScanReadyRetries++;
+                sensorConvWaitStartMs = now - (SENSOR_SCAN_CONV_WAIT_MS - 150UL);
+                sensorJobStep         = SSTEP_WAIT_CONV_DELAY;
+                break;
+            }
+            uint8_t total = rx.sensorRsp.totalFound;
+            if (total > MAX_DISCOVERED_SENSORS) {
+                total = MAX_DISCOVERED_SENSORS;
+            }
+            state.scanFoundCount = total;
+            for (uint8_t slot = 0; slot < 2; slot++) {
+                uint8_t idx = static_cast<uint8_t>(rx.sensorRsp.startIndex + slot);
+                if (idx < total && (rx.sensorRsp.validEntryMask & (1U << slot)) != 0) {
+                    memcpy(state.scanFound[idx].address, rx.sensorRsp.entries[slot].address, 8);
+                    int16_t deci = rx.sensorRsp.entries[slot].tempDeci;
+                    state.scanFound[idx].temp = (deci <= -1200)
+                                                    ? SENSOR_DISCONNECTED_VAL
+                                                    : (static_cast<float>(deci) / 10.0f);
+                }
+            }
+            if (static_cast<uint8_t>(rx.sensorRsp.startIndex + 2U) < total) {
+                sensorFetchOffset = static_cast<uint8_t>(rx.sensorRsp.startIndex + 2U);
+                sensorJobStep     = SSTEP_FETCH_FOUND;
+            } else {
+                sensorFetchOffset = 0;
+                sensorJobStep     = SSTEP_FETCH_ROLES;
+            }
+            break;
+        }
+
+        case SENSOR_CMD_LEARN:
+            if (!rspOk) {
+                finishSensorJob(false, "EEPROM_FAIL", now);
+            } else {
+                sensorFetchOffset = 0;
+                sensorJobStep     = SSTEP_FETCH_ROLES;
+            }
+            break;
+
+        case SENSOR_CMD_GET_ROLES: {
+            uint8_t roleMask = static_cast<uint8_t>((rx.sensorRsp.statusFlags >> SENSOR_RSP_ROLE_MASK_SHIFT) & 0x0FU);
+            for (uint8_t slot = 0; slot < 2; slot++) {
+                uint8_t r = static_cast<uint8_t>(rx.sensorRsp.startIndex + slot);
+                if (r < SENSOR_ROLE_COUNT) {
+                    memcpy(state.sensors[r].address, rx.sensorRsp.entries[slot].address, 8);
+                    state.sensors[r].assigned = isDeviceAddressNonZero(state.sensors[r].address);
+                    state.sensors[r].ok       = ((roleMask & (1U << r)) != 0) &&
+                                                ((rx.sensorRsp.validEntryMask & (1U << slot)) != 0);
+                }
+            }
+            if (sensorJobStep != SSTEP_FETCH_ROLES) {
+                break;
+            }
+            if (static_cast<uint8_t>(rx.sensorRsp.startIndex + 2U) < SENSOR_ROLE_COUNT) {
+                sensorFetchOffset = static_cast<uint8_t>(rx.sensorRsp.startIndex + 2U);
+                sensorJobStep     = SSTEP_FETCH_ROLES;
+            } else {
+                state.hasSensorRolesLoaded = true;
+                finishSensorJob(true, nullptr, now);
+            }
+            break;
+        }
+
+        default:
+            finishSensorJob(false, "BAD_SUBCMD", now);
+            break;
+    }
+}
+
 void processNrfResponsePacket(const NrfPacket& rx, uint32_t rxNowMs) {
     bool prevNrfOk         = state.nrf24Ok;
     bool prevPump          = state.pumpOn;
@@ -1142,6 +1507,7 @@ void processNrfResponsePacket(const NrfPacket& rx, uint32_t rxNowMs) {
     bool prevRelayFault    = state.relayFault;
     bool prevServiceMode   = state.serviceMode;
     bool prevNanoLoopFault = state.nanoLoopFault;
+    bool prevSensorUnknown = state.sensorUnknown;
     uint8_t prevPState     = state.pumpState;
     uint8_t prevAlarmAct   = state.alarmState.active;
     uint8_t prevAlarmRsn   = state.alarmState.reason;
@@ -1199,12 +1565,25 @@ void processNrfResponsePacket(const NrfPacket& rx, uint32_t rxNowMs) {
     bool rxRelayFbOn          = (rx.nano.syncFlags & SYNC_FLAG_RELAY_FB_ON) != 0;
     bool rxRelayMismatch      = (rx.nano.syncFlags & SYNC_FLAG_RELAY_MISMATCH) != 0;
     bool rxNanoLoopFault      = (rx.nano.alarmPacked & SYNC_FLAG_LOOP_FAULT) != 0;
+    bool rxSensorUnknown      = (rx.nano.alarmPacked & SYNC_FLAG_SENSOR_UNKNOWN) != 0;
     state.nanoSynced       = ackFlag;
     state.nanoSyncStale    = staleFlag;
     state.hasRelayFeedback = true;
     state.relayFeedbackOn  = rxRelayFbOn;
     state.nanoLoopFault    = rxNanoLoopFault;
+    state.sensorUnknown    = rxSensorUnknown;
     (void)rxPumpOn;
+
+    if (rxSensorUnknown != prevSensorUnknown) {
+        if (rxSensorUnknown) {
+            logEvent(LOG_WARN, "SENSOR_UNKNOWN", "Ismeretlen DS18B20 szenzor - tanitas szukseges");
+        } else {
+            logEvent(LOG_INFO, "SENSOR_ROLES_OK", "Mind a 4 DS18B20 szerep azonositva");
+        }
+    }
+    if (!state.hasSensorRolesLoaded || rxSensorUnknown != prevSensorUnknown) {
+        startSensorRolesSyncJob();
+    }
 
     if (rxNanoLoopFault != prevNanoLoopFault) {
         if (rxNanoLoopFault) {
@@ -1316,6 +1695,7 @@ void processNrfResponsePacket(const NrfPacket& rx, uint32_t rxNowMs) {
         prevNrfOk != state.nrf24Ok || prevPump != state.pumpOn ||
         prevRelayFb != state.relayFeedbackOn || prevRelayFault != state.relayFault ||
         prevServiceMode != state.serviceMode || prevNanoLoopFault != state.nanoLoopFault ||
+        prevSensorUnknown != state.sensorUnknown ||
         prevPState != state.pumpState ||
         prevAlarmAct != state.alarmState.active || prevAlarmRsn != state.alarmState.reason) {
         publishMqttStatus();
@@ -1328,6 +1708,12 @@ void handleNrfTimeout(uint32_t now) {
     nrfState = NRF_IDLE;
     nrfRetry = 0;
     radio.stopListening();
+
+    if (nrfTxPacket.packetType == PKT_TYPE_SENSOR_CMD) {
+        logEvent(LOG_WARN, "SENSOR_NRF_TIMEOUT", "Szenzor NRF parancs timeout");
+        finishSensorJob(false, nrfCycleAnyWriteOk ? "NRF_TIMEOUT" : "NRF_WRITE_FAIL", now);
+        return;
+    }
 
     if (pendingCmdActive) {
         if (pendingCmdSentInCurrentNrf) {
@@ -1431,6 +1817,12 @@ void handleNrf(uint32_t now) {
             startNrfRequest(now);
             return;
         }
+        if (sensorJobType != SJOB_NONE &&
+            sensorJobStep != SSTEP_IDLE &&
+            sensorJobStep != SSTEP_WAIT_CONV_DELAY) {
+            startSensorNrfStepPacket(now);
+            return;
+        }
         return;
     }
 
@@ -1438,12 +1830,24 @@ void handleNrf(uint32_t now) {
     if (radio.available()) {
         NrfPacket rx{};
         radio.read(&rx, sizeof(rx));
-        if (rx.packetType == PKT_TYPE_RESPONSE && rx.nano.seq == nrfTxPacket.esp.seq) {
+        if (nrfTxPacket.packetType == PKT_TYPE_REQUEST &&
+            rx.packetType == PKT_TYPE_RESPONSE &&
+            rx.nano.seq == nrfTxPacket.esp.seq) {
             radio.stopListening();
             nrfState = NRF_IDLE;
             nrfRetry = 0;
             nrfFail  = false;
             processNrfResponsePacket(rx, now);
+            return;
+        }
+        if (nrfTxPacket.packetType == PKT_TYPE_SENSOR_CMD &&
+            rx.packetType == PKT_TYPE_SENSOR_RSP &&
+            rx.sensorRsp.seq == nrfTxPacket.sensorCmd.seq) {
+            radio.stopListening();
+            nrfState = NRF_IDLE;
+            nrfRetry = 0;
+            nrfFail  = false;
+            processSensorNrfResponse(rx, now);
             return;
         }
     }
@@ -1683,9 +2087,28 @@ void buildStatusJson(JsonDocument& doc) {
             ? "Rele hiba: kert BE, fizikai rele KI (D7)"
             : "Rele hiba: kert KI, fizikai rele BE (D7)";
     } else if (state.safetySensorFault) {
-        doc["error"] = "Kazan szenzor hiba (-127) - szivattyu biztonsagi BE";
+        doc["error"] = state.sensorUnknown
+            ? "Szenzor ismeretlen vagy nincs tanitva - tanitas kell"
+            : "Kazan szenzor hiba (-127) - szivattyu biztonsagi BE";
+    } else if (state.sensorUnknown) {
+        doc["error"] = "Ismeretlen DS18B20 szenzor - tanitas szukseges";
     } else {
         doc["error"] = nullptr;
+    }
+
+    doc["sensorUnknown"] = state.sensorUnknown;
+    JsonObject sensorsObj = doc["sensors"].to<JsonObject>();
+    for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
+        JsonObject sObj = sensorsObj[sensorRoleToKey(r)].to<JsonObject>();
+        if (state.hasSensorRolesLoaded && state.sensors[r].assigned) {
+            char addrBuf[24];
+            formatDeviceAddressHex(state.sensors[r].address, addrBuf, sizeof(addrBuf));
+            sObj["address"] = addrBuf;
+            sObj["ok"]      = state.sensors[r].ok;
+        } else {
+            sObj["address"] = nullptr;
+            sObj["ok"]      = false;
+        }
     }
 }
 
@@ -1696,7 +2119,7 @@ bool publishMqttStatus() {
     }
     JsonDocument doc;
     buildStatusJson(doc);
-    char payload[2048];
+    char payload[2560];
     size_t n = serializeJson(doc, payload, sizeof(payload));
     if (n == 0) {
         mqttStatusPendingRetry = true;
@@ -1722,7 +2145,7 @@ bool publishMqttTelemetry() {
     JsonDocument doc;
     buildStatusJson(doc);
     doc["nanoCounter"] = state.nanoCounter;
-    char payload[2048];
+    char payload[2560];
     size_t n = serializeJson(doc, payload, sizeof(payload));
     if (n == 0) {
         mqttTelemetryPendingRetry = true;
@@ -1857,6 +2280,15 @@ void resetEloremenoStats(const char* logCode, const char* logMsg) {
 
 void onMenuTrendReset() {
     resetEloremenoStats("TREND_RESET_BY_MENU", "Statisztika nullazva (menu)");
+}
+
+void onMenuRequestSensorScan() {
+    startSensorScanJob(nullptr);
+}
+
+void onMenuRequestSensorLearn(uint8_t role, const uint8_t* addr) {
+    if (role >= SENSOR_ROLE_COUNT || !addr) return;
+    startSensorLearnJob(role, addr, nullptr);
 }
 
 // ============================================================================
@@ -1994,6 +2426,40 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         }
         if (strcmp(action, "resetTrend") == 0) {
             resetEloremenoStats("TREND_RESET_BY_FRONTEND", "Statisztika nullazva (frontend)");
+            return;
+        }
+        if (strcmp(action, "sensorScan") == 0) {
+            const char* cid = doc["cmdId"].is<const char*>() ? doc["cmdId"].as<const char*>() : nullptr;
+            if (!startSensorScanJob(cid)) {
+                if (cid && cid[0] != '\0') {
+                    publishMqttSensorScanAck(cid, false, "BUSY");
+                }
+            }
+            return;
+        }
+        if (strcmp(action, "sensorLearn") == 0) {
+            const char* cid     = doc["cmdId"].is<const char*>() ? doc["cmdId"].as<const char*>() : nullptr;
+            const char* roleStr = doc["role"].is<const char*>() ? doc["role"].as<const char*>() : nullptr;
+            const char* addrStr = doc["address"].is<const char*>() ? doc["address"].as<const char*>() : nullptr;
+            uint8_t roleIdx = 0xFF;
+            if (roleStr) {
+                if (strcmp(roleStr, "eloremeno") == 0)       roleIdx = SENSOR_ROLE_ELOREMENO;
+                else if (strcmp(roleStr, "visszatero") == 0) roleIdx = SENSOR_ROLE_VISSZATERO;
+                else if (strcmp(roleStr, "kazan") == 0)      roleIdx = SENSOR_ROLE_KAZAN;
+                else if (strcmp(roleStr, "kulteri") == 0)    roleIdx = SENSOR_ROLE_KULTERI;
+            }
+            uint8_t addrBytes[8] = { 0 };
+            if (roleIdx >= SENSOR_ROLE_COUNT || !addrStr || !parseDeviceAddressHex(addrStr, addrBytes)) {
+                if (cid && cid[0] != '\0') {
+                    publishMqttCmdAck(cid, false, "INVALID_PARAMS", state.relayFeedbackOn);
+                }
+                return;
+            }
+            if (!startSensorLearnJob(roleIdx, addrBytes, cid)) {
+                if (cid && cid[0] != '\0') {
+                    publishMqttCmdAck(cid, false, "BUSY", state.relayFeedbackOn);
+                }
+            }
             return;
         }
     }
@@ -2643,7 +3109,13 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_SW),  isrEncoderButton, CHANGE);
 
     lcd.begin();
-    menu.begin(&lcd, &state, { onMenuSettingCommitted, onMenuFactoryReset, onMenuTrendReset });
+    menu.begin(&lcd, &state, {
+        onMenuSettingCommitted,
+        onMenuFactoryReset,
+        onMenuTrendReset,
+        onMenuRequestSensorScan,
+        onMenuRequestSensorLearn
+    });
 
     spiNrf.begin(PIN_NRF_SCK, PIN_NRF_MISO, PIN_NRF_MOSI, PIN_NRF_CSN);
     if (!radio.begin(&spiNrf)) {
@@ -2760,6 +3232,7 @@ void loop() {
     }
 
     // 3. V5 Master-Slave nem-blokkoló NRF24 állapotgép (minden loop()-ban fut)
+    tickSensorJob(now);
     if (pendingCmdActive && pendingCmdWaitingSettle && nrfState == NRF_IDLE &&
         static_cast<uint32_t>(now - pendingCmdLastPollAt) >= CMD_RELAY_SETTLE_POLL_MS) {
         pendingCmdWaitingSettle = false;

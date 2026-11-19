@@ -35,6 +35,33 @@ constexpr uint8_t SYNC_FLAG_RELAY_MISMATCH       = 0x80; // bit7: Relé visszacs
 // Loop Monitor hiba bit az alarmPacked mező szabad felső bitjén (bit4),
 // így a syncFlags összes 8 bitje (0x01..0x80) és a 32 byte-os NrfPacket érintetlen marad.
 constexpr uint8_t SYNC_FLAG_LOOP_FAULT           = 0x10; // alarmPacked bit4: Nano loop ciklusidő hiba (>100ms x5 vagy >500ms x1)
+constexpr uint8_t SYNC_FLAG_SENSOR_UNKNOWN       = 0x20; // alarmPacked bit5: Ismeretlen / tanítatlan DS18B20 szenzor
+
+// Opcionális DS18B20 felderítési és tanítási csomagtípusok (továbbra is pontosan 32 byte-os NrfPacket)
+constexpr uint8_t PKT_TYPE_SENSOR_CMD            = 0xA3; // Master -> Slave szenzor parancs
+constexpr uint8_t PKT_TYPE_SENSOR_RSP            = 0xB4; // Slave  -> Master szenzor válasz
+
+constexpr uint8_t SENSOR_ROLE_COUNT              = 4;
+constexpr uint8_t MAX_DISCOVERED_SENSORS         = 6;
+
+enum SensorRole : uint8_t {
+    SENSOR_ROLE_ELOREMENO  = 0,
+    SENSOR_ROLE_VISSZATERO = 1,
+    SENSOR_ROLE_KAZAN      = 2,
+    SENSOR_ROLE_KULTERI    = 3
+};
+
+enum SensorSubCmd : uint8_t {
+    SENSOR_CMD_SCAN_START = 0,
+    SENSOR_CMD_GET_FOUND  = 1,
+    SENSOR_CMD_GET_ROLES  = 2,
+    SENSOR_CMD_LEARN      = 3
+};
+
+constexpr uint8_t SENSOR_RSP_FLAG_OK             = 0x01;
+constexpr uint8_t SENSOR_RSP_FLAG_UNKNOWN        = 0x02;
+constexpr uint8_t SENSOR_RSP_FLAG_SCAN_READY     = 0x04;
+constexpr uint8_t SENSOR_RSP_ROLE_MASK_SHIFT     = 3; // bits 3..6 = role 0..3 known/ok
 
 #ifndef SAFETY_OVERHEAT_TEMP_DEFINED
 #define SAFETY_OVERHEAT_TEMP_DEFINED
@@ -131,26 +158,57 @@ struct __attribute__((packed)) NanoToEspPayload {
     uint32_t counter;         // Növekvő válaszcsomag számláló
     uint32_t seq;             // UGYANAZ a seq, mint a kérésben
     uint8_t  sensorValidMask; // bit0: eloremeno, bit1: visszatero, bit2: kazan, bit3: kulteri
-    uint8_t  alarmPacked;     // bit0: active, bit1..3: AlarmReason (0..3), bit4: SYNC_FLAG_LOOP_FAULT
+    uint8_t  alarmPacked;     // bit0: active, bit1..3: AlarmReason, bit4: LOOP_FAULT, bit5: SENSOR_UNKNOWN
     uint8_t  cmdSeq;          // Utoljára feldolgozott parancs cmdSeq (1..255, 0 ha nincs)
     uint8_t  syncFlags;       // bit0: ACK, bit1: STALE, bit2: SERVICE_MODE, bit3: CMD_ACK, bit4: PUMP_ON, bit5: CMD_REJECTED_SERVICE, bit6: RELAY_FB_ON, bit7: RELAY_MISMATCH
     uint16_t syncEpochLow16;  // Utolsó kapott timeSyncEpoch alsó 16 bitje nyugtázáshoz (2 byte)
 };
 
+struct __attribute__((packed)) SensorScanEntryPacked {
+    uint8_t address[8];
+    int16_t tempDeci; // 0.1 °C egységben (-1270 = érvénytelen)
+};
+
+struct __attribute__((packed)) SensorCmdPayload {
+    uint8_t  subCmd;       // SensorSubCmd
+    uint8_t  cmdSeq;       // Parancs sorszám / hash
+    uint8_t  roleOrIndex;  // Szerep (0..3) vagy kezdőindex
+    uint8_t  address[8];   // DS18B20 8 byte-os ROM cím
+    uint32_t seq;          // Master kérés sorszám
+    uint8_t  reserved[16];
+};
+
+struct __attribute__((packed)) SensorRspPayload {
+    uint32_t              seq;
+    uint8_t               subCmd;
+    uint8_t               cmdSeq;
+    uint8_t               statusFlags;    // bit0=ok, bit1=sensorUnknown, bit2=scanReady, bits3..6=roleKnownMask
+    uint8_t               totalFound;
+    uint8_t               startIndex;
+    SensorScanEntryPacked entries[2];
+    uint8_t               validEntryMask; // bit0=entry0 valid, bit1=entry1 valid
+    uint8_t               reserved;
+};
+
 struct __attribute__((packed)) NrfPacket {
-    uint8_t packetType; // PKT_TYPE_REQUEST (0xA1) vagy PKT_TYPE_RESPONSE (0xB2)
+    uint8_t packetType; // PKT_TYPE_REQUEST (0xA1), PKT_TYPE_RESPONSE (0xB2), PKT_TYPE_SENSOR_CMD (0xA3), PKT_TYPE_SENSOR_RSP (0xB4)
     union {
         EspToNanoPayload esp;
         NanoToEspPayload nano;
+        SensorCmdPayload sensorCmd;
+        SensorRspPayload sensorRsp;
     };
 };
 
-static_assert(sizeof(PumpConfigPacked)  == 10, "PumpConfigPacked merete 10 byte kell legyen!");
-static_assert(sizeof(AlarmConfigPacked) == 5,  "AlarmConfigPacked merete 5 byte kell legyen!");
-static_assert(sizeof(AlarmStatePacked)  == 2,  "AlarmStatePacked merete 2 byte kell legyen!");
-static_assert(sizeof(EspToNanoPayload)  == 31, "EspToNanoPayload merete 31 byte kell legyen!");
-static_assert(sizeof(NanoToEspPayload)  == 31, "NanoToEspPayload merete 31 byte kell legyen!");
-static_assert(sizeof(NrfPacket)         == 32, "NrfPacket meretenek pontosan 32 byte-nak kell lennie!");
+static_assert(sizeof(PumpConfigPacked)      == 10, "PumpConfigPacked merete 10 byte kell legyen!");
+static_assert(sizeof(AlarmConfigPacked)     == 5,  "AlarmConfigPacked merete 5 byte kell legyen!");
+static_assert(sizeof(AlarmStatePacked)      == 2,  "AlarmStatePacked merete 2 byte kell legyen!");
+static_assert(sizeof(EspToNanoPayload)      == 31, "EspToNanoPayload merete 31 byte kell legyen!");
+static_assert(sizeof(NanoToEspPayload)      == 31, "NanoToEspPayload merete 31 byte kell legyen!");
+static_assert(sizeof(SensorScanEntryPacked) == 10, "SensorScanEntryPacked merete 10 byte kell legyen!");
+static_assert(sizeof(SensorCmdPayload)      == 31, "SensorCmdPayload merete 31 byte kell legyen!");
+static_assert(sizeof(SensorRspPayload)      == 31, "SensorRspPayload merete 31 byte kell legyen!");
+static_assert(sizeof(NrfPacket)             == 32, "NrfPacket meretenek pontosan 32 byte-nak kell lennie!");
 
 // Közös RF24 rádió csatorna és külön Master->Slave / Slave->Master csőcímek (5 byte)
 constexpr uint8_t NRF_CHANNEL = 108;
@@ -200,4 +258,102 @@ inline uint8_t sanitizeHeartbeatIntervalSec(uint8_t sec) {
     if (snapped < HEARTBEAT_MIN_SEC) snapped = HEARTBEAT_MIN_SEC;
     if (snapped > HEARTBEAT_MAX_SEC) snapped = HEARTBEAT_MAX_SEC;
     return snapped;
+}
+
+inline const char* sensorRoleToKey(uint8_t role) {
+    switch (role) {
+        case SENSOR_ROLE_ELOREMENO:  return "eloremeno";
+        case SENSOR_ROLE_VISSZATERO: return "visszatero";
+        case SENSOR_ROLE_KAZAN:      return "kazan";
+        case SENSOR_ROLE_KULTERI:    return "kulteri";
+        default:                     return "ismeretlen";
+    }
+}
+
+inline const char* sensorRoleToLabel(uint8_t role) {
+    switch (role) {
+        case SENSOR_ROLE_ELOREMENO:  return "Eloremeno";
+        case SENSOR_ROLE_VISSZATERO: return "Visszatero";
+        case SENSOR_ROLE_KAZAN:      return "Kazan";
+        case SENSOR_ROLE_KULTERI:    return "Kulteri";
+        default:                     return "Ismeretlen";
+    }
+}
+
+inline bool isDeviceAddressNonZero(const uint8_t addr[8]) {
+    if (!addr) return false;
+    uint8_t acc = 0;
+    for (uint8_t i = 0; i < 8; i++) {
+        acc |= addr[i];
+    }
+    return acc != 0;
+}
+
+inline char hexNibbleUpper(uint8_t v) {
+    uint8_t n = static_cast<uint8_t>(v & 0x0FU);
+    return (n < 10U) ? static_cast<char>('0' + n) : static_cast<char>('A' + (n - 10U));
+}
+
+inline int8_t hexCharVal(char c) {
+    if (c >= '0' && c <= '9') return static_cast<int8_t>(c - '0');
+    if (c >= 'A' && c <= 'F') return static_cast<int8_t>(c - 'A' + 10);
+    if (c >= 'a' && c <= 'f') return static_cast<int8_t>(c - 'a' + 10);
+    return -1;
+}
+
+inline void formatDeviceAddressHex(const uint8_t addr[8], char* out, unsigned int outLen) {
+    if (!out || outLen < 24U) {
+        if (out && outLen > 0U) out[0] = '\0';
+        return;
+    }
+    unsigned int pos = 0;
+    for (uint8_t i = 0; i < 8; i++) {
+        out[pos++] = hexNibbleUpper(addr[i] >> 4);
+        out[pos++] = hexNibbleUpper(addr[i] & 0x0FU);
+        if (i < 7U) {
+            out[pos++] = ':';
+        }
+    }
+    out[pos] = '\0';
+}
+
+inline void formatDeviceAddressShort(const uint8_t addr[8], char* out, unsigned int outLen) {
+    if (!out || outLen < 12U) {
+        if (out && outLen > 0U) out[0] = '\0';
+        return;
+    }
+    // "28:FF:9A:BC" (első 2 byte + utolsó 2 byte)
+    out[0]  = hexNibbleUpper(addr[0] >> 4);
+    out[1]  = hexNibbleUpper(addr[0] & 0x0FU);
+    out[2]  = ':';
+    out[3]  = hexNibbleUpper(addr[1] >> 4);
+    out[4]  = hexNibbleUpper(addr[1] & 0x0FU);
+    out[5]  = ':';
+    out[6]  = hexNibbleUpper(addr[6] >> 4);
+    out[7]  = hexNibbleUpper(addr[6] & 0x0FU);
+    out[8]  = ':';
+    out[9]  = hexNibbleUpper(addr[7] >> 4);
+    out[10] = hexNibbleUpper(addr[7] & 0x0FU);
+    out[11] = '\0';
+}
+
+inline bool parseDeviceAddressHex(const char* str, uint8_t out[8]) {
+    if (!str || !out) return false;
+    uint8_t tmp[8] = { 0 };
+    unsigned int idx = 0;
+    for (uint8_t b = 0; b < 8; b++) {
+        int8_t hi = hexCharVal(str[idx++]);
+        int8_t lo = hexCharVal(str[idx++]);
+        if (hi < 0 || lo < 0) return false;
+        tmp[b] = static_cast<uint8_t>((hi << 4) | lo);
+        if (b < 7U) {
+            if (str[idx] != ':' && str[idx] != '-') return false;
+            idx++;
+        }
+    }
+    if (str[idx] != '\0') return false;
+    for (uint8_t b = 0; b < 8; b++) {
+        out[b] = tmp[b];
+    }
+    return isDeviceAddressNonZero(out);
 }

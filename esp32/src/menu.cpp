@@ -173,8 +173,15 @@ void MenuController::buildItemsForState(MenuState targetState) {
             _items[_itemCount++] = { "Riasztas",            ITEM_EDIT_BOOL,            &_state->alarmConfig.alarmEnabled,   0.0f,                   1.0f,                   1.0f, EDIT_ALARM_ENABLED };
             _items[_itemCount++] = { "Ping",                ITEM_EDIT_ENUM,            &_state->heartbeatIntervalSec,       0.0f,                   5.0f,                   1.0f, EDIT_HEARTBEAT };
             _items[_itemCount++] = { "Manual Futes",        ITEM_EDIT_BOOL,            &_state->manualHeating,              0.0f,                   1.0f,                   1.0f, EDIT_MANUAL_HEATING };
+            _items[_itemCount++] = { "Szenzor Tanitas",     ITEM_SUBMENU,              nullptr,                             0.0f,                   0.0f,                   0.0f, MENU_SENSOR_MENU };
             _items[_itemCount++] = { "Gyari visszaallitas", ITEM_ACTION_FACTORY_RESET, nullptr,                             0.0f,                   0.0f,                   0.0f, 0 };
             _items[_itemCount++] = { "VISSZA",              ITEM_ACTION_BACK,          nullptr,                             0.0f,                   0.0f,                   0.0f, MENU_MAIN };
+            break;
+
+        case MENU_SENSOR_MENU:
+            _items[_itemCount++] = { "SZENZOR KERESES", ITEM_SUBMENU,     nullptr, 0, 0, 0, MENU_SENSOR_SCAN };
+            _items[_itemCount++] = { "TANITAS",         ITEM_SUBMENU,     nullptr, 0, 0, 0, MENU_SENSOR_TEACH };
+            _items[_itemCount++] = { "VISSZA",          ITEM_ACTION_BACK, nullptr, 0, 0, 0, MENU_BEALLITAS };
             break;
 
         case MENU_KIMENETEK:
@@ -194,6 +201,8 @@ void MenuController::buildItemsForState(MenuState targetState) {
         case MENU_CHECK:
         case MENU_TREND:
         case MENU_EDIT:
+        case MENU_SENSOR_SCAN:
+        case MENU_SENSOR_TEACH:
         default:
             break;
     }
@@ -220,6 +229,29 @@ void MenuController::enterSubmenu(MenuState sub, uint8_t initialCursor, uint32_t
         _trendCursor         = 0;
         _trendConfirmActive  = false;
         _trendConfirmStartMs = 0;
+        _lastActivityMs      = now;
+        _menuDirty           = true;
+        return;
+    }
+    if (sub == MENU_SENSOR_SCAN) {
+        _scanCursor     = 0;
+        _seenScanSeq    = _state ? _state->scanCompletedSeq : 0;
+        _lastActivityMs = now;
+        _menuDirty      = true;
+        if (_callbacks.onRequestSensorScan) {
+            _callbacks.onRequestSensorScan();
+        }
+        return;
+    }
+    if (sub == MENU_SENSOR_TEACH) {
+        _teachRole           = 0;
+        _teachPhase          = TEACH_PHASE_INIT;
+        _teachStartMs        = now;
+        _teachLastPollMs     = now;
+        _teachBaselineReady  = false;
+        _teachBaseCount      = 0;
+        _seenScanSeq         = _state ? _state->scanCompletedSeq : 0;
+        _seenLearnSeq        = _state ? _state->learnCompletedSeq : 0;
         _lastActivityMs      = now;
         _menuDirty           = true;
         return;
@@ -512,6 +544,18 @@ void MenuController::navigateBack(uint32_t now) {
             enterSubmenu(MENU_FOKOK, 5, now);
             break;
 
+        case MENU_SENSOR_SCAN:
+            enterSubmenu(MENU_SENSOR_MENU, 0, now);
+            break;
+
+        case MENU_SENSOR_TEACH:
+            enterSubmenu(MENU_SENSOR_MENU, 1, now);
+            break;
+
+        case MENU_SENSOR_MENU:
+            enterSubmenu(MENU_BEALLITAS, 10, now);
+            break;
+
         case MENU_FOKOK:
         case MENU_STATUS:
         case MENU_BEALLITAS:
@@ -658,9 +702,9 @@ void MenuController::handleInput(int8_t encSteps,
         return;
     }
 
-    // 4c. CHECK diagnosztikai néző (`MENU_CHECK` - 6 görgethető sor)
+    // 4c. CHECK diagnosztikai néző (`MENU_CHECK` - 7 görgethető sor)
     if (_menuState == MENU_CHECK) {
-        constexpr uint8_t CHECK_LINES = 6;
+        constexpr uint8_t CHECK_LINES = 7;
         if (steps != 0) {
             _lastActivityMs = now;
             int16_t next = static_cast<int16_t>(_checkCursor) + steps;
@@ -729,7 +773,42 @@ void MenuController::handleInput(int8_t encSteps,
         return;
     }
 
-    // 5. Lista navigáció (`MENU_MAIN`, `MENU_FOKOK`, `MENU_STATUS`, `MENU_BEALLITAS`, `MENU_KIMENETEK`)
+    // 4e. SZENZOR KERESES néző (`MENU_SENSOR_SCAN`)
+    if (_menuState == MENU_SENSOR_SCAN) {
+        uint8_t cnt = _state->scanFoundCount;
+        if (steps != 0 && cnt > 0) {
+            _lastActivityMs = now;
+            int16_t next = static_cast<int16_t>(_scanCursor) + steps;
+            while (next < 0) next += cnt;
+            _scanCursor = static_cast<uint8_t>(next % cnt);
+            _menuDirty  = true;
+        }
+        if (shortPress) {
+            _lastActivityMs = now;
+            if (!_state->scanInProgress && _callbacks.onRequestSensorScan) {
+                _seenScanSeq = _state->scanCompletedSeq;
+                _callbacks.onRequestSensorScan();
+                _menuDirty = true;
+            }
+        }
+        return;
+    }
+
+    // 4f. TANITAS 10 mp melegítéses varázsló (`MENU_SENSOR_TEACH`)
+    if (_menuState == MENU_SENSOR_TEACH) {
+        _lastActivityMs = now;
+        if (shortPress && _teachPhase == TEACH_PHASE_CONFIRM) {
+            _teachPhase   = TEACH_PHASE_SAVING;
+            _seenLearnSeq = _state->learnCompletedSeq;
+            if (_callbacks.onRequestSensorLearn) {
+                _callbacks.onRequestSensorLearn(_teachRole, _teachFoundAddr);
+            }
+            _menuDirty = true;
+        }
+        return;
+    }
+
+    // 5. Lista navigáció (`MENU_MAIN`, `MENU_FOKOK`, `MENU_STATUS`, `MENU_BEALLITAS`, `MENU_KIMENETEK`, `MENU_SENSOR_MENU`)
     if (steps != 0 && _itemCount > 0) {
         _lastActivityMs = now;
         int16_t next = static_cast<int16_t>(_cursor) + steps;
@@ -754,7 +833,7 @@ void MenuController::handleInput(int8_t encSteps,
                 break;
 
             case ITEM_ACTION_BACK:
-                enterSubmenu(MENU_MAIN, _mainCursor, now);
+                navigateBack(now);
                 break;
 
             case ITEM_EDIT_FLOAT:
@@ -818,6 +897,12 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
         }
     }
 
+    // 1d. Szenzor tanítás nem-blokkoló állapotgép
+    if (_menuState == MENU_SENSOR_TEACH) {
+        _lastActivityMs = now;
+        updateSensorTeaching(now);
+    }
+
     // 2. 20 mp tétlenség ellenőrzése: vissza a főképernyőre, félbehagyott szerkesztés eldobva
     // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
     if (_menuState != MENU_HOME) {
@@ -858,9 +943,10 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
         }
     }
 
-    // 5. Menü LCD frissítése 100ms-enként, ha változott (vagy lekérdező/napló/check/trend menüben 1mp-enként)
+    // 5. Menü LCD frissítése 100ms-enként, ha változott (vagy lekérdező/napló/check/trend/tanítás menüben 1mp-enként)
     if (_menuState == MENU_FOKOK || _menuState == MENU_STATUS || _menuState == MENU_LOGS ||
-        _menuState == MENU_CHECK || _menuState == MENU_TREND) {
+        _menuState == MENU_CHECK || _menuState == MENU_TREND ||
+        _menuState == MENU_SENSOR_SCAN || _menuState == MENU_SENSOR_TEACH) {
         // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
         if (static_cast<uint32_t>(now - _lastMainDrawMs) >= LCD_MAIN_REFRESH_MS) {
             _lastMainDrawMs = now;
@@ -880,6 +966,10 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
             drawCheckViewer();
         } else if (_menuState == MENU_TREND) {
             drawTrendViewer();
+        } else if (_menuState == MENU_SENSOR_SCAN) {
+            drawSensorScanViewer();
+        } else if (_menuState == MENU_SENSOR_TEACH) {
+            drawSensorTeachViewer(now);
         } else {
             drawMenu();
         }
@@ -1042,7 +1132,7 @@ void MenuController::drawLogViewer() {
 void MenuController::drawCheckViewer() {
     if (!_lcd || !_state) return;
 
-    if (_checkCursor >= 6) {
+    if (_checkCursor >= 7) {
         _checkCursor = 0;
     }
 
@@ -1050,7 +1140,7 @@ void MenuController::drawCheckViewer() {
     char line2[24];
     uint32_t now = millis();
 
-    snprintf(line1, sizeof(line1), "CHECK (%u/6)", static_cast<unsigned>(_checkCursor + 1));
+    snprintf(line1, sizeof(line1), "CHECK (%u/7)", static_cast<unsigned>(_checkCursor + 1));
 
     switch (_checkCursor) {
         case 0: {
@@ -1104,8 +1194,7 @@ void MenuController::drawCheckViewer() {
             break;
         }
 
-        case 5:
-        default: {
+        case 5: {
             bool anyLoopFault = _state->loopFault || _state->nanoLoopFault;
             if (anyLoopFault) {
                 snprintf(line2, sizeof(line2), "Loop: LASSU %lums",
@@ -1116,6 +1205,220 @@ void MenuController::drawCheckViewer() {
             }
             break;
         }
+
+        case 6:
+        default: {
+            if (_state->sensorUnknown) {
+                snprintf(line2, sizeof(line2), "Szenz: ISMERETLEN");
+            } else {
+                snprintf(line2, sizeof(line2), "Szenzorok: OK");
+            }
+            break;
+        }
+    }
+
+    _lcd->printLines(line1, line2);
+}
+
+void MenuController::drawSensorScanViewer() {
+    if (!_lcd || !_state) return;
+
+    char line1[24];
+    char line2[24];
+
+    if (_state->scanInProgress) {
+        snprintf(line1, sizeof(line1), "SZENZOR KERESES");
+        snprintf(line2, sizeof(line2), "Kereses...");
+        _lcd->printLines(line1, line2);
+        return;
+    }
+
+    if (!_state->scanLastOk) {
+        snprintf(line1, sizeof(line1), "SZENZOR KERESES");
+        snprintf(line2, sizeof(line2), "NRF hiba [OK]=ujra");
+        _lcd->printLines(line1, line2);
+        return;
+    }
+
+    uint8_t cnt = _state->scanFoundCount;
+    if (cnt == 0) {
+        snprintf(line1, sizeof(line1), "KERESES (0 db)");
+        snprintf(line2, sizeof(line2), "Nincs szenzor! [OK]");
+        _lcd->printLines(line1, line2);
+        return;
+    }
+
+    if (_scanCursor >= cnt) {
+        _scanCursor = 0;
+    }
+
+    char shortAddr[16];
+    formatDeviceAddressShort(_state->scanFound[_scanCursor].address, shortAddr, sizeof(shortAddr));
+    float tempC = _state->scanFound[_scanCursor].temp;
+
+    snprintf(line1, sizeof(line1), "KERESES (%u/%u)",
+             static_cast<unsigned>(_scanCursor + 1),
+             static_cast<unsigned>(cnt));
+    if (isTempValid(tempC)) {
+        snprintf(line2, sizeof(line2), "%s %4.1fC", shortAddr, tempC);
+    } else {
+        snprintf(line2, sizeof(line2), "%s --.-C", shortAddr);
+    }
+    _lcd->printLines(line1, line2);
+}
+
+void MenuController::updateSensorTeaching(uint32_t now) {
+    if (!_state) return;
+
+    switch (_teachPhase) {
+        case TEACH_PHASE_INIT:
+            if (_teachRole >= SENSOR_ROLE_COUNT) {
+                showErrorBanner("TANITAS KESZ!", "Mind a 4 mentve", 2000);
+                enterSubmenu(MENU_SENSOR_MENU, 1, now);
+                return;
+            }
+            _teachBaselineReady = false;
+            _teachBaseCount     = 0;
+            _seenScanSeq        = _state->scanCompletedSeq;
+            _teachStartMs       = now;
+            _teachLastPollMs    = now;
+            _teachPhase         = TEACH_PHASE_HEAT_WAIT;
+            if (!_state->scanInProgress && _callbacks.onRequestSensorScan) {
+                _callbacks.onRequestSensorScan();
+            }
+            _menuDirty = true;
+            break;
+
+        case TEACH_PHASE_HEAT_WAIT: {
+            if (_state->scanCompletedSeq != _seenScanSeq) {
+                _seenScanSeq = _state->scanCompletedSeq;
+                if (!_teachBaselineReady) {
+                    if (_state->scanLastOk && _state->scanFoundCount > 0) {
+                        _teachBaseCount = _state->scanFoundCount;
+                        if (_teachBaseCount > MAX_DISCOVERED_SENSORS) {
+                            _teachBaseCount = MAX_DISCOVERED_SENSORS;
+                        }
+                        for (uint8_t i = 0; i < _teachBaseCount; i++) {
+                            memcpy(_teachBaseAddr[i], _state->scanFound[i].address, 8);
+                            _teachBaseTemp[i] = _state->scanFound[i].temp;
+                        }
+                        _teachBaselineReady = true;
+                        _teachStartMs       = now; // A 10 mp visszaszámlálás az alapvonal után indul
+                        _menuDirty          = true;
+                    } else {
+                        _teachTimeoutBannerMs = now;
+                        _teachPhase           = TEACH_PHASE_TIMEOUT;
+                        _menuDirty            = true;
+                        return;
+                    }
+                } else if (_state->scanLastOk) {
+                    for (uint8_t i = 0; i < _state->scanFoundCount; i++) {
+                        float currT = _state->scanFound[i].temp;
+                        if (!isTempValid(currT)) continue;
+                        for (uint8_t b = 0; b < _teachBaseCount; b++) {
+                            if (memcmp(_state->scanFound[i].address, _teachBaseAddr[b], 8) == 0 &&
+                                isTempValid(_teachBaseTemp[b])) {
+                                if ((currT - _teachBaseTemp[b]) > SENSOR_TEACH_DELTA_C) {
+                                    memcpy(_teachFoundAddr, _state->scanFound[i].address, 8);
+                                    _teachPhase = TEACH_PHASE_CONFIRM;
+                                    _menuDirty  = true;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+            if (!_state->scanInProgress &&
+                static_cast<uint32_t>(now - _teachLastPollMs) >= SENSOR_TEACH_POLL_INTERVAL_MS) {
+                _teachLastPollMs = now;
+                if (_callbacks.onRequestSensorScan) {
+                    _seenScanSeq = _state->scanCompletedSeq;
+                    _callbacks.onRequestSensorScan();
+                }
+            }
+
+            // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+            if (_teachBaselineReady &&
+                static_cast<uint32_t>(now - _teachStartMs) >= SENSOR_TEACH_HEAT_WINDOW_MS) {
+                _teachTimeoutBannerMs = now;
+                _teachPhase           = TEACH_PHASE_TIMEOUT;
+                _menuDirty            = true;
+            }
+            break;
+        }
+
+        case TEACH_PHASE_CONFIRM:
+            break;
+
+        case TEACH_PHASE_SAVING:
+            if (_state->learnCompletedSeq != _seenLearnSeq) {
+                _seenLearnSeq = _state->learnCompletedSeq;
+                if (_state->learnLastOk) {
+                    _teachRole++;
+                    _teachPhase = TEACH_PHASE_INIT;
+                    _menuDirty  = true;
+                } else {
+                    showErrorBanner("MENTES HIBA!", "EEPROM/NRF hiba", 2000);
+                    enterSubmenu(MENU_SENSOR_MENU, 1, now);
+                }
+            }
+            break;
+
+        case TEACH_PHASE_TIMEOUT:
+            // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+            if (static_cast<uint32_t>(now - _teachTimeoutBannerMs) >= 2000UL) {
+                enterSubmenu(MENU_SENSOR_MENU, 1, now);
+            }
+            break;
+    }
+}
+
+void MenuController::drawSensorTeachViewer(uint32_t now) {
+    if (!_lcd || !_state) return;
+
+    char line1[24];
+    char line2[24];
+    const char* roleName = sensorRoleToLabel(_teachRole);
+
+    switch (_teachPhase) {
+        case TEACH_PHASE_INIT:
+        case TEACH_PHASE_HEAT_WAIT: {
+            if (!_teachBaselineReady) {
+                snprintf(line1, sizeof(line1), "TANITAS: %s", roleName);
+                snprintf(line2, sizeof(line2), "Alapmeres...");
+            } else {
+                // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+                uint32_t elapsed = static_cast<uint32_t>(now - _teachStartMs);
+                uint32_t remSec  = (elapsed < SENSOR_TEACH_HEAT_WINDOW_MS)
+                                       ? ((SENSOR_TEACH_HEAT_WINDOW_MS - elapsed + 999UL) / 1000UL)
+                                       : 0UL;
+                snprintf(line1, sizeof(line1), "%s (%lus)", roleName, static_cast<unsigned long>(remSec));
+                snprintf(line2, sizeof(line2), "Melegitsd meg!");
+            }
+            break;
+        }
+
+        case TEACH_PHASE_CONFIRM: {
+            char shortAddr[16];
+            formatDeviceAddressShort(_teachFoundAddr, shortAddr, sizeof(shortAddr));
+            snprintf(line1, sizeof(line1), "Talalt: %s", shortAddr);
+            snprintf(line2, sizeof(line2), "%s? [OK]", roleName);
+            break;
+        }
+
+        case TEACH_PHASE_SAVING:
+            snprintf(line1, sizeof(line1), "Mentes...");
+            snprintf(line2, sizeof(line2), "%s -> EEPROM", roleName);
+            break;
+
+        case TEACH_PHASE_TIMEOUT:
+        default:
+            snprintf(line1, sizeof(line1), "Nem melegedett");
+            snprintf(line2, sizeof(line2), "Probald ujra!");
+            break;
     }
 
     _lcd->printLines(line1, line2);

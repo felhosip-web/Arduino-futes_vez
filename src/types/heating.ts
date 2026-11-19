@@ -54,6 +54,41 @@ export interface HeatingTemperatures {
   kulteri: number | null;
 }
 
+export type SensorRoleKey = 'eloremeno' | 'visszatero' | 'kazan' | 'kulteri';
+
+export interface SensorRoleInfo {
+  address: string | null;
+  ok: boolean;
+}
+
+export type SensorStatusMap = Record<SensorRoleKey, SensorRoleInfo>;
+
+export interface SensorScanItem {
+  address: string;
+  temp: number | null;
+}
+
+export interface SensorScanApiResponse {
+  ok?: boolean;
+  acked?: boolean;
+  cmdId?: string;
+  executedAt?: string;
+  found?: SensorScanItem[];
+  reason?: string;
+  error?: string;
+}
+
+export interface SensorLearnApiResponse {
+  ok?: boolean;
+  acked?: boolean;
+  cmdId?: string;
+  executedAt?: string;
+  role?: SensorRoleKey;
+  address?: string;
+  reason?: string;
+  error?: string;
+}
+
 export interface EspTimeInfo {
   espNtpSynced: boolean;
   espTime: string;
@@ -119,6 +154,8 @@ export interface HeatingStatusPayload {
   time?: EspTimeInfo;
   sync?: TimeSyncInfo;
   trend?: TrendStats;
+  sensors?: SensorStatusMap;
+  sensorUnknown?: boolean;
 }
 
 export interface HeatingCommandPayload {

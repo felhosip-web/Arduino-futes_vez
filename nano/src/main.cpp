@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <avr/wdt.h>
 #include <SPI.h>
 #include <RF24.h>
@@ -26,16 +27,18 @@
 //     A4 (18) -> tartalek5
 //
 // V5 SLAVE SZABÁLYOK:
-//   - SOHA nem ad önállóan, csak a Master (ESP32-C3) 0xA1 REQUEST-jére válaszol
-//     200ms-on belül 0xB2 RESPONSE csomaggal (sima write(), writeAckPayload TILOS).
+//   - SOHA nem ad önállóan, csak a Master (ESP32-C3) 0xA1 REQUEST / 0xA3 SENSOR_CMD
+//     kérésére válaszol 200ms-on belül (sima write(), writeAckPayload TILOS).
 //   - Seq duplikáció-védelem: ha már feldolgozott seq érkezik, ugyanazt a
-//     RESPONSE csomagot küldi vissza a kimenetek újbóli végrehajtása nélkül.
+//     RESPONSE csomagot küldi vissza a kimenetek / EEPROM újbóli végrehajtása nélkül.
 //   - Fail-safe: induláskor amíg nincs ESP kapcsolat, valamint ha
 //     (millis() - lastRequestMs) > 3 * heartbeatIntervalSec * 1000 + 2000:
 //     szivattyú BE, piros LED 500ms-es villogás, alarmState reason = nrf_fail.
 //   - Szerviz kapcsoló (D6): 50ms debounce után azonnali szivattyú BE + zöld LED
 //     folyamatos BE, ESP pump parancstól függetlenül.
 //   - Relé visszacsatolás (D7): 50ms debounce, >500ms eltérésnél RELAY_MISMATCH.
+//   - DS18B20 Auto-Discovery + EEPROM tanítás: nincs beégetett ROM cím,
+//     boot-kor OneWire keresés + EEPROM ellenőrzés; eltérésnél ISMERETLEN / tanítás.
 // ============================================================================
 
 constexpr uint8_t PIN_ONE_WIRE       = 2;
@@ -79,15 +82,38 @@ constexpr float ALARM_OVERHEAT_DEFAULT = 85.0f;
 constexpr float ALARM_OVERHEAT_MIN     = 70.0f;
 constexpr float ALARM_OVERHEAT_MAX     = 90.0f;
 
-// --- DS18B20 szenzor címek (cseréld le a Serial address-kiíró mód alapján!) ---
-DeviceAddress ADDR_ELOREMENO  = { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 }; // TODO: CSERÉLD LE VALÓS CÍMRE!
-DeviceAddress ADDR_VISSZATERO = { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02 }; // TODO: CSERÉLD LE VALÓS CÍMRE!
-DeviceAddress ADDR_KAZAN      = { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03 }; // TODO: CSERÉLD LE VALÓS CÍMRE!
-DeviceAddress ADDR_KULTERI    = { 0x28, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04 }; // TODO: CSERÉLD LE VALÓS CÍMRE!
+// --- EEPROM DS18B20 szerep-cím tárolás ---
+constexpr uint16_t SENSOR_EEPROM_MAGIC   = 0x4653U; // "FS"
+constexpr uint8_t  SENSOR_EEPROM_VERSION = 1U;
+constexpr int      SENSOR_EEPROM_ADDR    = 0;
+
+struct __attribute__((packed)) SensorEepromStore {
+    uint16_t magic;
+    uint8_t  version;
+    uint8_t  assignedMask; // bit0..3 = Eloremeno, Visszatero, Kazan, Kulteri
+    uint8_t  addr[SENSOR_ROLE_COUNT][8];
+    uint8_t  checksum;
+};
 
 OneWire oneWire(PIN_ONE_WIRE);
 DallasTemperature sensors(&oneWire);
 RF24 radio(PIN_NRF_CE, PIN_NRF_CSN);
+
+// --- EEPROM-ból betöltött és buszon felderített DS18B20 címek ---
+DeviceAddress sensorAddr[SENSOR_ROLE_COUNT] = { {0}, {0}, {0}, {0} };
+uint8_t       roleAssignedMask              = 0;
+uint8_t       rolePresentMask               = 0;
+uint8_t       roleKnownMask                 = 0;
+bool          sensorUnknown                 = true;
+
+DeviceAddress foundBusAddr[MAX_DISCOVERED_SENSORS] = { {0} };
+int16_t       foundBusTempsDeci[MAX_DISCOVERED_SENSORS] = { -1270, -1270, -1270, -1270, -1270, -1270 };
+uint8_t       foundBusCount                 = 0;
+bool          scanConvPending               = false;
+uint32_t      scanConvReqMs                 = 0;
+bool          scanReadPending               = false;
+uint8_t       scanReadStep                  = 0;
+bool          scanReady                     = false;
 
 // --- Tárolt konfiguráció és mért állapot ---
 PumpConfigPacked lastPumpConfig = {
@@ -117,17 +143,20 @@ uint8_t latestSensorValidMask = 0;
 
 NrfPacket rxPacket;
 NrfPacket lastResponsePacket;
+NrfPacket lastSensorResponsePacket;
 
-uint8_t  lastEspOutputsMask   = 0;
-bool     hasEspRequest        = false;
-bool     hasProcessedSeq      = false;
-uint32_t lastProcessedSeq     = 0;
-uint32_t responseCounter      = 0;
-uint32_t lastRequestMs        = 0;
-uint32_t lastTempCycleMs      = 0;
-bool     conversionRequested  = false;
-uint32_t conversionReqMs      = 0;
-bool     failsafeActive       = true; // Induláskor nincs még ESP kapcsolat -> biztonságos alapállapot
+uint8_t  lastEspOutputsMask     = 0;
+bool     hasEspRequest          = false;
+bool     hasProcessedSeq        = false;
+uint32_t lastProcessedSeq       = 0;
+bool     hasProcessedSensorSeq  = false;
+uint32_t lastProcessedSensorSeq = 0;
+uint32_t responseCounter        = 0;
+uint32_t lastRequestMs          = 0;
+uint32_t lastTempCycleMs        = 0;
+bool     conversionRequested    = false;
+uint32_t conversionReqMs        = 0;
+bool     failsafeActive         = true; // Induláskor nincs még ESP kapcsolat -> biztonságos alapállapot
 
 uint32_t lastAlarmBlinkMs     = 0;
 bool     alarmBlinkOn         = true;
@@ -308,7 +337,7 @@ void evaluateLocalSafetyAndAlarm() {
     } else if (alarmOverheat) {
         currentAlarmState.active = 1;
         currentAlarmState.reason = ALARM_REASON_OVERHEAT;
-    } else if (kazanInvalid) {
+    } else if (kazanInvalid || sensorUnknown) {
         currentAlarmState.active = 1;
         currentAlarmState.reason = ALARM_REASON_SENSOR_FAIL;
     } else if (!hasEspRequest || failsafeActive) {
@@ -378,6 +407,155 @@ void refreshHardwareOutputs(uint32_t now) {
 }
 
 // ============================================================================
+// EEPROM + ONEWIRE AUTO-DISCOVERY + TANÍTÁS
+// ============================================================================
+inline void eepromCommit() {
+    // AVR <EEPROM.h> EEPROM.put() közvetlenül ír; ESP8266/ESP32 kompatibilitásért külön wrapper.
+#if defined(ESP8266) || defined(ESP32)
+    EEPROM.commit();
+#endif
+}
+
+uint8_t computeEepromChecksum(const SensorEepromStore& st) {
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(&st);
+    uint8_t sum = 0x5AU;
+    // Az utolsó checksum byte kivételével minden byte-on végigmegyünk
+    for (size_t i = 0; i < sizeof(SensorEepromStore) - 1U; i++) {
+        sum = static_cast<uint8_t>(sum ^ raw[i]);
+        sum = static_cast<uint8_t>(sum + (raw[i] * 3U));
+    }
+    return sum;
+}
+
+void printSerialHexAddr(const uint8_t addr[8]) {
+    char buf[24];
+    formatDeviceAddressHex(addr, buf, sizeof(buf));
+    Serial.print(buf);
+}
+
+void loadSensorAddressesFromEeprom() {
+    SensorEepromStore store{};
+    EEPROM.get(SENSOR_EEPROM_ADDR, store);
+
+    if (store.magic != SENSOR_EEPROM_MAGIC ||
+        store.version != SENSOR_EEPROM_VERSION ||
+        store.checksum != computeEepromChecksum(store)) {
+        roleAssignedMask = 0;
+        memset(sensorAddr, 0, sizeof(sensorAddr));
+        Serial.println(F("[SENSOR] EEPROM ures vagy ervenytelen - szenzor tanitas szukseges."));
+        return;
+    }
+
+    roleAssignedMask = static_cast<uint8_t>(store.assignedMask & 0x0FU);
+    for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
+        if ((roleAssignedMask & (1U << r)) != 0 && isDeviceAddressNonZero(store.addr[r])) {
+            memcpy(sensorAddr[r], store.addr[r], 8);
+        } else {
+            roleAssignedMask &= static_cast<uint8_t>(~(1U << r));
+            memset(sensorAddr[r], 0, 8);
+        }
+    }
+    Serial.print(F("[SENSOR] EEPROM betoltve, assignedMask=0x"));
+    Serial.println(roleAssignedMask, HEX);
+}
+
+bool saveSensorAddressToEeprom(uint8_t role, const uint8_t newAddr[8]) {
+    if (role >= SENSOR_ROLE_COUNT || !isDeviceAddressNonZero(newAddr)) {
+        return false;
+    }
+
+    memcpy(sensorAddr[role], newAddr, 8);
+    roleAssignedMask |= static_cast<uint8_t>(1U << role);
+
+    SensorEepromStore store{};
+    store.magic        = SENSOR_EEPROM_MAGIC;
+    store.version      = SENSOR_EEPROM_VERSION;
+    store.assignedMask = roleAssignedMask;
+    for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
+        memcpy(store.addr[r], sensorAddr[r], 8);
+    }
+    store.checksum = computeEepromChecksum(store);
+
+    EEPROM.put(SENSOR_EEPROM_ADDR, store);
+    eepromCommit();
+
+    SensorEepromStore verify{};
+    EEPROM.get(SENSOR_EEPROM_ADDR, verify);
+    bool verified = (memcmp(&store, &verify, sizeof(SensorEepromStore)) == 0);
+    if (!verified) {
+        Serial.println(F("ERROR EEPROM_VERIFY_FAIL"));
+        return false;
+    }
+
+    Serial.print(F("[SENSOR] Tanitva EEPROM-ba role="));
+    Serial.print(sensorRoleToKey(role));
+    Serial.print(F(" addr="));
+    printSerialHexAddr(newAddr);
+    Serial.println();
+    return true;
+}
+
+void recomputeRolePresence(bool logMissing) {
+    rolePresentMask = 0;
+    for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
+        if ((roleAssignedMask & (1U << r)) == 0) {
+            continue;
+        }
+        for (uint8_t i = 0; i < foundBusCount; i++) {
+            if (memcmp(sensorAddr[r], foundBusAddr[i], 8) == 0) {
+                rolePresentMask |= static_cast<uint8_t>(1U << r);
+                break;
+            }
+        }
+    }
+
+    roleKnownMask = static_cast<uint8_t>(roleAssignedMask & rolePresentMask);
+    sensorUnknown = (foundBusCount < SENSOR_ROLE_COUNT) || (roleKnownMask != 0x0FU);
+
+    if (logMissing) {
+        if (sensorUnknown) {
+            for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
+                if ((roleKnownMask & (1U << r)) == 0) {
+                    Serial.print(F("WARN SENSOR_UNKNOWN role="));
+                    Serial.println(sensorRoleToKey(r));
+                }
+            }
+        } else {
+            Serial.println(F("[SENSOR] Mind a 4 DS18B20 szerep azonosítva és jelen van a buszon."));
+        }
+    }
+}
+
+void discoverBusAddresses(bool logMissing) {
+    foundBusCount = 0;
+    memset(foundBusAddr, 0, sizeof(foundBusAddr));
+    for (uint8_t i = 0; i < MAX_DISCOVERED_SENSORS; i++) {
+        foundBusTempsDeci[i] = -1270;
+    }
+
+    uint8_t addr[8];
+    oneWire.reset_search();
+    delayMicroseconds(250);
+    while (foundBusCount < MAX_DISCOVERED_SENSORS && oneWire.search(addr)) {
+        wdt_reset();
+        if (OneWire::crc8(addr, 7) != addr[7]) {
+            continue;
+        }
+        if (isDeviceAddressNonZero(addr)) {
+            memcpy(foundBusAddr[foundBusCount], addr, 8);
+            foundBusCount++;
+        }
+    }
+    oneWire.reset_search();
+
+    sensors.begin();
+    sensors.setResolution(12);
+    sensors.setWaitForConversion(false);
+
+    recomputeRolePresence(logMissing);
+}
+
+// ============================================================================
 // DS18B20 ADDRESS-KIÍRÓ MÓD (SERIAL 'a' KARAKTERRE)
 // ============================================================================
 void printDeviceAddressCArray(const DeviceAddress addr) {
@@ -394,36 +572,38 @@ void printDeviceAddressCArray(const DeviceAddress addr) {
 void runAddressScanner() {
     loopMonitorSuspend = true;
     wdt_reset();
-    Serial.println(F("\n=== DS18B20 ADDRESS-KIIRO MOD ==="));
-    sensors.begin();
-    uint8_t count = sensors.getDeviceCount();
+    Serial.println(F("\n=== DS18B20 AUTO-DISCOVERY ==="));
+    discoverBusAddresses(true);
     Serial.print(F("Talalt szenzorok szama: "));
-    Serial.println(count);
+    Serial.println(foundBusCount);
 
     sensors.setWaitForConversion(true);
     sensors.requestTemperatures();
     wdt_reset();
 
-    DeviceAddress foundAddr;
-    for (uint8_t i = 0; i < count; i++) {
+    for (uint8_t i = 0; i < foundBusCount; i++) {
         wdt_reset();
-        if (sensors.getAddress(foundAddr, i)) {
-            float tempC = sensors.getTempC(foundAddr);
-            Serial.print(F("  ["));
-            Serial.print(i);
-            Serial.print(F("] Cim: "));
-            printDeviceAddressCArray(foundAddr);
-            Serial.print(F("  | Homerseklet: "));
-            if (tempC <= -120.0f) {
-                Serial.println(F("HIBA (-127)"));
-            } else {
-                Serial.print(tempC, 2);
-                Serial.println(F(" C"));
-            }
+        float tempC = sensors.getTempC(foundBusAddr[i]);
+        foundBusTempsDeci[i] = (tempC > -120.0f && !isnan(tempC) && tempC <= 125.0f)
+                                   ? static_cast<int16_t>(lroundf(tempC * 10.0f))
+                                   : -1270;
+        Serial.print(F("  ["));
+        Serial.print(i);
+        Serial.print(F("] Cim: "));
+        printSerialHexAddr(foundBusAddr[i]);
+        Serial.print(F(" "));
+        printDeviceAddressCArray(foundBusAddr[i]);
+        Serial.print(F("  | Homerseklet: "));
+        if (tempC <= -120.0f) {
+            Serial.println(F("HIBA (-127)"));
+        } else {
+            Serial.print(tempC, 2);
+            Serial.println(F(" C"));
         }
     }
+    scanReady = true;
     sensors.setWaitForConversion(false);
-    Serial.println(F("Masold be a cimeket az ADDR_* tombokbe! (Ujraolvasas: kuldj 'a' karaktert)"));
+    Serial.println(F("Ujraolvasas: kuldj 'a' karaktert, vagy tanits LCD/Frontend menubol."));
     Serial.println(F("=================================\n"));
     wdt_reset();
 }
@@ -439,12 +619,19 @@ float readSingleSensor(const DeviceAddress addr) {
     return t;
 }
 
+float readRoleTemperature(uint8_t role) {
+    if (role >= SENSOR_ROLE_COUNT || (roleKnownMask & (1U << role)) == 0) {
+        return SENSOR_DISCONNECTED_VAL;
+    }
+    return readSingleSensor(sensorAddr[role]);
+}
+
 void commitTemperatureResults() {
     uint8_t validMask = 0;
-    setBit(validMask, 0, latestEloremeno  > -120.0f);
-    setBit(validMask, 1, latestVisszatero > -120.0f);
-    setBit(validMask, 2, latestKazan      > -120.0f);
-    setBit(validMask, 3, latestKulteri    > -120.0f);
+    setBit(validMask, 0, ((roleKnownMask & (1U << SENSOR_ROLE_ELOREMENO))  != 0) && latestEloremeno  > -120.0f);
+    setBit(validMask, 1, ((roleKnownMask & (1U << SENSOR_ROLE_VISSZATERO)) != 0) && latestVisszatero > -120.0f);
+    setBit(validMask, 2, ((roleKnownMask & (1U << SENSOR_ROLE_KAZAN))      != 0) && latestKazan      > -120.0f);
+    setBit(validMask, 3, ((roleKnownMask & (1U << SENSOR_ROLE_KULTERI))    != 0) && latestKulteri    > -120.0f);
     latestSensorValidMask = validMask;
 
     evaluateLocalSafetyAndAlarm();
@@ -460,30 +647,30 @@ void commitTemperatureResults() {
 }
 
 void updateAllTemperatures() {
-    latestEloremeno  = readSingleSensor(ADDR_ELOREMENO);
-    latestVisszatero = readSingleSensor(ADDR_VISSZATERO);
-    latestKazan      = readSingleSensor(ADDR_KAZAN);
-    latestKulteri    = readSingleSensor(ADDR_KULTERI);
+    latestEloremeno  = readRoleTemperature(SENSOR_ROLE_ELOREMENO);
+    latestVisszatero = readRoleTemperature(SENSOR_ROLE_VISSZATERO);
+    latestKazan      = readRoleTemperature(SENSOR_ROLE_KAZAN);
+    latestKulteri    = readRoleTemperature(SENSOR_ROLE_KULTERI);
     commitTemperatureResults();
 }
 
 void stepAsyncTemperatureRead() {
     switch (dsReadStep) {
         case 0:
-            dsPendingEloremeno = readSingleSensor(ADDR_ELOREMENO);
+            dsPendingEloremeno = readRoleTemperature(SENSOR_ROLE_ELOREMENO);
             dsReadStep = 1;
             break;
         case 1:
-            dsPendingVisszatero = readSingleSensor(ADDR_VISSZATERO);
+            dsPendingVisszatero = readRoleTemperature(SENSOR_ROLE_VISSZATERO);
             dsReadStep = 2;
             break;
         case 2:
-            dsPendingKazan = readSingleSensor(ADDR_KAZAN);
+            dsPendingKazan = readRoleTemperature(SENSOR_ROLE_KAZAN);
             dsReadStep = 3;
             break;
         case 3:
         default:
-            dsPendingKulteri = readSingleSensor(ADDR_KULTERI);
+            dsPendingKulteri = readRoleTemperature(SENSOR_ROLE_KULTERI);
             latestEloremeno  = dsPendingEloremeno;
             latestVisszatero = dsPendingVisszatero;
             latestKazan      = dsPendingKazan;
@@ -492,6 +679,25 @@ void stepAsyncTemperatureRead() {
             dsReadStep       = 0;
             commitTemperatureResults();
             break;
+    }
+}
+
+void stepAsyncScanRead() {
+    if (scanReadStep >= foundBusCount) {
+        scanReadPending = false;
+        scanReadStep    = 0;
+        scanReady       = true;
+        return;
+    }
+    float t = readSingleSensor(foundBusAddr[scanReadStep]);
+    foundBusTempsDeci[scanReadStep] = (t > -120.0f)
+                                          ? static_cast<int16_t>(lroundf(t * 10.0f))
+                                          : -1270;
+    scanReadStep++;
+    if (scanReadStep >= foundBusCount) {
+        scanReadPending = false;
+        scanReadStep    = 0;
+        scanReady       = true;
     }
 }
 
@@ -510,6 +716,9 @@ void buildResponsePacket(uint32_t seq) {
     uint8_t aPacked = packAlarmState(currentAlarmState);
     if (loopFault) {
         aPacked |= SYNC_FLAG_LOOP_FAULT;
+    }
+    if (sensorUnknown) {
+        aPacked |= SYNC_FLAG_SENSOR_UNKNOWN;
     }
     lastResponsePacket.nano.alarmPacked     = aPacked;
     lastResponsePacket.nano.cmdSeq          = lastCmdSeq;
@@ -533,6 +742,119 @@ void sendResponseToMaster(const NrfPacket& resp) {
     radio.openWritingPipe(NRF_ADDR_SLAVE_TO_MASTER);
     radio.write(&resp, sizeof(resp));
     radio.startListening();
+}
+
+void buildSensorResponsePacket(uint32_t seq, uint8_t subCmd, uint8_t cmdSeq, uint8_t startIdx, bool ok) {
+    memset(&lastSensorResponsePacket, 0, sizeof(lastSensorResponsePacket));
+    lastSensorResponsePacket.packetType           = PKT_TYPE_SENSOR_RSP;
+    lastSensorResponsePacket.sensorRsp.seq        = seq;
+    lastSensorResponsePacket.sensorRsp.subCmd     = subCmd;
+    lastSensorResponsePacket.sensorRsp.cmdSeq     = cmdSeq;
+    lastSensorResponsePacket.sensorRsp.totalFound = foundBusCount;
+    lastSensorResponsePacket.sensorRsp.startIndex = startIdx;
+
+    uint8_t sFlags = 0;
+    if (ok)            sFlags |= SENSOR_RSP_FLAG_OK;
+    if (sensorUnknown) sFlags |= SENSOR_RSP_FLAG_UNKNOWN;
+    if (scanReady)     sFlags |= SENSOR_RSP_FLAG_SCAN_READY;
+    sFlags |= static_cast<uint8_t>((roleKnownMask & 0x0FU) << SENSOR_RSP_ROLE_MASK_SHIFT);
+    lastSensorResponsePacket.sensorRsp.statusFlags = sFlags;
+
+    uint8_t vMask = 0;
+    if (subCmd == SENSOR_CMD_GET_ROLES) {
+        for (uint8_t slot = 0; slot < 2; slot++) {
+            uint8_t r = static_cast<uint8_t>(startIdx + slot);
+            if (r < SENSOR_ROLE_COUNT && (roleAssignedMask & (1U << r)) != 0) {
+                memcpy(lastSensorResponsePacket.sensorRsp.entries[slot].address, sensorAddr[r], 8);
+                if ((roleKnownMask & (1U << r)) != 0) {
+                    vMask |= static_cast<uint8_t>(1U << slot);
+                }
+            }
+            lastSensorResponsePacket.sensorRsp.entries[slot].tempDeci = -1270;
+        }
+    } else if (subCmd == SENSOR_CMD_GET_FOUND) {
+        for (uint8_t slot = 0; slot < 2; slot++) {
+            uint8_t idx = static_cast<uint8_t>(startIdx + slot);
+            if (idx < foundBusCount) {
+                memcpy(lastSensorResponsePacket.sensorRsp.entries[slot].address, foundBusAddr[idx], 8);
+                lastSensorResponsePacket.sensorRsp.entries[slot].tempDeci = foundBusTempsDeci[idx];
+                vMask |= static_cast<uint8_t>(1U << slot);
+            } else {
+                lastSensorResponsePacket.sensorRsp.entries[slot].tempDeci = -1270;
+            }
+        }
+    }
+    lastSensorResponsePacket.sensorRsp.validEntryMask = vMask;
+}
+
+void handleSensorCommandPacket(const NrfPacket& pkt, uint32_t now) {
+    lastRequestMs = now;
+    uint32_t incomingSeq = pkt.sensorCmd.seq;
+
+    if (hasProcessedSensorSeq && incomingSeq == lastProcessedSensorSeq) {
+        sendResponseToMaster(lastSensorResponsePacket);
+        return;
+    }
+
+    hasProcessedSensorSeq  = true;
+    lastProcessedSensorSeq = incomingSeq;
+    hasEspRequest          = true;
+    if (failsafeActive) {
+        failsafeActive = false;
+        Serial.println(F("[NANO] Master kapcsolat helyreallt (sensorCmd), fail-safe feloldva."));
+    }
+
+    uint8_t subCmd      = pkt.sensorCmd.subCmd;
+    uint8_t cmdSeq      = pkt.sensorCmd.cmdSeq;
+    uint8_t roleOrIndex = pkt.sensorCmd.roleOrIndex;
+    bool    ok          = true;
+
+    switch (subCmd) {
+        case SENSOR_CMD_SCAN_START:
+            loopMonitorSuspend = true;
+            discoverBusAddresses(false);
+            sensors.requestTemperatures();
+            scanConvPending = true;
+            scanConvReqMs   = now;
+            scanReadPending = false;
+            scanReadStep    = 0;
+            scanReady       = false;
+            break;
+
+        case SENSOR_CMD_GET_FOUND:
+            break;
+
+        case SENSOR_CMD_GET_ROLES:
+            break;
+
+        case SENSOR_CMD_LEARN: {
+            loopMonitorSuspend = true;
+            ok = saveSensorAddressToEeprom(roleOrIndex, pkt.sensorCmd.address);
+            if (ok) {
+                discoverBusAddresses(false);
+                // Azonnal próbáljuk beolvasni a frissen tanított szerep hőmérsékletét és új konverziót indítani
+                if (roleOrIndex == SENSOR_ROLE_ELOREMENO) {
+                    latestEloremeno = readRoleTemperature(SENSOR_ROLE_ELOREMENO);
+                } else if (roleOrIndex == SENSOR_ROLE_VISSZATERO) {
+                    latestVisszatero = readRoleTemperature(SENSOR_ROLE_VISSZATERO);
+                } else if (roleOrIndex == SENSOR_ROLE_KAZAN) {
+                    latestKazan = readRoleTemperature(SENSOR_ROLE_KAZAN);
+                } else if (roleOrIndex == SENSOR_ROLE_KULTERI) {
+                    latestKulteri = readRoleTemperature(SENSOR_ROLE_KULTERI);
+                }
+                commitTemperatureResults();
+                refreshHardwareOutputs(now);
+            }
+            break;
+        }
+
+        default:
+            ok = false;
+            break;
+    }
+
+    buildSensorResponsePacket(incomingSeq, subCmd, cmdSeq, roleOrIndex, ok);
+    sendResponseToMaster(lastSensorResponsePacket);
 }
 
 void handleSerialCommands() {
@@ -618,7 +940,6 @@ void setup() {
     if (mcusrSnapshot & _BV(WDRF)) {
         Serial.println(F("WARN WATCHDOG_RESET: elozo ujraindulas hardveres watchdog miatt tortent!"));
     }
-    Serial.println(F("FIGYELEM: Csereld le az ADDR_* tomboket a scanner altal kiirt valos cimekre, kulonben minden szenzor -127 lesz!"));
 
     pinMode(PIN_LED_ZOLD, OUTPUT);
     pinMode(PIN_SERVICE_SWITCH, INPUT_PULLUP);
@@ -650,6 +971,8 @@ void setup() {
     refreshHardwareOutputs(lastAlarmBlinkMs);
     Serial.println(F("[NANO] Indulasi biztonsagi allapot: Szivattyu BE, Piros LED villog."));
 
+    // EEPROM DS18B20 szerep-címek betöltése + OneWire busz auto-discovery
+    loadSensorAddressesFromEeprom();
     runAddressScanner();
     loopMonitorSuspend = false;
     sensors.setResolution(12);
@@ -692,7 +1015,7 @@ void loop() {
 
     // 1. Nem-blokkoló aszinkron DS18B20 mérés 10 másodpercenként (4 szenzor ciklusokra bontva, 750ms konverzió nélkül)
     // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
-    if (!conversionRequested && !dsReadPending &&
+    if (!scanConvPending && !scanReadPending && !conversionRequested && !dsReadPending &&
         (static_cast<uint32_t>(now - lastTempCycleMs) >= TEMP_READ_INTERVAL_MS)) {
         sensors.requestTemperatures();
         conversionRequested = true;
@@ -711,13 +1034,27 @@ void loop() {
         stepAsyncTemperatureRead();
     }
 
-    // 2. Master (ESP32-C3) REQUEST fogadása (0xA1) és azonnali RESPONSE küldése (0xB2)
+    // 1b. Nem-blokkoló DS18B20 keresés (sensorScan) konverzió és lépésenkénti kiolvasás
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (scanConvPending && (static_cast<uint32_t>(now - scanConvReqMs) >= DS18B20_CONV_TIME_MS)) {
+        scanConvPending = false;
+        scanReadPending = true;
+        scanReadStep    = 0;
+    }
+
+    if (scanReadPending) {
+        stepAsyncScanRead();
+    }
+
+    // 2. Master (ESP32-C3) REQUEST (0xA1) vagy SENSOR_CMD (0xA3) fogadása és azonnali válasz
     if (radio.available()) {
         while (radio.available()) {
             radio.read(&rxPacket, sizeof(rxPacket));
         }
 
-        if (rxPacket.packetType == PKT_TYPE_REQUEST) {
+        if (rxPacket.packetType == PKT_TYPE_SENSOR_CMD) {
+            handleSensorCommandPacket(rxPacket, now);
+        } else if (rxPacket.packetType == PKT_TYPE_REQUEST) {
             lastRequestMs = now;
             uint32_t incomingSeq = rxPacket.esp.seq;
 

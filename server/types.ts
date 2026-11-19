@@ -69,6 +69,22 @@ export interface HeatingTemperatures {
   kulteri: number | null;
 }
 
+export const VALID_SENSOR_ROLES = ['eloremeno', 'visszatero', 'kazan', 'kulteri'] as const;
+
+export type SensorRoleKey = (typeof VALID_SENSOR_ROLES)[number];
+
+export interface SensorRoleInfo {
+  address: string | null;
+  ok: boolean;
+}
+
+export type SensorStatusMap = Record<SensorRoleKey, SensorRoleInfo>;
+
+export interface SensorScanItem {
+  address: string;
+  temp: number | null;
+}
+
 export interface EspTimeInfo {
   espNtpSynced: boolean;
   espTime: string;
@@ -132,6 +148,8 @@ export interface HeatingStatusPayload {
   time?: EspTimeInfo;
   sync?: TimeSyncInfo;
   trend?: TrendStats;
+  sensors?: SensorStatusMap;
+  sensorUnknown?: boolean;
 }
 
 export interface StoredDeviceState {
@@ -172,4 +190,5 @@ export interface CmdAckResult {
   pumpOn?: boolean;
   executedAt?: string;
   reason?: CmdAckReason;
+  found?: SensorScanItem[];
 }

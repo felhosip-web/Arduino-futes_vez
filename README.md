@@ -49,11 +49,11 @@ Két egységes, **Master–Slave** felépítésű okos fűtésvezérlő és szil
 
 ### 2.1 Arduino Nano (kazánnál, SLAVE)
 
-A 4 db **DS18B20** hőmérséklet-szenzor közös **OneWire** buszon van a **D2** lábon (4,7 kΩ felhúzó ellenállással 5V felé). Mindegyik szenzort egyedi 8 byte-os `DeviceAddress` alapján azonosítjuk, **nem index alapján**. Első indításkor a Serial Monitoron (115200 baud) az **`a`** karakter elküldésére a Nano kilistázza a buszon talált címeket — ezeket kell bemásolni a `nano/src/main.cpp` fájl `// TODO: CSERÉLD LE VALÓS CÍMRE!` soraira (`ADDR_ELOREMENO`, `ADDR_VISSZATERO`, `ADDR_KAZAN`, `ADDR_KULTERI`).
+A 4 db **DS18B20** hőmérséklet-szenzor közös **OneWire** buszon van a **D2** lábon (4,7 kΩ felhúzó ellenállással 5V felé). Mindegyik szenzort egyedi 8 byte-os `DeviceAddress` alapján azonosítjuk (**nem index alapján**), és a címek a Nano **EEPROM** memóriájában tárolódnak — nincs szükség fix kódba égetett címekre vagy újrafordításra szenzorcserekor. A Serial Monitoron (115200 baud) az **`a`** karakter elküldésére továbbra is lekérdezhető a buszon talált címek listája.
 
 | Komponens / Jel | Arduino Nano láb | Irány / Típus | Megjegyzés |
 | :--- | :--- | :--- | :--- |
-| **4× DS18B20 OneWire busz** | `D2` | Digitális (OneWire) | 4,7 kΩ pull-up 5V-ra; cím szerinti olvasás (`'a'` parancs a Serial Monitoron) |
+| **4× DS18B20 OneWire busz** | `D2` | Digitális (OneWire) | 4,7 kΩ pull-up 5V-ra; auto-discovery + EEPROM cím szerinti olvasás (`'a'` parancs Serial-on) |
 | **NRF24L01+ CE** | `D3` | Kimenet | Rádió modul engedélyező |
 | **NRF24L01+ CSN** | `D4` | Kimenet | SPI Chip Select |
 | **NRF24L01+ MOSI** | `D11` | Hardveres SPI | Master Out Slave In |
@@ -72,7 +72,17 @@ A 4 db **DS18B20** hőmérséklet-szenzor közös **OneWire** buszon van a **D2*
 
 > **Figyelem:** Az NRF24L01+ modul **3,3 V** tápfeszültséget igényel (a Nano 3.3V kimenete gyenge lehet, célszerű külső 3.3V stabilizátor és 10–100 µF kondenzátor a modul tápján).
 
-### 2.2 ESP32-C3 (szobában, MASTER / Gateway)
+### 2.2 DS18B20 tanítás (Auto-Discovery + EEPROM)
+
+- **Boot felderítés és ellenőrzés**: Induláskor a Nano betölti a 4 szerephez (`eloremeno`, `visszatero`, `kazan`, `kulteri`) tartozó ROM címeket az **EEPROM**-ból (magic + verzió + checksum ellenőrzéssel), majd OneWire kereséssel összeveti a buszon lévő érzékelőkkel.
+- **Szenzorhiba / csere biztonság**: Ha az EEPROM üres, `< 4` szenzor található, vagy egy elmentett cím már nem szerepel a buszon (pl. hibás szenzor cseréje után), a rendszer **SOHA nem tippel index alapján**. Az érintett szerep **`ISMERETLEN`** állapotba kerül (`-127.0 °C`), a Nano `SYNC_FLAG_SENSOR_UNKNOWN` jelzést és `sensor_fail` riasztást küld, a biztonsági logika pedig bekapcsolva tartja a szivattyút.
+- **Tanítás LCD-ről (`BEALLITAS -> Szenzor Tanitas`)**:
+  - **`SZENZOR KERESES`**: kilistázza a buszon talált összes DS18B20 címet és aktuális hőmérsékletét (`01 28:FF.. 23.5C`).
+  - **`TANITAS` (10 mp melegítéses varázsló)**: szerepenként végigvezeti a felhasználót: melegítsd meg a kijelzett szenzort kézzel (**`> 2,0 °C`** emelkedés 10 mp alatt) → `[OK]` megjelenésekor rövid gombnyomással menthető EEPROM-ba (ellenőrző visszaolvasással), vagy ha nem melegedett, újrapróbálható.
+- **Tanítás Frontendről (`Szenzorok` kártya)**:
+  - A **`Tanítás indítása`** gombbal lekérdezi a buszt (`GET /api/heating/:id/sensor/scan`), majd szerepenként legördülő listából (**dropdown**) egyetlen kattintással elmenthető (`POST /api/heating/:id/sensor/learn`) — így **egyetlen kicserélt szenzor is** újratanítható a többi érintése nélkül. Opcionálisan böngészős **10 mp-es melegítéses segéd** is indítható.
+
+### 2.3 ESP32-C3 (szobában, MASTER / Gateway)
 
 | Komponens / Jel | ESP32-C3 GPIO | Irány / Típus | Megjegyzés |
 | :--- | :--- | :--- | :--- |
@@ -102,11 +112,12 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 - **`packetType` mező (1 byte):**
   - `0xA1` (`PKT_TYPE_REQUEST`): **Master → Slave** (ESP32-C3 → Arduino Nano)
   - `0xB2` (`PKT_TYPE_RESPONSE`): **Slave → Master** (Arduino Nano → ESP32-C3)
+  - `0xA3` (`PKT_TYPE_SENSOR_CMD`) / `0xB4` (`PKT_TYPE_SENSOR_RSP`): opcionális, továbbra is fix **32 byte-os** DS18B20 felderítési és EEPROM tanítási üzenetpár
 
 | Struktúra (31 byte payload) | Mezők pontos sorrendben | Leírás |
 | :--- | :--- | :--- |
 | **`EspToNanoPayload`** | `outputsMask`, `targetTemp`, `mode`, `manualHeating`, `pumpConfig`, `alarmConfig`, `heartbeatIntervalSec`, `seq`, `timeSyncEpoch` | Az ESP32 kimeneti bitmaszkja, termosztát, szivattyú-, riasztás- és ping beállításai, a növekvő `seq` sorszám, valamint a 4 byte-os `timeSyncEpoch` időszinkron érték. |
-| **`NanoToEspPayload`** | `eloremeno`, `visszatero`, `kazan`, `kulteri`, `kazanStatusMask`, `counter`, `seq`, `sensorValidMask`, `alarmPacked`, `cmdSeq`, `syncFlags`, `syncEpochLow16` | A 4 mért hőfok (`-127.0f` hiba esetén), az 1 byte-os `kazanStatusMask` (amelyet az ESP32 bont vissza 8 elemű `kazan_status` tömbbé), a válasz `counter`, a szenzor-érvényességi maszk, az `alarmPacked` (`bit0`: active, `bit1..3`: reason, `bit4`: `SYNC_FLAG_LOOP_FAULT = 0x10`), a `syncFlags` (`bit0`: `ACK`, `bit1`: `STALE`, `bit2`: `SYNC_FLAG_SERVICE_MODE`, `bit3`: `CMD_ACK`, `bit4`: `PUMP_ON` kért állapot, `bit5`: `CMD_REJECTED_SERVICE`, `bit6`: `SYNC_FLAG_RELAY_FB_ON` D7 fizikai visszacsatolás, `bit7`: `SYNC_FLAG_RELAY_MISMATCH` >500 ms eltérés) + `syncEpochLow16` + `cmdSeq` (továbbra is fix 32 byte-os `NrfPacket`). |
+| **`NanoToEspPayload`** | `eloremeno`, `visszatero`, `kazan`, `kulteri`, `kazanStatusMask`, `counter`, `seq`, `sensorValidMask`, `alarmPacked`, `cmdSeq`, `syncFlags`, `syncEpochLow16` | A 4 mért hőfok (`-127.0f` hiba esetén), az 1 byte-os `kazanStatusMask` (amelyet az ESP32 bont vissza 8 elemű `kazan_status` tömbbé), a válasz `counter`, a szenzor-érvényességi maszk, az `alarmPacked` (`bit0`: active, `bit1..3`: reason, `bit4`: `SYNC_FLAG_LOOP_FAULT = 0x10`, `bit5`: `SYNC_FLAG_SENSOR_UNKNOWN = 0x20`), a `syncFlags` (`bit0`: `ACK`, `bit1`: `STALE`, `bit2`: `SYNC_FLAG_SERVICE_MODE`, `bit3`: `CMD_ACK`, `bit4`: `PUMP_ON` kért állapot, `bit5`: `CMD_REJECTED_SERVICE`, `bit6`: `SYNC_FLAG_RELAY_FB_ON` D7 fizikai visszacsatolás, `bit7`: `SYNC_FLAG_RELAY_MISMATCH` >500 ms eltérés) + `syncEpochLow16` + `cmdSeq` (továbbra is fix 32 byte-os `NrfPacket`). |
 
 ### MQTT topicok (HiveMQ Cloud TLS 8883)
 
@@ -232,6 +243,13 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
     "maxAt": "14:32",
     "minAt": "06:15",
     "since": "2026-11-17 08:12:00 óta"
+  },
+  "sensorUnknown": false,
+  "sensors": {
+    "eloremeno": { "address": "28:FF:64:1E:90:12:34:56", "ok": true },
+    "visszatero": { "address": "28:FF:64:1E:90:12:34:57", "ok": true },
+    "kazan": { "address": "28:FF:64:1E:90:12:34:58", "ok": true },
+    "kulteri": { "address": "28:FF:64:1E:90:12:34:59", "ok": true }
   },
   "error": null
 }
@@ -420,7 +438,7 @@ FŐKÉPERNYŐ
       │    ├── Radio
       │    ├── Bizt. Hatar        (95.0C (FIX), csak olvasható)
       │    ├── NAPLO
-      │    ├── CHECK              (6 sor: NTP, Nano, Radio, Millis, Szerviz, Loop)
+      │    ├── CHECK              (7 sor: NTP, Nano, Radio, Millis, Szerviz, Loop, Szenzorok)
       │    └── VISSZA
       ├── BEALLITAS
       │    ├── Celhofok           (16.0 - 26.0 °C, lépés: 0.5 °C)
@@ -433,6 +451,7 @@ FŐKÉPERNYŐ
       │    ├── Riasztas           (BE / KI)
       │    ├── Ping               (5s / 10s / 15s / 20s / 25s / 30s)
       │    ├── Manual Futes       (BE / KI)
+      │    ├── Szenzor Tanitas    (SZENZOR KERESES / TANITAS 10mp varázsló)
       │    ├── Gyari visszaallit  (Tartsd 3mp-ig!)
       │    └── VISSZA
       └── KIMENETEK
@@ -537,7 +556,7 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
    ```bash
    pio run -d nano -t upload
    ```
-   Nyisd meg a Serial Monitort (`115200` baud), küldj egy **`a`** karaktert, ellenőrizd a 4 db DS18B20 `DeviceAddress` címét, és ha még a placeholder címek vannak benne, írd be őket a `nano/src/main.cpp`-be, majd töltsd fel újra.
+   Első indításkor (amikor az EEPROM még üres) a Nano automatikusan felderíti a buszon lévő DS18B20 szenzorokat, és `ISMERETLEN` jelzést küld, amíg meg nem tanítod a 4 szerepet az ESP32 LCD menüjéből (`BEALLITAS -> Szenzor Tanitas`) vagy a webes **`Szenzorok`** kártyáról. Nincs szükség kódmódosításra vagy újrafordításra.
 3. **ESP32-C3 feltöltése és Wi-Fi beállítása**:
    ```bash
    pio run -d esp32 -t upload
@@ -627,7 +646,8 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
         ├── AlarmControl.tsx        # Túlmelegedés riasztás és villogó állapotjelző
         ├── PushNotifications.tsx   # Böngésző értesítések (Push) konfigurációs panel
         ├── HeartbeatControl.tsx    # V5 NRF24 életjel és ping intervallum (5–30s)
-        ├── SystemCheck.tsx         # Rendszer ellenőrzés (NTP, Nano, Radio, Millis + kézi szinkron)
+        ├── SystemCheck.tsx         # Rendszer ellenőrzés (NTP, Nano, Radio, Millis, Szerviz, Loop, Szenzorok)
+        ├── SensorsPanel.tsx        # DS18B20 szerep-áttekintő, busz kereső és tanítási panel
         ├── ServiceModeModal.tsx    # Nem bezárható szerviz üzemmód figyelmeztető modal
         ├── ChartsView.tsx          # Hőmérséklet grafikon nézet időablakkal és felbontással
         ├── TempChart.tsx           # Recharts vonaldiagram üres adat kezeléssel
@@ -661,3 +681,4 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
 | **Nem lehet kikapcsolni a szivattyút frontendről** | Szerviz kapcsoló BE van | Kapcsold KI a kapcsolót a kazánnál. |
 | **RELÉ HIBA, Kért BE, relé KI** | Beragadt / beégett érintkező, vagy szakadt vezeték a D7-en | Ellenőrizd a relét, cseréld ki, ne használd a rendszert hiba mellett. |
 | **`LOOP_SLOW` / `LOOP_FAULT`** | Blokkoló kód, NRF várakozás, WiFi szakadás | Ellenőrizd, hogy nincs-e `delay()` a `loop()`-ban, és nézd meg a soros logot / `CHECK` menüt. |
+| **Szenzor ISMERETLEN** | Kicserélt szenzor, új cím | BEALLITAS -> SZENZOR TANITAS, vagy frontend Szenzorok kártya -> Tanítás. |

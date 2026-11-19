@@ -109,9 +109,13 @@ constexpr uint32_t ALARM_BLINK_INTERVAL_MS    = 500UL;    // 500ms BE / 500ms KI
 constexpr uint32_t NRF_RESPONSE_TIMEOUT_MS  = 500UL; // Max 500ms várakozás RESPONSE-ra
 constexpr uint8_t  NRF_MAX_ATTEMPTS         = 3;     // Max 3 próba egy ping ciklusban
 constexpr uint8_t  NRF_MAX_MISSED_CYCLES    = 3;     // 3 egymás utáni sikertelen ciklus -> nrf_fail
-constexpr uint32_t CMD_ACK_TIMEOUT_MS       = 3000UL; // Max 3000ms end-to-end CMD_ACK várakozás
-constexpr uint32_t RELAY_FAULT_DELAY_MS     = 500UL;  // Max 500ms eltérés kért vs D7 visszacsatolás között
-constexpr uint32_t CMD_RELAY_SETTLE_POLL_MS = 75UL;   // Relé D7 beállási újrakérdezés (50ms debounce után)
+constexpr uint32_t CMD_ACK_TIMEOUT_MS         = 3000UL; // Max 3000ms end-to-end CMD_ACK várakozás
+constexpr uint32_t RELAY_FAULT_DELAY_MS       = 500UL;  // Max 500ms eltérés kért vs D7 visszacsatolás között
+constexpr uint32_t CMD_RELAY_SETTLE_POLL_MS   = 75UL;   // Relé D7 beállási újrakérdezés (50ms debounce után)
+constexpr uint32_t SENSOR_SCAN_CONV_WAIT_MS   = 850UL;  // Nano 800ms DS18B20 scan konverzió kivárása
+constexpr uint32_t SENSOR_TEACH_HEAT_WINDOW_MS = 10000UL; // 10 mp melegítési ablak LCD tanításkor
+constexpr uint32_t SENSOR_TEACH_POLL_INTERVAL_MS = 1400UL; // Tanítás közbeni keresési ciklus (nem-blokkoló)
+constexpr float    SENSOR_TEACH_DELTA_C       = 2.0f;   // > 2.0 °C emelkedés = azonosított szenzor
 
 // --- TLS biztonsági beállítások (kizárólag CA tanúsítvány-ellenőrzéssel) ---
 constexpr bool     TLS_REQUIRE_CA_CERT    = true;

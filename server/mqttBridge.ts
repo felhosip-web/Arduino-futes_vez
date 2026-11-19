@@ -13,6 +13,8 @@ import type {
   HeatingUpdateEvent,
   PumpMode,
   PumpStartSensor,
+  SensorScanItem,
+  SensorStatusMap,
   StoredDeviceState,
 } from './types.ts';
 import { SAFETY_OVERHEAT_TEMP } from './validation.ts';
@@ -73,6 +75,13 @@ export function mergeHeatingStatus(
   const mergedTime = mergeDefined(prevStatus.time, parsed.time);
   const mergedSync = mergeDefined(prevStatus.sync, parsed.sync);
   const mergedTrend = mergeDefined(prevStatus.trend, parsed.trend);
+  const mergedSensors =
+    parsed.sensors && typeof parsed.sensors === 'object'
+      ? ({
+          ...(prevStatus.sensors ?? {}),
+          ...parsed.sensors,
+        } as SensorStatusMap)
+      : prevStatus.sensors;
 
   const extraLoopFields: Partial<HeatingStatusPayload> = {
     ...(typeof parsed.loopFault === 'boolean'
@@ -95,6 +104,11 @@ export function mergeHeatingStatus(
       : typeof prevStatus.loopLastMs === 'number'
         ? { loopLastMs: prevStatus.loopLastMs }
         : {}),
+    ...(typeof parsed.sensorUnknown === 'boolean'
+      ? { sensorUnknown: parsed.sensorUnknown }
+      : typeof prevStatus.sensorUnknown === 'boolean'
+        ? { sensorUnknown: prevStatus.sensorUnknown }
+        : {}),
   };
 
   return {
@@ -111,6 +125,7 @@ export function mergeHeatingStatus(
     ...(mergedTime ? { time: mergedTime } : {}),
     ...(mergedSync ? { sync: mergedSync } : {}),
     ...(mergedTrend ? { trend: mergedTrend } : {}),
+    ...(mergedSensors ? { sensors: mergedSensors } : {}),
   };
 }
 
@@ -184,6 +199,7 @@ export class HeatingMqttBridge {
   private readonly relayFaultStates = new Map<string, boolean>();
   private readonly loopFaultStates = new Map<string, boolean>();
   private readonly nanoLoopFaultStates = new Map<string, boolean>();
+  private readonly sensorUnknownStates = new Map<string, boolean>();
   private readonly lastActiveTrends = new Map<string, 'up' | 'down'>();
   private readonly pendingAcks = new Map<
     string,
@@ -415,6 +431,24 @@ export class HeatingMqttBridge {
       this.nanoLoopFaultStates.set(deviceId, parsed.nanoLoopFault);
     }
 
+    if (typeof parsed.sensorUnknown === 'boolean') {
+      const prevSensorUnknown = this.sensorUnknownStates.get(deviceId);
+      if (parsed.sensorUnknown && prevSensorUnknown !== true) {
+        this.logBackendEvent(
+          'WARN',
+          'SENSOR_UNKNOWN',
+          `${deviceId} ismeretlen DS18B20 szenzor - tanítás szükséges`
+        );
+      } else if (!parsed.sensorUnknown && prevSensorUnknown === true) {
+        this.logBackendEvent(
+          'INFO',
+          'SENSOR_ROLES_OK',
+          `${deviceId} mind a 4 DS18B20 szerep azonosítva`
+        );
+      }
+      this.sensorUnknownStates.set(deviceId, parsed.sensorUnknown);
+    }
+
     const incomingTrend = parsed.trend?.eloremeno;
     if (incomingTrend === 'up' || incomingTrend === 'down') {
       const prevActiveTrend = this.lastActiveTrends.get(deviceId);
@@ -508,6 +542,16 @@ export class HeatingMqttBridge {
           ? undefined
           : 'NRF_TIMEOUT';
 
+    const found: SensorScanItem[] | undefined = Array.isArray(parsed.found)
+      ? parsed.found
+          .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+          .map((item) => ({
+            address: typeof item.address === 'string' ? item.address : '',
+            temp: typeof item.temp === 'number' && Number.isFinite(item.temp) ? item.temp : null,
+          }))
+          .filter((item) => item.address.length > 0)
+      : undefined;
+
     if (!ok) {
       this.logBackendEvent('WARN', 'CMD_ACK_FAIL', `${deviceId} cmdId=${cmdId} reason=${reason}`);
     }
@@ -519,6 +563,7 @@ export class HeatingMqttBridge {
       ...(pumpOn !== undefined ? { pumpOn } : {}),
       ...(executedAt !== undefined ? { executedAt } : {}),
       ...(reason !== undefined ? { reason } : {}),
+      ...(found !== undefined ? { found } : {}),
     });
   }
 
