@@ -5,8 +5,10 @@ import {
   CheckCircle2,
   Clock,
   Cpu,
+  Gauge,
   Radio,
   RefreshCw,
+  Wrench,
 } from 'lucide-react';
 import { API_URL, DEVICE_ID } from '../config';
 import type { HeatingStatusPayload } from '../types/heating';
@@ -53,8 +55,21 @@ export function SystemCheck({ status, lastUpdatedAt, onSyncTriggered }: SystemCh
     typeof sync?.millisOverflowInDays === 'number' ? sync.millisOverflowInDays : null;
   const overflowWarning = overflowDays !== null && overflowDays <= 7;
 
+  const serviceModeActive = Boolean(status?.serviceMode);
+  const espLoopFault = Boolean(status?.loopFault);
+  const nanoLoopFault = Boolean(status?.nanoLoopFault);
+  const anyLoopFault = espLoopFault || nanoLoopFault;
+  const loopMaxMs =
+    typeof status?.loopMaxMs === 'number' && Number.isFinite(status.loopMaxMs)
+      ? status.loopMaxMs
+      : null;
+  const loopLastMs =
+    typeof status?.loopLastMs === 'number' && Number.isFinite(status.loopLastMs)
+      ? status.loopLastMs
+      : null;
+
   const hasSyncData = Boolean(status && sync);
-  const allOk = hasSyncData && ntpOk && nanoOk && radioOk && !overflowWarning;
+  const allOk = hasSyncData && ntpOk && nanoOk && radioOk && !overflowWarning && !anyLoopFault;
 
   const handleForceSync = async () => {
     setSyncing(true);
@@ -273,6 +288,67 @@ export function SystemCheck({ status, lastUpdatedAt, onSyncTriggered }: SystemCh
             </p>
             <p className="mt-1 text-xs text-slate-400">
               32-bit uint32_t kivonás (49 napos körbefordulás védett)
+            </p>
+          </div>
+
+          {/* 5. Szerviz kapcsoló (Nano D6) */}
+          <div className="rounded-lg border border-slate-800/90 bg-slate-950/60 p-4">
+            <div className="flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                <Wrench className="h-4 w-4 text-slate-400" aria-hidden="true" />
+                Szerviz kapcsoló (D6)
+              </span>
+              <span
+                className={`rounded border px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${
+                  serviceModeActive
+                    ? 'border-amber-500/60 bg-amber-950/70 text-amber-300'
+                    : 'border-emerald-500/40 bg-emerald-950/60 text-emerald-300'
+                }`}
+              >
+                {serviceModeActive ? 'BE (SLAVE)' : 'KI'}
+              </span>
+            </div>
+            <p className="mt-2 font-mono text-sm font-medium text-slate-100">
+              {serviceModeActive ? 'Kézi kazánoldali vezérlés' : 'Normál automata vezérlés'}
+            </p>
+            <p className="mt-1 text-xs text-slate-400">
+              {serviceModeActive
+                ? 'A szivattyú D6-ról kényszerítve BE van kapcsolva'
+                : 'ESP32 / webes vezérlés aktív'}
+            </p>
+          </div>
+
+          {/* 6. Loop monitor */}
+          <div className="rounded-lg border border-slate-800/90 bg-slate-950/60 p-4">
+            <div className="flex items-center justify-between gap-2">
+              <span className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                <Gauge className="h-4 w-4 text-slate-400" aria-hidden="true" />
+                Loop monitor
+              </span>
+              <span
+                className={`rounded border px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${
+                  anyLoopFault
+                    ? 'border-red-500 bg-red-950/80 text-red-200 animate-pulse'
+                    : 'border-emerald-500/40 bg-emerald-950/60 text-emerald-300'
+                }`}
+              >
+                {anyLoopFault ? `LASSÚ (max ${loopMaxMs ?? '?'}ms)` : 'Loop: OK'}
+              </span>
+            </div>
+            <p
+              className={`mt-2 font-mono text-sm font-semibold tabular-nums ${
+                anyLoopFault ? 'text-red-300' : 'text-slate-100'
+              }`}
+            >
+              {anyLoopFault
+                ? `${espLoopFault ? 'ESP32 ' : ''}${nanoLoopFault ? 'Nano ' : ''}lassulás észlelve`
+                : loopLastMs !== null
+                  ? `Utolsó: ${loopLastMs} ms`
+                  : 'Nincs mérés'}
+            </p>
+            <p className="mt-1 text-xs text-slate-400 tabular-nums">
+              {loopMaxMs !== null ? `ESP max: ${loopMaxMs} ms` : 'ESP max: —'} · Nano:{' '}
+              {nanoLoopFault ? 'LASSÚ' : 'OK'}
             </p>
           </div>
         </div>

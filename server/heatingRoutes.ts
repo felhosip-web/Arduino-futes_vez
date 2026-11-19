@@ -286,7 +286,7 @@ export function createHeatingRouter(
   router.get('/:id', requireGetAuth, handleGetStatus);
   router.get('/:id/status', requireGetAuth, handleGetStatus);
 
-  // POST /api/heating/:id/command - teljes vagy részleges CMD JSON validálása és továbbítása MQTT-re
+  // POST /api/heating/:id/command - teljes vagy részleges CMD JSON validálása és továbbítása MQTT-re + CMD_ACK
   router.post('/:id/command', async (req, res) => {
     const { id } = req.params;
 
@@ -301,8 +301,20 @@ export function createHeatingRouter(
         if (!validation.ok) {
           return { ok: false as const, error: validation.error };
         }
-        await bridge.publishCommand(id, validation.value);
-        return { ok: true as const, command: validation.value };
+        const meta = bridge.generateCmdId();
+        const waiter = bridge.createCommandAckWaiter(meta.cmdId, 3000);
+        try {
+          await bridge.publishCommand(id, validation.value, meta);
+        } catch (err) {
+          waiter.cancel();
+          throw err;
+        }
+        return {
+          ok: true as const,
+          command: validation.value,
+          cmdId: meta.cmdId,
+          ackPromise: waiter.promise,
+        };
       });
 
       if (!result.ok) {
@@ -310,10 +322,26 @@ export function createHeatingRouter(
         return;
       }
 
-      bridge.logBackendEvent('INFO', 'API_CMD', 'POST /command OK');
+      const ack = await result.ackPromise;
+      if (!ack.acked) {
+        res.status(504).json({
+          ok: false,
+          acked: false,
+          cmdId: ack.cmdId,
+          reason: ack.reason || 'ACK_TIMEOUT',
+          ...(ack.pumpOn !== undefined ? { pumpOn: ack.pumpOn } : {}),
+        });
+        return;
+      }
+
+      bridge.logBackendEvent('INFO', 'API_CMD', `POST /command OK (cmdId=${ack.cmdId})`);
 
       res.json({
         ok: true,
+        acked: true,
+        cmdId: ack.cmdId,
+        ...(ack.pumpOn !== undefined ? { pumpOn: ack.pumpOn } : {}),
+        ...(ack.executedAt !== undefined ? { executedAt: ack.executedAt } : {}),
         topic: `futes/${id}/cmd`,
         command: result.command,
       });
@@ -323,7 +351,7 @@ export function createHeatingRouter(
     }
   });
 
-  // POST /api/heating/:id/kimenet - egyetlen kimenet bit gyors kapcsolása sorosított eszköz-mutexszel
+  // POST /api/heating/:id/kimenet - egyetlen kimenet bit gyors kapcsolása sorosított eszköz-mutexszel + CMD_ACK
   router.post('/:id/kimenet', async (req, res) => {
     const { id } = req.params;
     const validation = validateSingleOutputBody(req.body);
@@ -341,8 +369,20 @@ export function createHeatingRouter(
         }
 
         const fullCommand = buildSingleOutputCommand(current, validation.value);
-        await bridge.publishCommand(id, fullCommand);
-        return { conflict: false as const, fullCommand };
+        const meta = bridge.generateCmdId();
+        const waiter = bridge.createCommandAckWaiter(meta.cmdId, 3000);
+        try {
+          await bridge.publishCommand(id, fullCommand, meta);
+        } catch (err) {
+          waiter.cancel();
+          throw err;
+        }
+        return {
+          conflict: false as const,
+          fullCommand,
+          cmdId: meta.cmdId,
+          ackPromise: waiter.promise,
+        };
       });
 
       if (result.conflict) {
@@ -352,8 +392,24 @@ export function createHeatingRouter(
         return;
       }
 
+      const ack = await result.ackPromise;
+      if (!ack.acked) {
+        res.status(504).json({
+          ok: false,
+          acked: false,
+          cmdId: ack.cmdId,
+          reason: ack.reason || 'ACK_TIMEOUT',
+          ...(ack.pumpOn !== undefined ? { pumpOn: ack.pumpOn } : {}),
+        });
+        return;
+      }
+
       res.json({
         ok: true,
+        acked: true,
+        cmdId: ack.cmdId,
+        ...(ack.pumpOn !== undefined ? { pumpOn: ack.pumpOn } : {}),
+        ...(ack.executedAt !== undefined ? { executedAt: ack.executedAt } : {}),
         topic: `futes/${id}/cmd`,
         changed: validation.value,
         command: result.fullCommand,
@@ -364,7 +420,7 @@ export function createHeatingRouter(
     }
   });
 
-  // POST /api/heating/:id/pump - csak a pumpConfig módosítása, a többi mező a frissebb forrásból
+  // POST /api/heating/:id/pump - csak a pumpConfig módosítása + CMD_ACK
   router.post('/:id/pump', async (req, res) => {
     const { id } = req.params;
 
@@ -396,8 +452,20 @@ export function createHeatingRouter(
           return { status: 400 as const, error: built.error };
         }
 
-        await bridge.publishCommand(id, built.value);
-        return { status: 200 as const, command: built.value };
+        const meta = bridge.generateCmdId();
+        const waiter = bridge.createCommandAckWaiter(meta.cmdId, 3000);
+        try {
+          await bridge.publishCommand(id, built.value, meta);
+        } catch (err) {
+          waiter.cancel();
+          throw err;
+        }
+        return {
+          status: 200 as const,
+          command: built.value,
+          cmdId: meta.cmdId,
+          ackPromise: waiter.promise,
+        };
       });
 
       if (result.status !== 200) {
@@ -405,8 +473,24 @@ export function createHeatingRouter(
         return;
       }
 
+      const ack = await result.ackPromise;
+      if (!ack.acked) {
+        res.status(504).json({
+          ok: false,
+          acked: false,
+          cmdId: ack.cmdId,
+          reason: ack.reason || 'ACK_TIMEOUT',
+          ...(ack.pumpOn !== undefined ? { pumpOn: ack.pumpOn } : {}),
+        });
+        return;
+      }
+
       res.json({
         ok: true,
+        acked: true,
+        cmdId: ack.cmdId,
+        ...(ack.pumpOn !== undefined ? { pumpOn: ack.pumpOn } : {}),
+        ...(ack.executedAt !== undefined ? { executedAt: ack.executedAt } : {}),
         topic: `futes/${id}/cmd`,
         pumpConfig: result.command.pumpConfig,
         command: result.command,
@@ -417,7 +501,7 @@ export function createHeatingRouter(
     }
   });
 
-  // POST /api/heating/:id/alarm - csak az alarmConfig módosítása, a többi mező a frissebb forrásból
+  // POST /api/heating/:id/alarm - csak az alarmConfig módosítása + CMD_ACK
   router.post('/:id/alarm', async (req, res) => {
     const { id } = req.params;
 
@@ -449,8 +533,20 @@ export function createHeatingRouter(
           return { status: 400 as const, error: built.error };
         }
 
-        await bridge.publishCommand(id, built.value);
-        return { status: 200 as const, command: built.value };
+        const meta = bridge.generateCmdId();
+        const waiter = bridge.createCommandAckWaiter(meta.cmdId, 3000);
+        try {
+          await bridge.publishCommand(id, built.value, meta);
+        } catch (err) {
+          waiter.cancel();
+          throw err;
+        }
+        return {
+          status: 200 as const,
+          command: built.value,
+          cmdId: meta.cmdId,
+          ackPromise: waiter.promise,
+        };
       });
 
       if (result.status !== 200) {
@@ -458,8 +554,24 @@ export function createHeatingRouter(
         return;
       }
 
+      const ack = await result.ackPromise;
+      if (!ack.acked) {
+        res.status(504).json({
+          ok: false,
+          acked: false,
+          cmdId: ack.cmdId,
+          reason: ack.reason || 'ACK_TIMEOUT',
+          ...(ack.pumpOn !== undefined ? { pumpOn: ack.pumpOn } : {}),
+        });
+        return;
+      }
+
       res.json({
         ok: true,
+        acked: true,
+        cmdId: ack.cmdId,
+        ...(ack.pumpOn !== undefined ? { pumpOn: ack.pumpOn } : {}),
+        ...(ack.executedAt !== undefined ? { executedAt: ack.executedAt } : {}),
         topic: `futes/${id}/cmd`,
         alarmConfig: result.command.alarmConfig,
         command: result.command,
@@ -470,7 +582,7 @@ export function createHeatingRouter(
     }
   });
 
-  // POST /api/heating/:id/heartbeat - csak a heartbeat módosítása, a többi mező a frissebb forrásból
+  // POST /api/heating/:id/heartbeat - csak a heartbeat módosítása + CMD_ACK
   router.post('/:id/heartbeat', async (req, res) => {
     const { id } = req.params;
 
@@ -502,8 +614,20 @@ export function createHeatingRouter(
           return { status: 400 as const, error: built.error };
         }
 
-        await bridge.publishCommand(id, built.value);
-        return { status: 200 as const, command: built.value };
+        const meta = bridge.generateCmdId();
+        const waiter = bridge.createCommandAckWaiter(meta.cmdId, 3000);
+        try {
+          await bridge.publishCommand(id, built.value, meta);
+        } catch (err) {
+          waiter.cancel();
+          throw err;
+        }
+        return {
+          status: 200 as const,
+          command: built.value,
+          cmdId: meta.cmdId,
+          ackPromise: waiter.promise,
+        };
       });
 
       if (result.status !== 200) {
@@ -511,14 +635,30 @@ export function createHeatingRouter(
         return;
       }
 
+      const ack = await result.ackPromise;
+      if (!ack.acked) {
+        res.status(504).json({
+          ok: false,
+          acked: false,
+          cmdId: ack.cmdId,
+          reason: ack.reason || 'ACK_TIMEOUT',
+          ...(ack.pumpOn !== undefined ? { pumpOn: ack.pumpOn } : {}),
+        });
+        return;
+      }
+
       bridge.logBackendEvent(
         'INFO',
         'API_HEARTBEAT',
-        `POST /heartbeat OK (${result.command.heartbeat.intervalSec}s)`
+        `POST /heartbeat OK (${result.command.heartbeat.intervalSec}s, cmdId=${ack.cmdId})`
       );
 
       res.json({
         ok: true,
+        acked: true,
+        cmdId: ack.cmdId,
+        ...(ack.pumpOn !== undefined ? { pumpOn: ack.pumpOn } : {}),
+        ...(ack.executedAt !== undefined ? { executedAt: ack.executedAt } : {}),
         topic: `futes/${id}/cmd`,
         heartbeat: result.command.heartbeat,
         command: result.command,

@@ -10,6 +10,11 @@
 #include <Preferences.h>
 #include <RF24.h>
 #include <math.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
+#if __has_include(<esp_idf_version.h>)
+#include <esp_idf_version.h>
+#endif
 
 #include <time.h>
 
@@ -23,8 +28,8 @@
 // ============================================================================
 // ESP32-C3 - SZOBA OLDALI MASTER / GATEWAY (V5 PROTOKOLL + MENÜ + NVS)
 // ============================================================================
-// - Master -> Slave REQUEST (0xA1) növekvő seq-el, majd max 500ms várakozás
-//   Slave -> Master RESPONSE (0xB2) csomagra, max 3 próbával, AckPayload KI.
+// - Master -> Slave REQUEST (0xA1) növekvő seq-el, nem-blokkoló állapotgéppel
+//   (NRF_IDLE / NRF_WAITING), max 500ms/próba, max 3 retry, AckPayload KI.
 // - 2x20 I2C LCD menürendszer interrupt alapú rotary encoderrel (delay nélkül).
 // - Preferences (NVS, "futes" namespace) tartós tárolás + 3 mp gyári reset.
 // ============================================================================
@@ -50,8 +55,10 @@ constexpr const char* WIFI_PORTAL_IP = "192.168.4.1";
 
 // --- Időzítők ---
 uint32_t lastLm35Ms              = 0;
-uint32_t lastHeartbeatMs         = 0;
+uint32_t lastPing                = 0;
+uint32_t lastNrfOk               = 0;
 uint32_t lastTelemetryMs         = 0;
+uint32_t lastMqttPublishRetryMs  = 0;
 uint32_t lastWifiTryMs           = 0;
 uint32_t lastMqttTryMs           = 0;
 uint32_t mqttRetryIntervalMs     = MQTT_RECONNECT_MS;
@@ -80,6 +87,10 @@ bool     mqttStatusPendingRetry    = false;
 bool     mqttTelemetryPendingRetry = false;
 bool     nrfErrorBannerShown       = false;
 bool     nrfFailLoggedForOutage    = false;
+bool     nrfTimeoutLogged          = false;
+bool     nrfFail                   = false;
+bool     nrfCycleAnyWriteOk        = false;
+bool     nrfImmediatePending       = false;
 bool     prevWifiConnected         = false;
 bool     prevMqttConnected         = false;
 bool     ntpConfigured             = false;
@@ -91,6 +102,43 @@ bool     lm35OutOfRangeLogged      = false;
 String   wifiSsid;
 String   wifiPassword;
 const char* wifiPortalMessage = "Válaszd ki az otthoni Wi-Fi hálózatot.";
+
+// --- Nem-blokkoló NRF24 Master-Slave állapotgép ---
+enum NrfState : uint8_t { NRF_IDLE, NRF_WAITING };
+NrfState nrfState              = NRF_IDLE;
+uint32_t nrfSentAt             = 0;
+uint8_t  nrfRetry              = 0;
+const uint32_t NRF_TIMEOUT_MS  = NRF_RESPONSE_TIMEOUT_MS; // 500 ms
+const uint8_t  NRF_MAX_RETRY   = NRF_MAX_ATTEMPTS;        // 3
+NrfPacket nrfTxPacket{};
+uint32_t  nrfTxSyncEpoch       = 0;
+
+// --- Végponttól végpontig tartó parancs-visszaigazolás (CMD_ACK) ---
+bool     pendingCmdActive            = false;
+char     pendingCmdId[64]            = { 0 };
+uint8_t  pendingCmdSeq               = 0;
+uint32_t pendingCmdAt                = 0;
+bool     pendingCmdRequestedPumpOff  = false;
+bool     pendingCmdSentInCurrentNrf  = false;
+bool     pendingCmdWaitingSettle     = false;
+uint32_t pendingCmdLastPollAt        = 0;
+uint8_t  lastGeneratedCmdSeq         = 0;
+
+// --- DPDT Relé visszacsatolás figyelés (500ms eltérés -> RELAY_FAULT) ---
+bool     relayMismatchTiming         = false;
+uint32_t relayMismatchStartedMs      = 0;
+bool     prevRelayFaultLogged        = false;
+
+// --- Loop Monitor (ESP32-C3, 71 perces micros() túlcsordulás-biztos) ---
+uint32_t lastLoopUs                  = 0;
+uint32_t maxLoopUs                   = 0;
+uint32_t loopOverrunCount            = 0;
+bool     loopFault                   = false;
+bool     loopMonitorSuspend          = false;
+uint8_t  espSlowLoopStreak           = 0;
+uint8_t  espFastLoopStreak           = 0;
+uint32_t espLastSlowLogMs            = 0;
+bool     espHasSlowLogYet            = false;
 
 // ============================================================================
 // ESEMÉNY- ÉS HIBANAPLÓ (KÖRKÖRÖS PUFFER + SERIAL + AZONNALI MQTT ERROR)
@@ -261,6 +309,7 @@ const char* alarmReasonToStr(uint8_t r) {
         case ALARM_REASON_OVERHEAT:    return "overheat";
         case ALARM_REASON_SENSOR_FAIL: return "sensor_fail";
         case ALARM_REASON_NRF_FAIL:    return "nrf_fail";
+        case ALARM_REASON_PUMP_FAULT:  return "pump_fault";
         case ALARM_REASON_NONE:
         default:                       return "none";
     }
@@ -717,6 +766,43 @@ bool getSelectedStartSensorTemp(float& outTemp) {
     }
 }
 
+bool evaluateRelayFault(uint32_t now, bool nanoReportedMismatch) {
+    if (!state.hasRelayFeedback && !nanoReportedMismatch) {
+        return false;
+    }
+
+    bool prevFault = state.relayFault;
+    if (state.pumpOn == state.relayFeedbackOn && !nanoReportedMismatch) {
+        relayMismatchTiming = false;
+        state.relayFault    = false;
+    } else if (state.pumpOn != state.relayFeedbackOn) {
+        if (!relayMismatchTiming) {
+            relayMismatchTiming    = true;
+            relayMismatchStartedMs = now;
+        }
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        if (nanoReportedMismatch ||
+            static_cast<uint32_t>(now - relayMismatchStartedMs) >= RELAY_FAULT_DELAY_MS) {
+            state.relayFault = true;
+        }
+    }
+
+    if (state.relayFault != prevRelayFaultLogged) {
+        prevRelayFaultLogged = state.relayFault;
+        if (state.relayFault) {
+            char msg[48];
+            snprintf(msg, sizeof(msg), "commanded=%s feedback=%s",
+                     state.pumpOn ? "BE" : "KI",
+                     state.relayFeedbackOn ? "BE" : "KI");
+            logEvent(LOG_WARN, "RELAY_FAULT", msg);
+        } else {
+            logEvent(LOG_INFO, "RELAY_OK", "Rele allapot ismet egyezik");
+        }
+    }
+
+    return prevFault != state.relayFault;
+}
+
 void evaluateAlarmState() {
     bool alarmOverheat = isSensorValid(state.kazan) && (state.kazan >= state.alarmConfig.alarmTemp);
 
@@ -732,6 +818,10 @@ void evaluateAlarmState() {
     } else if (!state.nrf24Ok && state.consecutiveMissedPings >= NRF_MAX_MISSED_CYCLES) {
         state.alarmState.active = 1;
         state.alarmState.reason = ALARM_REASON_NRF_FAIL;
+    } else if (state.relayFault ||
+               (state.nanoAlarmState.active != 0 && state.nanoAlarmState.reason == ALARM_REASON_PUMP_FAULT)) {
+        state.alarmState.active = 1;
+        state.alarmState.reason = ALARM_REASON_PUMP_FAULT;
     } else if (state.safetySensorFault ||
                (state.nanoAlarmState.active != 0 && state.nanoAlarmState.reason == ALARM_REASON_SENSOR_FAIL)) {
         state.alarmState.active = 1;
@@ -759,6 +849,9 @@ void evaluateAlarmState() {
             case ALARM_REASON_SENSOR_FAIL:
                 logEvent(LOG_ERROR, "ALARM_SENSOR", "Kazan szenzor hiba (-127)");
                 break;
+            case ALARM_REASON_PUMP_FAULT:
+                logEvent(LOG_ERROR, "ALARM_PUMP", "Rele / szivattyu visszacsatolasi hiba");
+                break;
             case ALARM_REASON_NRF_FAIL:
                 logEvent(LOG_ERROR, "ALARM_NRF", "NRF24 kommunikacios hiba");
                 break;
@@ -774,7 +867,7 @@ void evaluateAlarmState() {
     prevAlarmReasonLogged = state.alarmState.reason;
 }
 
-bool evaluateBoilerPumpProtection(uint32_t now) {
+bool evaluateBoilerPumpProtection(uint32_t now, bool nanoReportedMismatch = false) {
     bool modeAutoRestored = false;
 
     // 10 perces manual_off automatikus visszaállás
@@ -882,6 +975,7 @@ bool evaluateBoilerPumpProtection(uint32_t now) {
         }
     }
 
+    evaluateRelayFault(now, nanoReportedMismatch);
     evaluateAlarmState();
 
     setBit(state.outputsMask, OUT_BIT_SZIVATTYU, state.pumpOn);
@@ -915,160 +1009,367 @@ void updateAlarmBlinkAndLed(uint32_t now) {
 bool publishMqttStatus();
 
 // ============================================================================
-// V5 MASTER-SLAVE NRF24 KOMMUNIKÁCIÓ (REQUEST 0xA1 -> RESPONSE 0xB2)
+// V5 MASTER-SLAVE NRF24 KOMMUNIKÁCIÓ (NEM-BLOKKOLÓ ÁLLAPOTGÉP: 0xA1 -> 0xB2)
 // ============================================================================
-bool sendRequestToNano() {
+void formatEspIsoTimeStr(char* out, size_t len, uint32_t uptimeSec) {
+    if (!out || len == 0) return;
+    if (state.ntpSynced) {
+        time_t epochNow = time(nullptr);
+        if (epochNow >= 1700000000) {
+            struct tm tmUtc{};
+            if (gmtime_r(&epochNow, &tmUtc)) {
+                strftime(out, len, "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
+                return;
+            }
+        }
+    }
+    snprintf(out, len, "UP %lus", static_cast<unsigned long>(uptimeSec));
+}
+
+void publishMqttCmdAck(const char* cmdId, bool ok, const char* reason, bool pumpOn) {
+    if (!cmdId || cmdId[0] == '\0' || !mqtt.connected()) {
+        return;
+    }
+
+    uint32_t uptimeSec = static_cast<uint32_t>(uptimeTotalMs / 1000ULL);
+    char execAt[32];
+    formatEspIsoTimeStr(execAt, sizeof(execAt), uptimeSec);
+
+    JsonDocument doc;
+    doc["cmdId"]      = cmdId;
+    doc["ok"]         = ok;
+    doc["pumpOn"]     = pumpOn;
+    doc["executedAt"] = execAt;
+    if (!ok && reason && reason[0] != '\0') {
+        doc["reason"] = reason;
+    }
+
+    char payload[256];
+    size_t n = serializeJson(doc, payload, sizeof(payload));
+    if (n == 0) {
+        return;
+    }
+
+    bool ok1 = mqtt.publish(TOPIC_ACK, reinterpret_cast<const uint8_t*>(payload), n, false);
+    bool ok2 = mqtt.publish(TOPIC_ACK_ALT, reinterpret_cast<const uint8_t*>(payload), n, false);
+    if (!ok1 && !ok2) {
+        logEvent(LOG_WARN, "MQTT_PUB_FAIL", "MQTT PUBLISH FAILED cmd_ack");
+    }
+}
+
+void clearPendingCmd() {
+    pendingCmdActive           = false;
+    pendingCmdSentInCurrentNrf = false;
+    pendingCmdRequestedPumpOff = false;
+    pendingCmdWaitingSettle    = false;
+    pendingCmdLastPollAt       = 0;
+    pendingCmdSeq              = 0;
+    pendingCmdId[0]            = '\0';
+}
+
+uint8_t nextCmdSeqFromCmdId(const JsonDocument& doc, const char* cmdId) {
+    if (doc["cmdSeq"].is<int>()) {
+        uint8_t s = static_cast<uint8_t>(doc["cmdSeq"].as<int>() & 0xFF);
+        if (s != 0) {
+            return s;
+        }
+    }
+    uint8_t hash = 0;
+    if (cmdId) {
+        for (size_t i = 0; cmdId[i] != '\0'; i++) {
+            hash = static_cast<uint8_t>((hash * 33U) + static_cast<uint8_t>(cmdId[i]));
+        }
+    }
+    if (hash == 0) {
+        lastGeneratedCmdSeq++;
+        if (lastGeneratedCmdSeq == 0) {
+            lastGeneratedCmdSeq = 1;
+        }
+        hash = lastGeneratedCmdSeq;
+    }
+    return hash;
+}
+
+void buildNrfRequestPacket() {
     state.txSeq++;
     if (state.txSeq == 0) {
         state.txSeq = 1;
     }
 
-    uint32_t syncEpochToSend = pendingTimeSyncEpoch;
+    nrfTxSyncEpoch             = pendingTimeSyncEpoch;
+    pendingCmdSentInCurrentNrf = pendingCmdActive;
 
-    NrfPacket tx{};
-    tx.packetType               = PKT_TYPE_REQUEST;
-    tx.esp.outputsMask          = state.outputsMask;
-    tx.esp.targetTemp           = state.targetTemp;
-    tx.esp.mode                 = state.mode;
-    tx.esp.manualHeating        = state.manualHeating ? 1 : 0;
-    tx.esp.pumpConfig           = state.pumpConfig;
-    tx.esp.alarmConfig          = state.alarmConfig;
-    tx.esp.heartbeatIntervalSec = state.heartbeatIntervalSec;
-    tx.esp.seq                  = state.txSeq;
-    tx.esp.timeSyncEpoch        = syncEpochToSend;
+    memset(&nrfTxPacket, 0, sizeof(nrfTxPacket));
+    nrfTxPacket.packetType               = PKT_TYPE_REQUEST;
+    nrfTxPacket.esp.outputsMask          = state.outputsMask;
+    nrfTxPacket.esp.targetTemp           = state.targetTemp;
+    nrfTxPacket.esp.modeAndManual        = packModeAndManual(state.mode, state.manualHeating);
+    nrfTxPacket.esp.cmdSeq               = pendingCmdActive ? pendingCmdSeq : 0;
+    nrfTxPacket.esp.pumpConfig           = state.pumpConfig;
+    nrfTxPacket.esp.alarmConfig          = state.alarmConfig;
+    nrfTxPacket.esp.heartbeatIntervalSec = state.heartbeatIntervalSec;
+    nrfTxPacket.esp.seq                  = state.txSeq;
+    nrfTxPacket.esp.timeSyncEpoch        = nrfTxSyncEpoch;
+}
 
-    bool anyWriteOk = false;
-
-    for (uint8_t attempt = 0; attempt < NRF_MAX_ATTEMPTS; attempt++) {
-        radio.stopListening();
-        radio.flush_rx();
-        bool writeOk = radio.write(&tx, sizeof(tx));
-        if (!writeOk) {
-            updateAlarmBlinkAndLed(millis());
-            continue;
-        }
-        anyWriteOk = true;
+void transmitCurrentNrfPacket() {
+    radio.stopListening();
+    radio.flush_rx();
+    bool writeOk = radio.write(&nrfTxPacket, sizeof(nrfTxPacket));
+    if (writeOk) {
+        nrfCycleAnyWriteOk = true;
         radio.startListening();
+    }
+}
 
-        uint32_t waitStartMs = millis();
-        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
-        while (static_cast<uint32_t>(millis() - waitStartMs) < NRF_RESPONSE_TIMEOUT_MS) {
-            updateAlarmBlinkAndLed(millis());
+void startNrfRequest(uint32_t now) {
+    buildNrfRequestPacket();
+    nrfCycleAnyWriteOk = false;
+    nrfRetry           = 0;
+    nrfSentAt          = now;
+    nrfState           = NRF_WAITING;
+    transmitCurrentNrfPacket();
+}
 
-            if (radio.available()) {
-                NrfPacket rx{};
-                radio.read(&rx, sizeof(rx));
+void requestImmediateNrfSend() {
+    nrfImmediatePending = true;
+}
 
-                if (rx.packetType == PKT_TYPE_RESPONSE && rx.nano.seq == tx.esp.seq) {
-                    radio.stopListening();
+void processNrfResponsePacket(const NrfPacket& rx, uint32_t rxNowMs) {
+    bool prevNrfOk         = state.nrf24Ok;
+    bool prevPump          = state.pumpOn;
+    bool prevRelayFb       = state.relayFeedbackOn;
+    bool prevRelayFault    = state.relayFault;
+    bool prevServiceMode   = state.serviceMode;
+    bool prevNanoLoopFault = state.nanoLoopFault;
+    uint8_t prevPState     = state.pumpState;
+    uint8_t prevAlarmAct   = state.alarmState.active;
+    uint8_t prevAlarmRsn   = state.alarmState.reason;
 
-                    uint32_t rxNowMs      = millis();
-                    state.eloremeno       = rx.nano.eloremeno;
-                    state.visszatero      = rx.nano.visszatero;
-                    state.kazan           = rx.nano.kazan;
-                    state.kulteri         = rx.nano.kulteri;
-                    state.nanoCounter     = rx.nano.counter;
-                    state.sensorValidMask = rx.nano.sensorValidMask;
-                    state.nanoAlarmState  = rx.nano.alarmState;
-                    state.hasNrfResponse  = true;
-                    state.lastNrfResponseMs = rxNowMs;
+    state.eloremeno         = rx.nano.eloremeno;
+    state.visszatero        = rx.nano.visszatero;
+    state.kazan             = rx.nano.kazan;
+    state.kulteri           = rx.nano.kulteri;
+    state.nanoCounter       = rx.nano.counter;
+    state.sensorValidMask   = rx.nano.sensorValidMask;
+    state.nanoAlarmState    = unpackAlarmState(rx.nano.alarmPacked);
+    state.hasNrfResponse    = true;
+    state.lastNrfResponseMs = rxNowMs;
+    lastNrfOk               = rxNowMs;
 
-                    for (uint8_t b = 0; b < 8; b++) {
-                        state.kazanStatus[b] = getBit(rx.nano.kazanStatusMask, b) ? 1 : 0;
-                    }
-
-                    // Napi max/min/átlag frissítése minden érvényes előremenő mérésnél
-                    if (isSensorValid(state.eloremeno)) {
-                        char hhmm[6] = { 0 };
-                        if (state.ntpSynced) {
-                            struct tm tmStat{};
-                            if (getLocalTime(&tmStat, 0) && (tmStat.tm_year + 1900 >= 2024)) {
-                                snprintf(hhmm, sizeof(hhmm), "%02d:%02d", tmStat.tm_hour, tmStat.tm_min);
-                            }
-                        }
-                        if (state.eloremenoCount == 0 || state.eloremeno > state.eloremenoMax) {
-                            state.eloremenoMax = state.eloremeno;
-                            if (hhmm[0] != '\0') {
-                                strncpy(state.eloremenoMaxAt, hhmm, sizeof(state.eloremenoMaxAt) - 1);
-                            } else {
-                                state.eloremenoMaxAt[0] = '\0';
-                            }
-                        }
-                        if (state.eloremenoCount == 0 || state.eloremeno < state.eloremenoMin) {
-                            state.eloremenoMin = state.eloremeno;
-                            if (hhmm[0] != '\0') {
-                                strncpy(state.eloremenoMinAt, hhmm, sizeof(state.eloremenoMinAt) - 1);
-                            } else {
-                                state.eloremenoMinAt[0] = '\0';
-                            }
-                        }
-                        state.eloremenoSum += static_cast<double>(state.eloremeno);
-                        state.eloremenoCount++;
-                    }
-
-                    bool ackFlag         = (rx.nano.syncFlags & SYNC_FLAG_ACK) != 0;
-                    bool staleFlag       = (rx.nano.syncFlags & SYNC_FLAG_STALE) != 0;
-                    bool rxServiceMode   = (rx.nano.syncFlags & SYNC_FLAG_SERVICE_MODE) != 0;
-                    state.nanoSynced     = ackFlag;
-                    state.nanoSyncStale  = staleFlag;
-
-                    if (rxServiceMode != state.serviceMode) {
-                        state.serviceMode = rxServiceMode;
-                        if (state.serviceMode) {
-                            logEvent(LOG_INFO, "SERVICE_MODE_ON_BY_SLAVE", "Kazan oldali szerviz kapcsolo BE");
-                        } else {
-                            logEvent(LOG_INFO, "SERVICE_MODE_OFF_BY_SLAVE", "Kazan oldali szerviz kapcsolo KI");
-                        }
-                        menu.requestRedraw();
-                    }
-
-                    if (syncEpochToSend != 0) {
-                        uint16_t expectedLow16 = static_cast<uint16_t>(syncEpochToSend & 0xFFFFU);
-                        if (ackFlag && rx.nano.syncEpochLow16 == expectedLow16) {
-                            state.lastNanoSyncEpoch   = syncEpochToSend;
-                            state.lastNanoSyncMs      = rxNowMs;
-                            state.lastNanoSyncSuccess = true;
-                            pendingTimeSyncEpoch      = 0;
-                            syncRetryWaiting          = false;
-                            logEvent(LOG_INFO, "NANO_SYNC", "Nano idoszinkron OK");
-                        } else {
-                            state.lastNanoSyncSuccess = false;
-                            pendingTimeSyncEpoch      = 0;
-                            syncRetryWaiting          = true;
-                            syncRetryStartMs          = rxNowMs;
-                            logEvent(LOG_WARN, "SYNC_FAIL", "Nano szinkron ACK hiba, 1h mulva ujra");
-                        }
-                    } else if (!ackFlag && state.ntpSynced && state.lastNanoSyncEpoch != 0 && !syncRetryWaiting) {
-                        // A Nano újraindult és elvesztette a szinkront: következő ciklusban automatikus újraszinkron
-                        state.lastNanoSyncEpoch = 0;
-                        bootSyncDone = false;
-                    }
-
-                    state.consecutiveMissedPings = 0;
-                    nrfErrorBannerShown          = false;
-                    nrfFailLoggedForOutage       = false;
-                    if (!state.nrf24Ok) {
-                        state.nrf24Ok = true;
-                        logEvent(LOG_INFO, "NRF_OK", "NRF24 kapcsolat helyreallt");
-                    }
-                    return true;
-                }
-            }
-            delay(1);
-        }
-
-        radio.stopListening();
+    for (uint8_t b = 0; b < 8; b++) {
+        state.kazanStatus[b] = getBit(rx.nano.kazanStatusMask, b) ? 1 : 0;
     }
 
-    if (syncEpochToSend != 0) {
+    // Napi max/min/átlag frissítése minden érvényes előremenő mérésnél
+    if (isSensorValid(state.eloremeno)) {
+        char hhmm[6] = { 0 };
+        if (state.ntpSynced) {
+            struct tm tmStat{};
+            if (getLocalTime(&tmStat, 0) && (tmStat.tm_year + 1900 >= 2024)) {
+                snprintf(hhmm, sizeof(hhmm), "%02d:%02d", tmStat.tm_hour, tmStat.tm_min);
+            }
+        }
+        if (state.eloremenoCount == 0 || state.eloremeno > state.eloremenoMax) {
+            state.eloremenoMax = state.eloremeno;
+            if (hhmm[0] != '\0') {
+                strncpy(state.eloremenoMaxAt, hhmm, sizeof(state.eloremenoMaxAt) - 1);
+            } else {
+                state.eloremenoMaxAt[0] = '\0';
+            }
+        }
+        if (state.eloremenoCount == 0 || state.eloremeno < state.eloremenoMin) {
+            state.eloremenoMin = state.eloremeno;
+            if (hhmm[0] != '\0') {
+                strncpy(state.eloremenoMinAt, hhmm, sizeof(state.eloremenoMinAt) - 1);
+            } else {
+                state.eloremenoMinAt[0] = '\0';
+            }
+        }
+        state.eloremenoSum += static_cast<double>(state.eloremeno);
+        state.eloremenoCount++;
+    }
+
+    bool ackFlag              = (rx.nano.syncFlags & SYNC_FLAG_ACK) != 0;
+    bool staleFlag            = (rx.nano.syncFlags & SYNC_FLAG_STALE) != 0;
+    bool rxServiceMode        = (rx.nano.syncFlags & SYNC_FLAG_SERVICE_MODE) != 0;
+    bool rxCmdAck             = (rx.nano.syncFlags & SYNC_FLAG_CMD_ACK) != 0;
+    bool rxPumpOn             = (rx.nano.syncFlags & SYNC_FLAG_PUMP_ON) != 0;
+    bool rxCmdRejectedService = (rx.nano.syncFlags & SYNC_FLAG_CMD_REJECTED_SERVICE) != 0;
+    bool rxRelayFbOn          = (rx.nano.syncFlags & SYNC_FLAG_RELAY_FB_ON) != 0;
+    bool rxRelayMismatch      = (rx.nano.syncFlags & SYNC_FLAG_RELAY_MISMATCH) != 0;
+    bool rxNanoLoopFault      = (rx.nano.alarmPacked & SYNC_FLAG_LOOP_FAULT) != 0;
+    state.nanoSynced       = ackFlag;
+    state.nanoSyncStale    = staleFlag;
+    state.hasRelayFeedback = true;
+    state.relayFeedbackOn  = rxRelayFbOn;
+    state.nanoLoopFault    = rxNanoLoopFault;
+    (void)rxPumpOn;
+
+    if (rxNanoLoopFault != prevNanoLoopFault) {
+        if (rxNanoLoopFault) {
+            logEvent(LOG_ERROR, "NANO_LOOP_FAULT", "Nano loop ciklusido tul lepett");
+        } else {
+            logEvent(LOG_INFO, "NANO_LOOP_OK", "Nano loop ciklusido helyreallt");
+        }
+        menu.requestRedraw();
+    }
+
+    if (rxServiceMode != state.serviceMode) {
+        state.serviceMode = rxServiceMode;
+        if (state.serviceMode) {
+            logEvent(LOG_INFO, "SERVICE_MODE_ON_BY_SLAVE", "Kazan oldali szerviz kapcsolo BE");
+        } else {
+            logEvent(LOG_INFO, "SERVICE_MODE_OFF_BY_SLAVE", "Kazan oldali szerviz kapcsolo KI");
+        }
+        menu.requestRedraw();
+    }
+
+    // Függő parancs végponttól-végpontig tartó visszaigazolásának (CMD_ACK) ellenőrzése (D7 fizikai visszacsatolással)
+    bool expectedPumpOn = getBit(nrfTxPacket.esp.outputsMask, OUT_BIT_SZIVATTYU);
+    if (pendingCmdActive) {
+        if (pendingCmdSentInCurrentNrf && rx.nano.cmdSeq == pendingCmdSeq) {
+            if (rxCmdRejectedService || (rxServiceMode && pendingCmdRequestedPumpOff)) {
+                char ackId[64];
+                strncpy(ackId, pendingCmdId, sizeof(ackId) - 1);
+                ackId[sizeof(ackId) - 1] = '\0';
+                clearPendingCmd();
+                logEvent(LOG_WARN, "CMD_ACK_REJECT", "Parancs elutasitva (szerviz mod)");
+                publishMqttCmdAck(ackId, false, "SERVICE_MODE", rxRelayFbOn);
+            } else if (rxCmdAck && (rxRelayFbOn == expectedPumpOn)) {
+                char ackId[64];
+                strncpy(ackId, pendingCmdId, sizeof(ackId) - 1);
+                ackId[sizeof(ackId) - 1] = '\0';
+                clearPendingCmd();
+                logEvent(LOG_INFO, "CMD_ACK_OK", ackId);
+                publishMqttCmdAck(ackId, true, nullptr, rxRelayFbOn);
+            } else if (rxRelayMismatch ||
+                       (static_cast<uint32_t>(rxNowMs - pendingCmdAt) >= RELAY_FAULT_DELAY_MS &&
+                        rxRelayFbOn != expectedPumpOn)) {
+                char ackId[64];
+                strncpy(ackId, pendingCmdId, sizeof(ackId) - 1);
+                ackId[sizeof(ackId) - 1] = '\0';
+                clearPendingCmd();
+                logEvent(LOG_WARN, "CMD_ACK_RELAY_MISMATCH", ackId);
+                publishMqttCmdAck(ackId, false, "RELAY_MISMATCH", rxRelayFbOn);
+            } else {
+                // D7 relé visszacsatolás még kapcsolódik (<500ms) -> 75ms múlva újra lekérdezzük
+                pendingCmdSentInCurrentNrf = false;
+                pendingCmdWaitingSettle    = true;
+                pendingCmdLastPollAt       = rxNowMs;
+            }
+        } else {
+            // Előző ciklus válasza érkezett be; most azonnal küldjük a függő parancsot
+            pendingCmdSentInCurrentNrf = false;
+            pendingCmdWaitingSettle    = false;
+            requestImmediateNrfSend();
+        }
+    }
+
+    bool syncUpdated = false;
+    if (nrfTxSyncEpoch != 0) {
+        uint16_t expectedLow16 = static_cast<uint16_t>(nrfTxSyncEpoch & 0xFFFFU);
+        if (ackFlag && rx.nano.syncEpochLow16 == expectedLow16) {
+            state.lastNanoSyncEpoch   = nrfTxSyncEpoch;
+            state.lastNanoSyncMs      = rxNowMs;
+            state.lastNanoSyncSuccess = true;
+            pendingTimeSyncEpoch      = 0;
+            syncRetryWaiting          = false;
+            syncUpdated               = true;
+            logEvent(LOG_INFO, "NANO_SYNC", "Nano idoszinkron OK");
+        } else {
+            state.lastNanoSyncSuccess = false;
+            pendingTimeSyncEpoch      = 0;
+            syncRetryWaiting          = true;
+            syncRetryStartMs          = rxNowMs;
+            syncUpdated               = true;
+            logEvent(LOG_WARN, "SYNC_FAIL", "Nano szinkron ACK hiba, 1h mulva ujra");
+        }
+        nrfTxSyncEpoch = 0;
+    } else if (!ackFlag && state.ntpSynced && state.lastNanoSyncEpoch != 0 && !syncRetryWaiting) {
+        // A Nano újraindult és elvesztette a szinkront: következő ciklusban automatikus újraszinkron
+        state.lastNanoSyncEpoch = 0;
+        bootSyncDone = false;
+    }
+
+    state.consecutiveMissedPings = 0;
+    nrfErrorBannerShown          = false;
+    nrfFailLoggedForOutage       = false;
+    nrfTimeoutLogged             = false;
+    if (!state.nrf24Ok) {
+        state.nrf24Ok = true;
+        logEvent(LOG_INFO, "NRF_OK", "NRF24 kapcsolat helyreallt");
+    }
+
+    bool modeRestored = evaluateBoilerPumpProtection(rxNowMs, rxRelayMismatch);
+    if (modeRestored) {
+        saveSetting("pumpMode", static_cast<uint32_t>(state.pumpConfig.pumpMode));
+    }
+    updateAlarmBlinkAndLed(rxNowMs);
+
+    if (prevPump != state.pumpOn) {
+        // A friss kazánhőmérséklet alapján változott a szivattyú parancs -> azonnali küldés
+        requestImmediateNrfSend();
+    }
+
+    if (mqttStatusPendingRetry || syncUpdated || modeRestored ||
+        prevNrfOk != state.nrf24Ok || prevPump != state.pumpOn ||
+        prevRelayFb != state.relayFeedbackOn || prevRelayFault != state.relayFault ||
+        prevServiceMode != state.serviceMode || prevNanoLoopFault != state.nanoLoopFault ||
+        prevPState != state.pumpState ||
+        prevAlarmAct != state.alarmState.active || prevAlarmRsn != state.alarmState.reason) {
+        publishMqttStatus();
+    }
+    menu.requestRedraw();
+}
+
+void handleNrfTimeout(uint32_t now) {
+    nrfFail  = true;
+    nrfState = NRF_IDLE;
+    nrfRetry = 0;
+    radio.stopListening();
+
+    if (pendingCmdActive) {
+        if (pendingCmdSentInCurrentNrf) {
+            char failedId[64];
+            strncpy(failedId, pendingCmdId, sizeof(failedId) - 1);
+            failedId[sizeof(failedId) - 1] = '\0';
+            clearPendingCmd();
+            logEvent(LOG_WARN, "CMD_ACK_NRF_TIMEOUT", failedId);
+            publishMqttCmdAck(failedId, false, "NRF_TIMEOUT", state.relayFeedbackOn);
+        } else {
+            requestImmediateNrfSend();
+        }
+    }
+
+    if (!state.hasNrfResponse && lastNrfOk == 0) {
+        lastNrfOk = now;
+    }
+
+    if (!nrfTimeoutLogged) {
+        nrfTimeoutLogged = true;
+        char msg[48];
+        snprintf(msg, sizeof(msg), "NRF_TIMEOUT seq=%lu",
+                 static_cast<unsigned long>(nrfTxPacket.esp.seq));
+        logEvent(LOG_WARN, "NRF_TIMEOUT", msg);
+    }
+
+    bool syncUpdated = false;
+    if (nrfTxSyncEpoch != 0) {
         state.lastNanoSyncSuccess = false;
         pendingTimeSyncEpoch      = 0;
         syncRetryWaiting          = true;
-        syncRetryStartMs          = millis();
+        syncRetryStartMs          = now;
+        nrfTxSyncEpoch            = 0;
+        syncUpdated               = true;
         logEvent(LOG_WARN, "SYNC_FAIL", "Nano szinkron sikertelen, 1h mulva ujra");
     }
 
-    if (!anyWriteOk) {
+    bool prevNrfOk       = state.nrf24Ok;
+    uint8_t prevAlarmAct = state.alarmState.active;
+    uint8_t prevAlarmRsn = state.alarmState.reason;
+
+    if (!nrfCycleAnyWriteOk) {
         state.nrf24Ok                = false;
         state.consecutiveMissedPings = NRF_MAX_MISSED_CYCLES;
         evaluateAlarmState();
@@ -1078,7 +1379,8 @@ bool sendRequestToNano() {
         if (!nrfFailLoggedForOutage) {
             nrfFailLoggedForOutage = true;
             char msg[48];
-            snprintf(msg, sizeof(msg), "NRF WRITE FAILED seq=%lu", static_cast<unsigned long>(tx.esp.seq));
+            snprintf(msg, sizeof(msg), "NRF WRITE FAILED seq=%lu",
+                     static_cast<unsigned long>(nrfTxPacket.esp.seq));
             logEvent(LOG_ERROR, "NRF_FAIL", msg);
         }
         if (!nrfErrorBannerShown) {
@@ -1086,27 +1388,77 @@ bool sendRequestToNano() {
             menu.showErrorBanner("NRF HIBA!", "Radio iras hiba", 2000);
         }
         menu.requestRedraw();
-        return false;
-    }
-
-    if (state.consecutiveMissedPings < 255) {
-        state.consecutiveMissedPings++;
-    }
-    if (state.consecutiveMissedPings == 1) {
-        char msg[48];
-        snprintf(msg, sizeof(msg), "1. kimaradt ping seq=%lu", static_cast<unsigned long>(tx.esp.seq));
-        logEvent(LOG_WARN, "NRF_MISS", msg);
-    }
-    if (state.consecutiveMissedPings >= NRF_MAX_MISSED_CYCLES) {
-        state.nrf24Ok = false;
-        evaluateAlarmState();
-        if (!nrfFailLoggedForOutage) {
-            nrfFailLoggedForOutage = true;
-            logEvent(LOG_ERROR, "NRF_FAIL", "3 kimaradt ping");
+    } else {
+        if (state.consecutiveMissedPings < 255) {
+            state.consecutiveMissedPings++;
+        }
+        if (state.consecutiveMissedPings == 1) {
+            char msg[48];
+            snprintf(msg, sizeof(msg), "1. kimaradt ping seq=%lu",
+                     static_cast<unsigned long>(nrfTxPacket.esp.seq));
+            logEvent(LOG_WARN, "NRF_MISS", msg);
+        }
+        if (state.consecutiveMissedPings >= NRF_MAX_MISSED_CYCLES) {
+            state.nrf24Ok = false;
+            evaluateAlarmState();
+            if (!nrfFailLoggedForOutage) {
+                nrfFailLoggedForOutage = true;
+                logEvent(LOG_ERROR, "NRF_FAIL", "3 kimaradt ping");
+            }
         }
     }
 
-    return false;
+    if (syncUpdated || prevNrfOk != state.nrf24Ok ||
+        prevAlarmAct != state.alarmState.active ||
+        prevAlarmRsn != state.alarmState.reason) {
+        publishMqttStatus();
+        menu.requestRedraw();
+    }
+}
+
+void handleNrf(uint32_t now) {
+    if (nrfState == NRF_IDLE) {
+        uint32_t pingInterval = static_cast<uint32_t>(state.heartbeatIntervalSec) * 1000UL;
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        if (static_cast<uint32_t>(now - lastPing) >= pingInterval) {
+            lastPing            = now;
+            nrfImmediatePending = false;
+            startNrfRequest(now);
+            return;
+        }
+        if (nrfImmediatePending) {
+            nrfImmediatePending = false;
+            startNrfRequest(now);
+            return;
+        }
+        return;
+    }
+
+    // nrfState == NRF_WAITING
+    if (radio.available()) {
+        NrfPacket rx{};
+        radio.read(&rx, sizeof(rx));
+        if (rx.packetType == PKT_TYPE_RESPONSE && rx.nano.seq == nrfTxPacket.esp.seq) {
+            radio.stopListening();
+            nrfState = NRF_IDLE;
+            nrfRetry = 0;
+            nrfFail  = false;
+            processNrfResponsePacket(rx, now);
+            return;
+        }
+    }
+
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (static_cast<uint32_t>(now - nrfSentAt) >= NRF_TIMEOUT_MS) {
+        if (nrfRetry < NRF_MAX_RETRY) {
+            // UGYANAZT a csomagot küldjük újra, nem várunk a válaszra
+            transmitCurrentNrfPacket();
+            nrfSentAt = now;
+            nrfRetry++;
+        } else {
+            handleNrfTimeout(now);
+        }
+    }
 }
 
 // ============================================================================
@@ -1203,7 +1555,10 @@ void buildStatusJson(JsonDocument& doc) {
     pCfg["pumpStopTemp"]    = round1(state.pumpConfig.pumpStopTemp);
     pCfg["pumpStartSensor"] = pumpSensorToStr(state.pumpConfig.pumpStartSensor);
 
-    doc["pumpState"] = pumpStateToStr(state.pumpState);
+    doc["pumpState"]       = pumpStateToStr(state.pumpState);
+    doc["pumpOn"]          = state.pumpOn;
+    doc["relayFeedbackOn"] = state.relayFeedbackOn;
+    doc["relayFault"]      = state.relayFault;
     const char* pumpCtrlStr = "AUTO";
     if (state.serviceMode) {
         pumpCtrlStr = "SERVICE";
@@ -1226,7 +1581,11 @@ void buildStatusJson(JsonDocument& doc) {
     JsonObject hb = doc["heartbeat"].to<JsonObject>();
     hb["intervalSec"] = state.heartbeatIntervalSec;
 
-    doc["nrf24_ok"] = state.nrf24Ok;
+    doc["nrf24_ok"]      = state.nrf24Ok;
+    doc["loopFault"]     = state.loopFault;
+    doc["nanoLoopFault"] = state.nanoLoopFault;
+    doc["loopMaxMs"]     = state.loopMaxMs;
+    doc["loopLastMs"]    = state.loopLastMs;
 
     char espTimeBuf[24];
     formatEspCurrentTimeStr(espTimeBuf, sizeof(espTimeBuf), uptimeSec);
@@ -1319,6 +1678,10 @@ void buildStatusJson(JsonDocument& doc) {
         doc["error"] = "NRF24 kommunikacios hiba (3 ping kimaradt)";
     } else if (state.safetyOverheat) {
         doc["error"] = "Kazan tulmelegedes (>= 95.0C) - szivattyu kenyszeritett BE";
+    } else if (state.relayFault) {
+        doc["error"] = state.pumpOn
+            ? "Rele hiba: kert BE, fizikai rele KI (D7)"
+            : "Rele hiba: kert KI, fizikai rele BE (D7)";
     } else if (state.safetySensorFault) {
         doc["error"] = "Kazan szenzor hiba (-127) - szivattyu biztonsagi BE";
     } else {
@@ -1439,10 +1802,8 @@ void commitSettingEffects(bool redrawMenu) {
     evaluateBoilerPumpProtection(now);
     updateAlarmBlinkAndLed(now);
 
-    sendRequestToNano();
-    lastHeartbeatMs = millis();
-    evaluateBoilerPumpProtection(lastHeartbeatMs);
-    updateAlarmBlinkAndLed(lastHeartbeatMs);
+    requestImmediateNrfSend();
+    handleNrf(now);
 
     publishMqttStatus();
     if (redrawMenu) {
@@ -1462,10 +1823,8 @@ void onMenuFactoryReset() {
     evaluateBoilerPumpProtection(now);
     updateAlarmBlinkAndLed(now);
 
-    sendRequestToNano();
-    lastHeartbeatMs = millis();
-    evaluateBoilerPumpProtection(lastHeartbeatMs);
-    updateAlarmBlinkAndLed(lastHeartbeatMs);
+    requestImmediateNrfSend();
+    handleNrf(now);
 
     publishMqttStatus();
 }
@@ -1574,13 +1933,10 @@ void triggerNanoTimeSync() {
     pendingTimeSyncEpoch = static_cast<uint32_t>(epochNow);
     syncRetryWaiting     = false;
 
-    sendRequestToNano();
-    lastHeartbeatMs = millis();
-    evaluateBoilerPumpProtection(lastHeartbeatMs);
-    updateAlarmBlinkAndLed(lastHeartbeatMs);
+    requestImmediateNrfSend();
+    handleNrf(now);
     publishMqttStatus();
     menu.requestRedraw();
-    (void)now;
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -1612,6 +1968,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (strcmp(action, "forceSync") == 0) {
             logEvent(LOG_INFO, "FORCE_SYNC", "Idoszinkron keres (mqtt)");
             if (!state.ntpSynced && WiFi.status() == WL_CONNECTED) {
+                loopMonitorSuspend = true;
                 configTime(3600, 3600, NTP_SERVER_1, NTP_SERVER_2);
                 setenv("TZ", NTP_TZ_INFO, 1);
                 tzset();
@@ -1723,13 +2080,58 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         }
     }
 
+    const char* incomingCmdId = nullptr;
+    if (doc["cmdId"].is<const char*>()) {
+        const char* cid = doc["cmdId"].as<const char*>();
+        if (cid && cid[0] != '\0') {
+            incomingCmdId = cid;
+        }
+    }
+
+    bool requestedPumpOff = false;
+    if (doc["pumpConfig"].is<JsonObject>()) {
+        JsonObject pcCheck = doc["pumpConfig"].as<JsonObject>();
+        if (pcCheck["pumpMode"].is<const char*>() &&
+            strcmp(pcCheck["pumpMode"].as<const char*>(), "manual_off") == 0) {
+            requestedPumpOff = true;
+        }
+    }
+    if (doc["kimenetek"].is<JsonObject>()) {
+        JsonObject kCheck = doc["kimenetek"].as<JsonObject>();
+        if (kCheck["szivattyu"].is<bool>() && !kCheck["szivattyu"].as<bool>()) {
+            requestedPumpOff = true;
+        }
+    }
+
     if (!saveChangedSettingsFromState(state, staged)) {
         // Mentési hiba esetén megtartjuk a régi értéket RAM-ban, nem küldünk STATUS-t
+        if (incomingCmdId) {
+            publishMqttCmdAck(incomingCmdId, false, "NVS_FAIL", state.relayFeedbackOn);
+        }
         return;
     }
 
     logMqttSettingChanges(state, staged);
     state = staged;
+
+    if (incomingCmdId) {
+        if (pendingCmdActive && strcmp(pendingCmdId, incomingCmdId) != 0) {
+            char prevId[64];
+            strncpy(prevId, pendingCmdId, sizeof(prevId) - 1);
+            prevId[sizeof(prevId) - 1] = '\0';
+            publishMqttCmdAck(prevId, false, "ACK_TIMEOUT", state.relayFeedbackOn);
+        }
+        pendingCmdActive           = true;
+        strncpy(pendingCmdId, incomingCmdId, sizeof(pendingCmdId) - 1);
+        pendingCmdId[sizeof(pendingCmdId) - 1] = '\0';
+        pendingCmdSeq              = nextCmdSeqFromCmdId(doc, incomingCmdId);
+        pendingCmdAt               = millis();
+        pendingCmdRequestedPumpOff = requestedPumpOff;
+        pendingCmdSentInCurrentNrf = false;
+        pendingCmdWaitingSettle    = false;
+        pendingCmdLastPollAt       = 0;
+    }
+
     commitSettingEffects(!menu.isEditing());
 }
 
@@ -1804,6 +2206,7 @@ void handleWifiPortalSave() {
     wifiSsid = ssid;
     wifiPassword = password;
     wifiPortalMessage = "Az adatok elmentve. Csatlakozás folyamatban; ha nem sikerül, add meg újra a hálózatot.";
+    loopMonitorSuspend = true;
     WiFi.mode(WIFI_AP_STA);
     WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
     lastWifiTryMs = millis();
@@ -1820,6 +2223,7 @@ void handleWifiPortalNotFound() {
 }
 
 void beginWifiPortal(const char* message) {
+    loopMonitorSuspend = true;
     wifiPortalMessage = message;
     lastWifiPortalTryMs = millis();
     WiFi.mode(wifiSsid.length() == 0 ? WIFI_AP : WIFI_AP_STA);
@@ -1842,6 +2246,7 @@ void beginWifiPortal(const char* message) {
 }
 
 void stopWifiPortal() {
+    loopMonitorSuspend = true;
     wifiPortalDns.stop();
     wifiPortalServer.stop();
     WiFi.softAPdisconnect(true);
@@ -1864,6 +2269,7 @@ void loadWifiCredentials() {
 }
 
 void startNtpSync(uint32_t now) {
+    loopMonitorSuspend = true;
     configTime(3600, 3600, NTP_SERVER_1, NTP_SERVER_2);
     setenv("TZ", NTP_TZ_INFO, 1);
     tzset();
@@ -1979,6 +2385,7 @@ void maintainConnectivity(uint32_t now) {
 
         if (static_cast<uint32_t>(now - lastWifiTryMs) >= WIFI_RECONNECT_MS) {
             lastWifiTryMs = now;
+            loopMonitorSuspend = true;
             logEvent(LOG_INFO, "WIFI_RETRY", "WiFi ujracsatlakozas");
             WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
         }
@@ -2020,15 +2427,19 @@ void maintainConnectivity(uint32_t now) {
                 return;
             }
 
+            loopMonitorSuspend = true;
+            esp_task_wdt_reset();
             if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD,
                              TOPIC_STATUS, 1, true,
                              "{\"online\":false,\"error\":\"Gateway offline\"}")) {
+                esp_task_wdt_reset();
                 prevMqttConnected   = true;
                 mqttRetryIntervalMs = MQTT_RECONNECT_MS;
                 mqtt.subscribe(TOPIC_CMD);
                 logEvent(LOG_INFO, "MQTT_OK", "HiveMQ Cloud csatlakozva");
                 publishMqttStatus();
             } else {
+                esp_task_wdt_reset();
                 char tlsErrBuf[128] = { 0 };
                 int tlsErr = wifiSecureClient.lastError(tlsErrBuf, sizeof(tlsErrBuf));
                 if (tlsErr != 0) {
@@ -2130,6 +2541,77 @@ void processEncoderAndButton(uint32_t now) {
     }
 }
 
+void evaluateEspLoopMonitor(uint32_t loopStartUs, uint32_t now) {
+    if (loopMonitorSuspend) {
+        loopMonitorSuspend = false;
+        return;
+    }
+
+    // OVERFLOW-SAFE: uint32_t kivonás, 71 perces micros() túlcsorduláskor is helyes.
+    lastLoopUs = static_cast<uint32_t>(micros() - loopStartUs);
+    if (lastLoopUs > maxLoopUs) {
+        maxLoopUs = lastLoopUs;
+    }
+    state.loopLastMs = lastLoopUs / 1000UL;
+    state.loopMaxMs  = maxLoopUs / 1000UL;
+
+    if (lastLoopUs > ESP_LOOP_WARN_US) {
+        loopOverrunCount++;
+        // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+        if (!espHasSlowLogYet || static_cast<uint32_t>(now - espLastSlowLogMs) >= ESP_LOOP_WARN_COOLDOWN_MS) {
+            espHasSlowLogYet = true;
+            espLastSlowLogMs = now;
+            char msg[48];
+            snprintf(msg, sizeof(msg), "ESP_LOOP_SLOW %lums", static_cast<unsigned long>(state.loopLastMs));
+            logEvent(LOG_WARN, "ESP_LOOP_SLOW", msg);
+        }
+    }
+
+    if (lastLoopUs > ESP_LOOP_FAULT_SINGLE_US) {
+        espSlowLoopStreak = ESP_LOOP_FAULT_STREAK_CNT;
+        espFastLoopStreak = 0;
+        if (!loopFault) {
+            loopFault       = true;
+            state.loopFault = true;
+            char msg[48];
+            snprintf(msg, sizeof(msg), "ESP loop lelassult (%lums)", static_cast<unsigned long>(state.loopLastMs));
+            logEvent(LOG_ERROR, "ESP_LOOP_FAULT", msg);
+            publishMqttStatus();
+            menu.requestRedraw();
+        }
+    } else if (lastLoopUs > ESP_LOOP_FAULT_STREAK_US) {
+        espFastLoopStreak = 0;
+        if (espSlowLoopStreak < ESP_LOOP_FAULT_STREAK_CNT) {
+            espSlowLoopStreak++;
+        }
+        if (!loopFault && espSlowLoopStreak >= ESP_LOOP_FAULT_STREAK_CNT) {
+            loopFault       = true;
+            state.loopFault = true;
+            char msg[48];
+            snprintf(msg, sizeof(msg), "ESP loop tartosan lassu (%lums)", static_cast<unsigned long>(state.loopLastMs));
+            logEvent(LOG_ERROR, "ESP_LOOP_FAULT", msg);
+            publishMqttStatus();
+            menu.requestRedraw();
+        }
+    } else {
+        espSlowLoopStreak = 0;
+        if (lastLoopUs < ESP_LOOP_RECOVER_US) {
+            if (espFastLoopStreak < ESP_LOOP_RECOVER_CNT) {
+                espFastLoopStreak++;
+            }
+            if (loopFault && espFastLoopStreak >= ESP_LOOP_RECOVER_CNT) {
+                loopFault       = false;
+                state.loopFault = false;
+                logEvent(LOG_INFO, "ESP_LOOP_OK", "ESP loop ciklusido helyreallt");
+                publishMqttStatus();
+                menu.requestRedraw();
+            }
+        } else {
+            espFastLoopStreak = 0;
+        }
+    }
+}
+
 // ============================================================================
 // SETUP & LOOP
 // ============================================================================
@@ -2137,6 +2619,10 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     logEvent(LOG_INFO, "BOOT", "Indulas V5.4");
+    esp_reset_reason_t resetReason = esp_reset_reason();
+    if (resetReason == ESP_RST_TASK_WDT || resetReason == ESP_RST_WDT) {
+        logEvent(LOG_WARN, "WDT_RESET", "Elozo ujraindulas hardveres watchdog miatt tortent");
+    }
 
     pinMode(PIN_ALARM_LED, OUTPUT);
     digitalWrite(PIN_ALARM_LED, LOW);
@@ -2177,21 +2663,22 @@ void setup() {
     }
 
     uint32_t now = millis();
-    uptimePrevMs     = now;
-    uptimeTotalMs    = now;
-    lastAlarmBlinkMs = now;
-    lastTrendSampleMs = now;
+    uptimePrevMs           = now;
+    uptimeTotalMs          = now;
+    lastAlarmBlinkMs       = now;
+    lastTrendSampleMs      = now;
+    lastPing               = now;
+    lastNrfOk              = now;
+    lastMqttPublishRetryMs = now;
     evaluateRoomHeatingIndicator();
     evaluateBoilerPumpProtection(now);
-    sendRequestToNano();
-    lastHeartbeatMs = millis();
-    evaluateBoilerPumpProtection(lastHeartbeatMs);
-    updateAlarmBlinkAndLed(lastHeartbeatMs);
+    startNrfRequest(now);
+    updateAlarmBlinkAndLed(now);
     lcd.setStatusIcons(state.pumpOn, state.nrf24Ok, false);
     lcd.setTrend(state.trendDir);
     menu.requestRedraw();
-    menu.update(lastHeartbeatMs, alarmBlinkOn);
-    lcd.refresh(lastHeartbeatMs);
+    menu.update(now, alarmBlinkOn);
+    lcd.refresh(now);
 
     wifiPortalServer.on("/", HTTP_GET, handleWifiPortalRoot);
     wifiPortalServer.on("/save", HTTP_POST, handleWifiPortalSave);
@@ -2216,10 +2703,27 @@ void setup() {
     mqtt.setServer(MQTT_BROKER, MQTT_PORT);
     mqtt.setBufferSize(4096);
     mqtt.setCallback(mqttCallback);
+
+    // 5 másodperces hardveres task watchdog engedélyezése
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+    esp_task_wdt_config_t wdtCfg = {
+        .timeout_ms     = ESP_WDT_TIMEOUT_SEC * 1000UL,
+        .idle_core_mask = 0,
+        .trigger_panic  = true
+    };
+    esp_task_wdt_reconfigure(&wdtCfg);
+#else
+    esp_task_wdt_init(ESP_WDT_TIMEOUT_SEC, true);
+#endif
+    esp_task_wdt_add(nullptr);
+    loopMonitorSuspend = false;
 }
 
 void loop() {
-    uint32_t now = millis();
+    uint32_t loopStartUs = micros();
+    loopMonitorSuspend   = false;
+    uint32_t loopStartMs = millis();
+    uint32_t now = loopStartMs;
     // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
     uptimeTotalMs += static_cast<uint32_t>(now - uptimePrevMs);
     uptimePrevMs = now;
@@ -2250,46 +2754,54 @@ void loop() {
 
         if (modeRestored || prevHeat != state.heatingOn || prevPump != state.pumpOn ||
             fabsf(prevTemp - state.currentTemp) >= 0.2f) {
-            sendRequestToNano();
-            lastHeartbeatMs = millis();
-            evaluateBoilerPumpProtection(lastHeartbeatMs);
+            requestImmediateNrfSend();
             publishMqttStatus();
         }
     }
 
-    // 3. V5 Master-Slave Heartbeat ping minden heartbeatIntervalSec másodpercben
-    uint32_t heartbeatIntervalMs = static_cast<uint32_t>(state.heartbeatIntervalSec) * 1000UL;
+    // 3. V5 Master-Slave nem-blokkoló NRF24 állapotgép (minden loop()-ban fut)
+    if (pendingCmdActive && pendingCmdWaitingSettle && nrfState == NRF_IDLE &&
+        static_cast<uint32_t>(now - pendingCmdLastPollAt) >= CMD_RELAY_SETTLE_POLL_MS) {
+        pendingCmdWaitingSettle = false;
+        requestImmediateNrfSend();
+    }
+    handleNrf(now);
+
+    if (evaluateRelayFault(now, false)) {
+        evaluateAlarmState();
+        if (state.alarmConfig.alarmEnabled != 0 && state.alarmState.active != 0) {
+            setBit(state.outputsMask, OUT_BIT_LED_PIROS, true);
+        } else {
+            setBit(state.outputsMask, OUT_BIT_LED_PIROS, state.userLedPiros);
+        }
+        requestImmediateNrfSend();
+        publishMqttStatus();
+        menu.requestRedraw();
+    }
+
+    // 3a. End-to-end CMD_ACK 3000ms timeout ellenőrzése
     // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
-    if (static_cast<uint32_t>(now - lastHeartbeatMs) >= heartbeatIntervalMs) {
-        lastHeartbeatMs = now;
+    if (pendingCmdActive && (static_cast<uint32_t>(now - pendingCmdAt) >= CMD_ACK_TIMEOUT_MS)) {
+        char timedOutId[64];
+        strncpy(timedOutId, pendingCmdId, sizeof(timedOutId) - 1);
+        timedOutId[sizeof(timedOutId) - 1] = '\0';
+        clearPendingCmd();
+        logEvent(LOG_WARN, "CMD_ACK_TIMEOUT", timedOutId);
+        publishMqttCmdAck(timedOutId, false, "ACK_TIMEOUT", state.relayFeedbackOn);
+    }
 
-        bool prevNrfOk       = state.nrf24Ok;
-        bool prevPump        = state.pumpOn;
-        bool prevServiceMode = state.serviceMode;
-        uint8_t prevPState   = state.pumpState;
-        uint8_t prevAlarmAct = state.alarmState.active;
-        uint8_t prevAlarmRsn = state.alarmState.reason;
-
-        bool txOk = sendRequestToNano();
-        bool modeRestored = evaluateBoilerPumpProtection(millis());
-        if (modeRestored) {
-            saveSetting("pumpMode", static_cast<uint32_t>(state.pumpConfig.pumpMode));
-        }
-
-        if (txOk && prevPump != state.pumpOn) {
-            sendRequestToNano();
-        }
-
-        if (mqttStatusPendingRetry || modeRestored || prevNrfOk != state.nrf24Ok ||
-            prevPump != state.pumpOn || prevServiceMode != state.serviceMode ||
-            prevPState != state.pumpState || prevAlarmAct != state.alarmState.active ||
-            prevAlarmRsn != state.alarmState.reason) {
+    // 3b. Sikertelen MQTT status/telemetry újrapróbálása nem-blokkolva
+    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+    if (mqtt.connected() &&
+        (mqttStatusPendingRetry || mqttTelemetryPendingRetry) &&
+        static_cast<uint32_t>(now - lastMqttPublishRetryMs) >= MQTT_RECONNECT_MS) {
+        lastMqttPublishRetryMs = now;
+        if (mqttStatusPendingRetry) {
             publishMqttStatus();
         }
-
-        if (mqttTelemetryPendingRetry && mqtt.connected()) {
+        if (mqttTelemetryPendingRetry) {
             if (publishMqttTelemetry()) {
-                lastTelemetryMs = millis();
+                lastTelemetryMs = now;
             }
         }
     }
@@ -2351,4 +2863,17 @@ void loop() {
         lastTelemetryMs = now;
         publishMqttTelemetry();
     }
+
+#if defined(DEBUG) || (defined(DEBUG_MODE) && DEBUG_MODE)
+    uint32_t loopElapsedMs = static_cast<uint32_t>(millis() - loopStartMs);
+    if (loopElapsedMs > 50UL) {
+        Serial.printf("[DEBUG] loop() ciklusido=%lums (nrfState=%u)\n",
+                      static_cast<unsigned long>(loopElapsedMs),
+                      static_cast<unsigned>(nrfState));
+    }
+#endif
+
+    // 8. Loop Monitor + hardveres watchdog reset
+    evaluateEspLoopMonitor(loopStartUs, now);
+    esp_task_wdt_reset();
 }

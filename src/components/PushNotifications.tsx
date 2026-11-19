@@ -5,6 +5,7 @@ import {
   BellOff,
   BellRing,
   CheckCircle2,
+  Cpu,
   EyeOff,
   Flame,
   Radio,
@@ -44,6 +45,8 @@ function getAlertIcon(key: CriticalAlertKey) {
       return Thermometer;
     case 'nrfFail':
       return Radio;
+    case 'loopFault':
+      return Cpu;
     case 'serviceMode':
       return Wrench;
     case 'espOffline':
@@ -191,6 +194,7 @@ export function PushNotifications({
         pumpFault: value,
         sensorFail: value,
         nrfFail: value,
+        loopFault: value,
         serviceMode: value,
         espOffline: value,
       },

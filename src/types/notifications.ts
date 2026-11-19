@@ -5,6 +5,7 @@ export type CriticalAlertKey =
   | 'pumpFault'
   | 'sensorFail'
   | 'nrfFail'
+  | 'loopFault'
   | 'serviceMode'
   | 'espOffline';
 
@@ -38,6 +39,7 @@ export const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
     pumpFault: true,
     sensorFail: true,
     nrfFail: true,
+    loopFault: true,
     serviceMode: true,
     espOffline: true,
   },
@@ -66,6 +68,12 @@ export const CRITICAL_ALERT_ITEMS: ReadonlyArray<CriticalAlertItemMeta> = [
     key: 'nrfFail',
     label: 'Rádió (NRF24) hiba',
     description: 'Megszakadt a Master–Slave kapcsolat (a kazán fail-safe módba lép).',
+    severity: 'critical',
+  },
+  {
+    key: 'loopFault',
+    label: 'Loop ciklusidő hiba',
+    description: 'Az ESP32-C3 vagy az Arduino Nano főciklusa tartósan lelassult.',
     severity: 'critical',
   },
   {
@@ -131,6 +139,10 @@ export function loadNotificationPrefs(): NotificationPrefs {
           typeof rawAlerts.nrfFail === 'boolean'
             ? rawAlerts.nrfFail
             : DEFAULT_NOTIFICATION_PREFS.alerts.nrfFail,
+        loopFault:
+          typeof rawAlerts.loopFault === 'boolean'
+            ? rawAlerts.loopFault
+            : DEFAULT_NOTIFICATION_PREFS.alerts.loopFault,
         serviceMode:
           typeof rawAlerts.serviceMode === 'boolean'
             ? rawAlerts.serviceMode
@@ -185,15 +197,22 @@ export function evaluateCriticalAlerts(
 
   const isManualOff = status.pumpConfig?.pumpMode === 'manual_off';
   const pumpRelayOn = Boolean(status.kimenetek?.szivattyu);
+  const hasRelayFault = Boolean(status.relayFault);
+  const commandedOn = status.pumpOn ?? pumpRelayOn;
+  const feedbackOn = status.relayFeedbackOn;
   const pumpFaultActive =
-    Boolean(status.nrf24_ok) &&
-    !isManualOff &&
-    !pumpRelayOn &&
-    (status.pumpState === 'futes' ||
-      overheatActive ||
-      status.pumpConfig?.pumpMode === 'manual_on');
-  const pumpFaultBody =
-    'A szivattyúnak működnie kellene (fűtési igény vagy túlmelegedés miatt), de a relé KI állapotban van!';
+    hasRelayFault ||
+    (Boolean(status.nrf24_ok) &&
+      !isManualOff &&
+      !pumpRelayOn &&
+      (status.pumpState === 'futes' ||
+        overheatActive ||
+        status.pumpConfig?.pumpMode === 'manual_on'));
+  const pumpFaultBody = hasRelayFault
+    ? `Relé visszacsatolási hiba (Nano D7): Kért ${commandedOn ? 'BE' : 'KI'}, de a fizikai relé ${
+        feedbackOn ? 'BE' : 'KI'
+      } állapotban van!`
+    : 'A szivattyúnak működnie kellene (fűtési igény vagy túlmelegedés miatt), de a relé KI állapotban van!';
 
   const brokenSensors: string[] = [];
   if (status.nrf24_ok) {
@@ -212,6 +231,20 @@ export function evaluateCriticalAlerts(
   const nrfFailActive =
     status.nrf24_ok === false ||
     (status.alarmState?.active && status.alarmState.reason === 'nrf_fail');
+
+  const espLoopFault = Boolean(status.loopFault);
+  const nanoLoopFault = Boolean(status.nanoLoopFault);
+  const loopFaultActive = espLoopFault || nanoLoopFault;
+  const loopSource =
+    espLoopFault && nanoLoopFault
+      ? 'ESP32 és Nano'
+      : espLoopFault
+        ? 'ESP32'
+        : 'Nano';
+  const maxMsSuffix =
+    typeof status.loopMaxMs === 'number' && Number.isFinite(status.loopMaxMs)
+      ? ` (max ${status.loopMaxMs} ms)`
+      : '';
 
   const serviceModeActive = Boolean(status.serviceMode);
   const espOfflineActive = status.online === false;
@@ -239,6 +272,12 @@ export function evaluateCriticalAlerts(
       active: nrfFailActive,
       title: 'NRF24 rádiós kapcsolat megszakadt',
       body: 'Nincs válasz a kazánoldali Nano egységtől — a szivattyú fail-safe módban BE van kapcsolva.',
+      requireInteraction: true,
+    },
+    loopFault: {
+      active: loopFaultActive,
+      title: 'Loop hiba - ESP/Nano lelassult',
+      body: `${loopSource} főciklus túlterhelés / lassulás${maxMsSuffix}. Ellenőrizd a rendszernaplót.`,
       requireInteraction: true,
     },
     serviceMode: {

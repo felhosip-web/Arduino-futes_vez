@@ -36,7 +36,7 @@ export interface SafetyConfig {
   readonly safetyOverheatTemp: number;
 }
 
-export type AlarmReason = 'none' | 'overheat' | 'sensor_fail' | 'nrf_fail';
+export type AlarmReason = 'none' | 'overheat' | 'sensor_fail' | 'nrf_fail' | 'pump_fault';
 
 export interface AlarmState {
   active: boolean;
@@ -97,6 +97,9 @@ export interface HeatingStatusPayload {
   kazan_status: number[];
   pumpConfig: PumpConfig;
   pumpState: PumpState;
+  pumpOn?: boolean;
+  relayFeedbackOn?: boolean;
+  relayFault?: boolean;
   pumpControl?: PumpControlMode;
   serviceMode?: boolean;
   alarmConfig: AlarmConfig;
@@ -104,6 +107,10 @@ export interface HeatingStatusPayload {
   alarmState: AlarmState;
   heartbeat: HeartbeatConfig;
   nrf24_ok: boolean;
+  loopFault?: boolean;
+  nanoLoopFault?: boolean;
+  loopMaxMs?: number;
+  loopLastMs?: number;
   error: string | null;
   manualHeating?: boolean;
   nanoCounter?: number;
@@ -193,3 +200,22 @@ export const OUTPUT_ITEMS: ReadonlyArray<{ key: OutputKey; label: string; bit: n
   { key: 'tartalek4', label: 'Tartalék 4', bit: 6 },
   { key: 'tartalek5', label: 'Tartalék 5', bit: 7 },
 ];
+
+export type CommandAckStatus = 'idle' | 'pending' | 'acked' | 'error';
+
+export interface CommandAckState {
+  status: CommandAckStatus;
+  cmdId?: string;
+  reason?: string;
+  message?: string;
+}
+
+export interface CommandApiResponse {
+  ok?: boolean;
+  acked?: boolean;
+  cmdId?: string;
+  pumpOn?: boolean;
+  executedAt?: string;
+  reason?: string;
+  error?: string;
+}

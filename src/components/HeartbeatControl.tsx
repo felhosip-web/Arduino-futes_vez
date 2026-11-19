@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { AlertTriangle, Radio } from 'lucide-react';
 import { HEARTBEAT_INTERVALS } from '../config';
-import type { HeartbeatConfig } from '../types/heating';
+import type { CommandAckState, HeartbeatConfig } from '../types/heating';
+import { CommandAckBanner } from './CommandAckBanner';
 
 interface HeartbeatControlProps {
   heartbeat: HeartbeatConfig;
@@ -9,6 +10,7 @@ interface HeartbeatControlProps {
   lastUpdatedAt: number | null;
   counterValue?: number;
   sending: boolean;
+  ackState?: CommandAckState;
   onSendHeartbeat: (config: HeartbeatConfig) => Promise<void>;
 }
 
@@ -20,6 +22,7 @@ export function HeartbeatControl({
   lastUpdatedAt,
   counterValue,
   sending,
+  ackState,
   onSendHeartbeat,
 }: HeartbeatControlProps) {
   const [draftInterval, setDraftInterval] = useState<number>(heartbeat.intervalSec);
@@ -184,6 +187,8 @@ export function HeartbeatControl({
           )}
         </div>
       )}
+
+      <CommandAckBanner ackState={ackState} />
     </section>
   );
 }

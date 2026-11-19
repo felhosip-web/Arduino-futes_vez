@@ -18,6 +18,8 @@ import {
   DEFAULT_PUMP_CONFIG,
   DEFAULT_SAFETY_CONFIG,
   type AlarmConfig,
+  type CommandAckState,
+  type CommandApiResponse,
   type HeartbeatConfig,
   type HeatingCommandPayload,
   type HeatingMode,
@@ -50,8 +52,20 @@ import {
 } from './types/notifications';
 
 const ALERT_NOTIFICATION_COOLDOWN_MS = 60_000;
+const ACK_BANNER_DURATION_MS = 2000;
 
 type ActiveView = 'dashboard' | 'logs' | 'charts';
+type AckSectionKey = 'room' | 'pump' | 'output' | 'alarm' | 'heartbeat';
+
+const IDLE_ACK_STATE: CommandAckState = { status: 'idle' };
+
+const INITIAL_ACK_STATES: Record<AckSectionKey, CommandAckState> = {
+  room: IDLE_ACK_STATE,
+  pump: IDLE_ACK_STATE,
+  output: IDLE_ACK_STATE,
+  alarm: IDLE_ACK_STATE,
+  heartbeat: IDLE_ACK_STATE,
+};
 
 function isUsableStatus(
   candidate: Partial<HeatingStatusPayload> | null | undefined
@@ -95,10 +109,43 @@ export default function App() {
   const [notificationPrefs, setNotificationPrefs] = useState<NotificationPrefs>(() =>
     loadNotificationPrefs()
   );
+  const [ackStates, setAckStates] = useState<Record<AckSectionKey, CommandAckState>>(
+    INITIAL_ACK_STATES
+  );
 
   const hasAlertBaselineRef = useRef<boolean>(false);
   const prevAlertActiveRef = useRef<Partial<Record<CriticalAlertKey, boolean>>>({});
   const lastNotifiedAtRef = useRef<Partial<Record<CriticalAlertKey, number>>>({});
+  const ackTimersRef = useRef<Partial<Record<AckSectionKey, number>>>({});
+
+  const setSectionAck = useCallback(
+    (section: AckSectionKey, nextState: CommandAckState, autoClearMs?: number) => {
+      const prevTimer = ackTimersRef.current[section];
+      if (prevTimer !== undefined) {
+        window.clearTimeout(prevTimer);
+        delete ackTimersRef.current[section];
+      }
+      setAckStates((prev) => ({ ...prev, [section]: nextState }));
+      if (autoClearMs && autoClearMs > 0) {
+        ackTimersRef.current[section] = window.setTimeout(() => {
+          delete ackTimersRef.current[section];
+          setAckStates((prev) => ({ ...prev, [section]: IDLE_ACK_STATE }));
+        }, autoClearMs);
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    const timers = ackTimersRef.current;
+    return () => {
+      for (const timerId of Object.values(timers)) {
+        if (timerId !== undefined) {
+          window.clearTimeout(timerId);
+        }
+      }
+    };
+  }, []);
 
   const handleChangeNotificationPrefs = useCallback((next: NotificationPrefs) => {
     setNotificationPrefs(next);
@@ -117,6 +164,7 @@ export default function App() {
       pumpFault: evaluatedAlerts.pumpFault.active,
       sensorFail: evaluatedAlerts.sensorFail.active,
       nrfFail: evaluatedAlerts.nrfFail.active,
+      loopFault: evaluatedAlerts.loopFault.active,
       serviceMode: evaluatedAlerts.serviceMode.active,
       espOffline: evaluatedAlerts.espOffline.active,
     };
@@ -263,10 +311,56 @@ export default function App() {
     };
   }, [applyDeviceState, fetchInitialState]);
 
+  const processAckResponse = useCallback(
+    async (
+      section: AckSectionKey,
+      res: Response,
+      fallbackError: string
+    ): Promise<boolean> => {
+      if (res.status === 409) {
+        setWaitingForEsp(true);
+        setSectionAck(section, IDLE_ACK_STATE);
+        return false;
+      }
+
+      const body = (await res.json().catch(() => null)) as CommandApiResponse | null;
+
+      if (res.ok && body?.acked === true) {
+        setSectionAck(
+          section,
+          { status: 'acked', cmdId: body.cmdId },
+          ACK_BANNER_DURATION_MS
+        );
+        return true;
+      }
+
+      const reason = body?.reason;
+      const errMsg =
+        reason === 'SERVICE_MODE'
+          ? 'Nincs visszaigazolás a Nano-tól - szerviz módban van'
+          : reason === 'RELAY_MISMATCH'
+            ? 'Relé hiba: a fizikai visszacsatolás (Nano D7) nem követte a parancsot'
+            : reason === 'NRF_TIMEOUT' || reason === 'ACK_TIMEOUT'
+              ? 'Nincs visszaigazolás a Nano-tól - ellenőrizd a rádiót'
+              : body?.error || `${fallbackError} (HTTP ${res.status})`;
+
+      setSectionAck(section, {
+        status: 'error',
+        cmdId: body?.cmdId,
+        reason,
+        message: errMsg,
+      });
+      setErrorMsg(errMsg);
+      return false;
+    },
+    [setSectionAck]
+  );
+
   const handleSendRoomCommand = useCallback(
     async (patch: { targetTemp: number; mode: HeatingMode; manualHeating?: boolean }) => {
       if (!status) return;
       setSendingCommand(true);
+      setSectionAck('room', { status: 'pending' });
       setErrorMsg(null);
 
       const payload: HeatingCommandPayload = {
@@ -285,128 +379,114 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
-        if (res.status === 409) {
-          setWaitingForEsp(true);
-          return;
-        }
-        if (!res.ok) {
-          const body = (await res.json().catch(() => null)) as { error?: string } | null;
-          throw new Error(body?.error || `Parancs küldési hiba (HTTP ${res.status})`);
-        }
+        await processAckResponse('room', res, 'Parancs küldési hiba');
       } catch (err) {
         const message =
           err instanceof Error ? err.message : 'Hiba a parancs küldése közben.';
+        setSectionAck('room', { status: 'error', message });
         setErrorMsg(message);
       } finally {
         setSendingCommand(false);
       }
     },
-    [status]
+    [processAckResponse, setSectionAck, status]
   );
 
-  const handleSendPumpConfig = useCallback(async (pumpConfig: PumpConfig) => {
-    setSendingPump(true);
-    setErrorMsg(null);
-    try {
-      const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/pump`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pumpConfig }),
-      });
-      if (res.status === 409) {
-        setWaitingForEsp(true);
-        return;
+  const handleSendPumpConfig = useCallback(
+    async (pumpConfig: PumpConfig) => {
+      setSendingPump(true);
+      setSectionAck('pump', { status: 'pending' });
+      setErrorMsg(null);
+      try {
+        const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/pump`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pumpConfig }),
+        });
+        await processAckResponse('pump', res, 'Szivattyú beállítási hiba');
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Hiba a szivattyú beállításakor.';
+        setSectionAck('pump', { status: 'error', message });
+        setErrorMsg(message);
+      } finally {
+        setSendingPump(false);
       }
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error || `Szivattyú beállítási hiba (HTTP ${res.status})`);
-      }
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Hiba a szivattyú beállításakor.';
-      setErrorMsg(message);
-    } finally {
-      setSendingPump(false);
-    }
-  }, []);
+    },
+    [processAckResponse, setSectionAck]
+  );
 
-  const handleSendAlarmConfig = useCallback(async (alarmConfig: AlarmConfig) => {
-    setSendingAlarm(true);
-    setErrorMsg(null);
-    try {
-      const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/alarm`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ alarmConfig }),
-      });
-      if (res.status === 409) {
-        setWaitingForEsp(true);
-        return;
+  const handleSendAlarmConfig = useCallback(
+    async (alarmConfig: AlarmConfig) => {
+      setSendingAlarm(true);
+      setSectionAck('alarm', { status: 'pending' });
+      setErrorMsg(null);
+      try {
+        const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/alarm`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ alarmConfig }),
+        });
+        await processAckResponse('alarm', res, 'Riasztás beállítási hiba');
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Hiba a riasztás beállításakor.';
+        setSectionAck('alarm', { status: 'error', message });
+        setErrorMsg(message);
+      } finally {
+        setSendingAlarm(false);
       }
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error || `Riasztás beállítási hiba (HTTP ${res.status})`);
-      }
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Hiba a riasztás beállításakor.';
-      setErrorMsg(message);
-    } finally {
-      setSendingAlarm(false);
-    }
-  }, []);
+    },
+    [processAckResponse, setSectionAck]
+  );
 
-  const handleSendHeartbeat = useCallback(async (heartbeat: HeartbeatConfig) => {
-    setSendingHeartbeat(true);
-    setErrorMsg(null);
-    try {
-      const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/heartbeat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ heartbeat }),
-      });
-      if (res.status === 409) {
-        setWaitingForEsp(true);
-        return;
+  const handleSendHeartbeat = useCallback(
+    async (heartbeat: HeartbeatConfig) => {
+      setSendingHeartbeat(true);
+      setSectionAck('heartbeat', { status: 'pending' });
+      setErrorMsg(null);
+      try {
+        const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/heartbeat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ heartbeat }),
+        });
+        await processAckResponse('heartbeat', res, 'Életjel beállítási hiba');
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Hiba az életjel intervallum beállításakor.';
+        setSectionAck('heartbeat', { status: 'error', message });
+        setErrorMsg(message);
+      } finally {
+        setSendingHeartbeat(false);
       }
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error || `Életjel beállítási hiba (HTTP ${res.status})`);
-      }
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Hiba az életjel intervallum beállításakor.';
-      setErrorMsg(message);
-    } finally {
-      setSendingHeartbeat(false);
-    }
-  }, []);
+    },
+    [processAckResponse, setSectionAck]
+  );
 
-  const handleToggleOutput = useCallback(async (nev: OutputKey, ertek: boolean) => {
-    setPendingOutputKey(nev);
-    setErrorMsg(null);
-    try {
-      const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/kimenet`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nev, ertek }),
-      });
-      if (res.status === 409) {
-        setWaitingForEsp(true);
-        return;
+  const handleToggleOutput = useCallback(
+    async (nev: OutputKey, ertek: boolean) => {
+      setPendingOutputKey(nev);
+      setSectionAck('output', { status: 'pending' });
+      setErrorMsg(null);
+      try {
+        const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/kimenet`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nev, ertek }),
+        });
+        await processAckResponse('output', res, 'Kimenet kapcsolási hiba');
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Hiba a kimenet kapcsolása közben.';
+        setSectionAck('output', { status: 'error', message });
+        setErrorMsg(message);
+      } finally {
+        setPendingOutputKey(null);
       }
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error || `Kimenet kapcsolási hiba (HTTP ${res.status})`);
-      }
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Hiba a kimenet kapcsolása közben.';
-      setErrorMsg(message);
-    } finally {
-      setPendingOutputKey(null);
-    }
-  }, []);
+    },
+    [processAckResponse, setSectionAck]
+  );
 
   const handleResetTrendStats = useCallback(async (): Promise<boolean> => {
     setErrorMsg(null);
@@ -613,6 +693,7 @@ export default function App() {
               status={status}
               sending={sendingCommand}
               disabled={Boolean(status.serviceMode)}
+              ackState={ackStates.room}
               onSendRoomCommand={handleSendRoomCommand}
             />
 
@@ -623,10 +704,14 @@ export default function App() {
             <PumpControl
               pumpConfig={status.pumpConfig ?? DEFAULT_PUMP_CONFIG}
               pumpState={status.pumpState ?? 'varakozas'}
+              commandedPumpOn={status.pumpOn ?? Boolean(status.kimenetek?.szivattyu)}
+              relayFeedbackOn={status.relayFeedbackOn}
+              relayFault={status.relayFault}
               safety={status.safety ?? DEFAULT_SAFETY_CONFIG}
               kazanTemp={status.homersekletek?.kazan ?? null}
               sending={sendingPump}
               disabled={Boolean(status.serviceMode)}
+              ackState={ackStates.pump}
               onSendPumpConfig={handleSendPumpConfig}
             />
 
@@ -636,6 +721,7 @@ export default function App() {
               safety={status.safety ?? DEFAULT_SAFETY_CONFIG}
               kazanTemp={status.homersekletek?.kazan ?? null}
               sending={sendingAlarm}
+              ackState={ackStates.alarm}
               onSendAlarmConfig={handleSendAlarmConfig}
             />
 
@@ -651,6 +737,7 @@ export default function App() {
               lastUpdatedAt={lastUpdatedAt}
               counterValue={status.nanoCounter ?? status.seq ?? status.counter}
               sending={sendingHeartbeat}
+              ackState={ackStates.heartbeat}
               onSendHeartbeat={handleSendHeartbeat}
             />
 
@@ -659,6 +746,7 @@ export default function App() {
               pumpMode={status.pumpConfig?.pumpMode ?? 'auto'}
               pendingKey={pendingOutputKey}
               disabled={Boolean(status.serviceMode)}
+              ackState={ackStates.output}
               onToggleOutput={handleToggleOutput}
             />
 

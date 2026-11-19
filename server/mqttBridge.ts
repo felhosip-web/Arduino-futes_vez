@@ -7,6 +7,7 @@ import type { LogLevel } from './logsStore.ts';
 import { VALID_HEARTBEAT_INTERVALS } from './types.ts';
 import type {
   AlarmConfig,
+  CmdAckResult,
   HeatingCommand,
   HeatingStatusPayload,
   HeatingUpdateEvent,
@@ -73,9 +74,33 @@ export function mergeHeatingStatus(
   const mergedSync = mergeDefined(prevStatus.sync, parsed.sync);
   const mergedTrend = mergeDefined(prevStatus.trend, parsed.trend);
 
+  const extraLoopFields: Partial<HeatingStatusPayload> = {
+    ...(typeof parsed.loopFault === 'boolean'
+      ? { loopFault: parsed.loopFault }
+      : typeof prevStatus.loopFault === 'boolean'
+        ? { loopFault: prevStatus.loopFault }
+        : {}),
+    ...(typeof parsed.nanoLoopFault === 'boolean'
+      ? { nanoLoopFault: parsed.nanoLoopFault }
+      : typeof prevStatus.nanoLoopFault === 'boolean'
+        ? { nanoLoopFault: prevStatus.nanoLoopFault }
+        : {}),
+    ...(typeof parsed.loopMaxMs === 'number' && Number.isFinite(parsed.loopMaxMs)
+      ? { loopMaxMs: parsed.loopMaxMs }
+      : typeof prevStatus.loopMaxMs === 'number'
+        ? { loopMaxMs: prevStatus.loopMaxMs }
+        : {}),
+    ...(typeof parsed.loopLastMs === 'number' && Number.isFinite(parsed.loopLastMs)
+      ? { loopLastMs: parsed.loopLastMs }
+      : typeof prevStatus.loopLastMs === 'number'
+        ? { loopLastMs: prevStatus.loopLastMs }
+        : {}),
+  };
+
   return {
     ...prevStatus,
     ...cleanTop,
+    ...extraLoopFields,
     homersekletek: mergeDefined(prevStatus.homersekletek, parsed.homersekletek)!,
     kimenetek: mergeDefined(prevStatus.kimenetek, parsed.kimenetek)!,
     pumpConfig: mergeDefined(prevStatus.pumpConfig, parsed.pumpConfig)!,
@@ -156,7 +181,18 @@ export class HeatingMqttBridge {
   private readonly lastCommands = new Map<string, { command: HeatingCommand; sentAt: number }>();
   private readonly onlineStates = new Map<string, boolean>();
   private readonly serviceModeStates = new Map<string, boolean>();
+  private readonly relayFaultStates = new Map<string, boolean>();
+  private readonly loopFaultStates = new Map<string, boolean>();
+  private readonly nanoLoopFaultStates = new Map<string, boolean>();
   private readonly lastActiveTrends = new Map<string, 'up' | 'down'>();
+  private readonly pendingAcks = new Map<
+    string,
+    {
+      resolve: (result: CmdAckResult) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  private cmdSeqCounter = 0;
   private connected = false;
 
   constructor(io: SocketIOServer, logsStore: LogsStore = new LogsStore()) {
@@ -216,13 +252,19 @@ export class HeatingMqttBridge {
       if (!wasConnected) {
         this.logBackendEvent('INFO', 'MQTT_CONNECT', 'HiveMQ Cloud broker csatlakozva');
       }
-      this.client?.subscribe(['futes/+/status', 'futes/+/telemetry', 'futes/+/log'], { qos: 1 }, (err) => {
-        if (err) {
-          console.error('[MQTT] Feliratkozási hiba:', err.message);
-        } else {
-          console.log('[MQTT] Feliratkozva: futes/+/status, futes/+/telemetry, futes/+/log');
+      this.client?.subscribe(
+        ['futes/+/status', 'futes/+/telemetry', 'futes/+/log', 'futes/+/ack', 'heating/+/ack'],
+        { qos: 1 },
+        (err) => {
+          if (err) {
+            console.error('[MQTT] Feliratkozási hiba:', err.message);
+          } else {
+            console.log(
+              '[MQTT] Feliratkozva: futes/+/status, futes/+/telemetry, futes/+/log, futes/+/ack, heating/+/ack'
+            );
+          }
         }
-      });
+      );
     });
 
     this.client.on('reconnect', () => {
@@ -248,6 +290,12 @@ export class HeatingMqttBridge {
   }
 
   private handleIncomingMessage(topic: string, payloadBuffer: Buffer): void {
+    const ackMatch = /^(?:futes|heating)\/([^/]+)\/ack$/.exec(topic);
+    if (ackMatch) {
+      this.handleIncomingAckMessage(ackMatch[1], payloadBuffer);
+      return;
+    }
+
     const logMatch = /^futes\/([^/]+)\/log$/.exec(topic);
     if (logMatch) {
       this.handleIncomingLogMessage(logMatch[1], payloadBuffer);
@@ -313,6 +361,60 @@ export class HeatingMqttBridge {
       this.serviceModeStates.set(deviceId, parsed.serviceMode);
     }
 
+    if (typeof parsed.relayFault === 'boolean') {
+      const prevRelayFault = this.relayFaultStates.get(deviceId);
+      if (parsed.relayFault && prevRelayFault !== true) {
+        const cmdStr =
+          typeof parsed.pumpOn === 'boolean' ? (parsed.pumpOn ? 'BE' : 'KI') : '?';
+        const fbStr =
+          typeof parsed.relayFeedbackOn === 'boolean'
+            ? parsed.relayFeedbackOn
+              ? 'BE'
+              : 'KI'
+            : '?';
+        this.logBackendEvent(
+          'WARN',
+          'RELAY_FAULT',
+          `${deviceId} commanded=${cmdStr} feedback=${fbStr}`
+        );
+      } else if (!parsed.relayFault && prevRelayFault === true) {
+        this.logBackendEvent('INFO', 'RELAY_OK', `${deviceId} relé visszacsatolás helyreállt`);
+      }
+      this.relayFaultStates.set(deviceId, parsed.relayFault);
+    }
+
+    if (typeof parsed.loopFault === 'boolean') {
+      const prevLoopFault = this.loopFaultStates.get(deviceId);
+      if (parsed.loopFault && prevLoopFault !== true) {
+        const maxInfo =
+          typeof parsed.loopMaxMs === 'number' && Number.isFinite(parsed.loopMaxMs)
+            ? ` (max=${parsed.loopMaxMs}ms)`
+            : '';
+        this.logBackendEvent(
+          'ERROR',
+          'ESP_LOOP_FAULT',
+          `${deviceId} ESP32 loop ciklusidő hiba${maxInfo}`
+        );
+      } else if (!parsed.loopFault && prevLoopFault === true) {
+        this.logBackendEvent('INFO', 'ESP_LOOP_OK', `${deviceId} ESP32 loop ciklusidő helyreállt`);
+      }
+      this.loopFaultStates.set(deviceId, parsed.loopFault);
+    }
+
+    if (typeof parsed.nanoLoopFault === 'boolean') {
+      const prevNanoLoopFault = this.nanoLoopFaultStates.get(deviceId);
+      if (parsed.nanoLoopFault && prevNanoLoopFault !== true) {
+        this.logBackendEvent(
+          'ERROR',
+          'NANO_LOOP_FAULT',
+          `${deviceId} Nano loop ciklusidő hiba`
+        );
+      } else if (!parsed.nanoLoopFault && prevNanoLoopFault === true) {
+        this.logBackendEvent('INFO', 'NANO_LOOP_OK', `${deviceId} Nano loop ciklusidő helyreállt`);
+      }
+      this.nanoLoopFaultStates.set(deviceId, parsed.nanoLoopFault);
+    }
+
     const incomingTrend = parsed.trend?.eloremeno;
     if (incomingTrend === 'up' || incomingTrend === 'down') {
       const prevActiveTrend = this.lastActiveTrends.get(deviceId);
@@ -374,6 +476,108 @@ export class HeatingMqttBridge {
     this.logsStore.add('ERROR', code, message, 'esp', timestamp);
   }
 
+  private handleIncomingAckMessage(deviceId: string, payloadBuffer: Buffer): void {
+    let parsed: Record<string, unknown>;
+    try {
+      const raw = JSON.parse(payloadBuffer.toString('utf8')) as unknown;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+      parsed = raw as Record<string, unknown>;
+    } catch {
+      console.warn(`[MQTT] Érvénytelen ACK JSON (${deviceId})`);
+      return;
+    }
+
+    const cmdId = typeof parsed.cmdId === 'string' ? parsed.cmdId.trim() : '';
+    if (!cmdId) return;
+
+    const pending = this.pendingAcks.get(cmdId);
+    if (!pending) {
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    this.pendingAcks.delete(cmdId);
+
+    const ok = parsed.ok === true;
+    const pumpOn = typeof parsed.pumpOn === 'boolean' ? parsed.pumpOn : undefined;
+    const executedAt = typeof parsed.executedAt === 'string' ? parsed.executedAt : undefined;
+    const reason =
+      typeof parsed.reason === 'string' && parsed.reason.trim().length > 0
+        ? parsed.reason.trim()
+        : ok
+          ? undefined
+          : 'NRF_TIMEOUT';
+
+    if (!ok) {
+      this.logBackendEvent('WARN', 'CMD_ACK_FAIL', `${deviceId} cmdId=${cmdId} reason=${reason}`);
+    }
+
+    pending.resolve({
+      cmdId,
+      ok,
+      acked: ok,
+      ...(pumpOn !== undefined ? { pumpOn } : {}),
+      ...(executedAt !== undefined ? { executedAt } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+    });
+  }
+
+  public generateCmdId(): { cmdId: string; cmdSeq: number } {
+    const rand = Math.random().toString(36).slice(2, 6).padEnd(4, '0');
+    const cmdId = `cmd_${Date.now()}_${rand}`;
+    this.cmdSeqCounter = (this.cmdSeqCounter % 255) + 1;
+    return { cmdId, cmdSeq: this.cmdSeqCounter };
+  }
+
+  public createCommandAckWaiter(
+    cmdId: string,
+    timeoutMs = 3000
+  ): { promise: Promise<CmdAckResult>; cancel: () => void } {
+    let settled = false;
+    let resolveFn!: (result: CmdAckResult) => void;
+    let timer!: ReturnType<typeof setTimeout>;
+
+    const promise = new Promise<CmdAckResult>((resolve) => {
+      resolveFn = resolve;
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.pendingAcks.delete(cmdId);
+        this.logBackendEvent('WARN', 'CMD_ACK_TIMEOUT', `CMD_ACK_TIMEOUT cmdId=${cmdId}`);
+        resolve({
+          cmdId,
+          ok: false,
+          acked: false,
+          reason: 'ACK_TIMEOUT',
+        });
+      }, timeoutMs);
+
+      this.pendingAcks.set(cmdId, {
+        timer,
+        resolve: (result) => {
+          if (settled) return;
+          settled = true;
+          resolve(result);
+        },
+      });
+    });
+
+    const cancel = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      this.pendingAcks.delete(cmdId);
+      resolveFn({
+        cmdId,
+        ok: false,
+        acked: false,
+        reason: 'ACK_TIMEOUT',
+      });
+    };
+
+    return { promise, cancel };
+  }
+
   public publishAction(deviceId: string, actionPayload: Record<string, unknown>): Promise<void> {
     return new Promise((resolve, reject) => {
       if (!this.client || !this.connected) {
@@ -394,7 +598,11 @@ export class HeatingMqttBridge {
     });
   }
 
-  public publishCommand(deviceId: string, command: HeatingCommand): Promise<void> {
+  public publishCommand(
+    deviceId: string,
+    command: HeatingCommand,
+    meta?: { cmdId: string; cmdSeq: number }
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
       if (!this.client || !this.connected) {
         reject(new Error('Az MQTT kliens jelenleg nincs csatlakozva a HiveMQ Cloud brokerhez.'));
@@ -402,7 +610,8 @@ export class HeatingMqttBridge {
       }
 
       const topic = `futes/${deviceId}/cmd`;
-      const payload = JSON.stringify(command);
+      const wirePayload = meta ? { ...command, cmdId: meta.cmdId, cmdSeq: meta.cmdSeq } : command;
+      const payload = JSON.stringify(wirePayload);
 
       // Fontos: a backend CSAK továbbítja a parancsot MQTT-re, nem módosítja a tárolt ESP státuszt.
       this.client.publish(topic, payload, { qos: 1, retain: false }, (err) => {
@@ -435,6 +644,10 @@ export class HeatingMqttBridge {
   }
 
   public disconnect(): void {
+    for (const [cmdId, pending] of this.pendingAcks.entries()) {
+      clearTimeout(pending.timer);
+      this.pendingAcks.delete(cmdId);
+    }
     this.client?.end(true);
     this.connected = false;
   }

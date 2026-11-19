@@ -39,7 +39,7 @@ export interface SafetyConfig {
   readonly safetyOverheatTemp: number;
 }
 
-export type AlarmReason = 'none' | 'overheat' | 'sensor_fail' | 'nrf_fail';
+export type AlarmReason = 'none' | 'overheat' | 'sensor_fail' | 'nrf_fail' | 'pump_fault';
 
 export interface AlarmState {
   active: boolean;
@@ -112,6 +112,9 @@ export interface HeatingStatusPayload {
   kazan_status: number[];
   pumpConfig: PumpConfig;
   pumpState: PumpState;
+  pumpOn?: boolean;
+  relayFeedbackOn?: boolean;
+  relayFault?: boolean;
   pumpControl?: PumpControlMode;
   serviceMode?: boolean;
   alarmConfig: AlarmConfig;
@@ -119,6 +122,10 @@ export interface HeatingStatusPayload {
   alarmState: AlarmState;
   heartbeat: HeartbeatConfig;
   nrf24_ok: boolean;
+  loopFault?: boolean;
+  nanoLoopFault?: boolean;
+  loopMaxMs?: number;
+  loopLastMs?: number;
   error: string | null;
   manualHeating?: boolean;
   nanoCounter?: number;
@@ -148,4 +155,21 @@ export interface HeatingUpdateEvent {
   receivedAt: string;
   data: HeatingStatusPayload;
   state: StoredDeviceState;
+}
+
+export type CmdAckReason =
+  | 'NRF_TIMEOUT'
+  | 'ACK_TIMEOUT'
+  | 'SERVICE_MODE'
+  | 'RELAY_MISMATCH'
+  | 'NVS_FAIL'
+  | string;
+
+export interface CmdAckResult {
+  cmdId: string;
+  ok: boolean;
+  acked: boolean;
+  pumpOn?: boolean;
+  executedAt?: string;
+  reason?: CmdAckReason;
 }

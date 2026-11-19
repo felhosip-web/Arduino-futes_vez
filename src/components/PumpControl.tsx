@@ -2,20 +2,26 @@ import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Flame, PauseCircle } from 'lucide-react';
 import {
   DEFAULT_SAFETY_CONFIG,
+  type CommandAckState,
   type PumpConfig,
   type PumpMode,
   type PumpStartSensor,
   type PumpState,
   type SafetyConfig,
 } from '../types/heating';
+import { CommandAckBanner } from './CommandAckBanner';
 
 interface PumpControlProps {
   pumpConfig: PumpConfig;
   pumpState: PumpState;
+  commandedPumpOn?: boolean;
+  relayFeedbackOn?: boolean;
+  relayFault?: boolean;
   safety?: SafetyConfig;
   kazanTemp: number | null;
   sending: boolean;
   disabled?: boolean;
+  ackState?: CommandAckState;
   onSendPumpConfig: (config: PumpConfig) => Promise<void>;
 }
 
@@ -42,10 +48,14 @@ function hasHysteresisError(startTemp: number, stopTemp: number): boolean {
 export function PumpControl({
   pumpConfig,
   pumpState,
+  commandedPumpOn,
+  relayFeedbackOn,
+  relayFault = false,
   safety = DEFAULT_SAFETY_CONFIG,
   kazanTemp,
   sending,
   disabled = false,
+  ackState,
   onSendPumpConfig,
 }: PumpControlProps) {
   const [draftConfig, setDraftConfig] = useState<PumpConfig>(pumpConfig);
@@ -116,41 +126,108 @@ export function PumpControl({
     kazanTemp >= safety.safetyOverheatTemp;
 
   const isPumpRunning = pumpState === 'futes';
+  const effectiveCommanded = commandedPumpOn ?? isPumpRunning;
+  const hasFeedback = typeof relayFeedbackOn === 'boolean';
+  const effectiveFeedback = hasFeedback ? relayFeedbackOn : effectiveCommanded;
+  const hasRelayFault = Boolean(relayFault);
 
   return (
     <section
       aria-labelledby="pump-control-title"
-      className="rounded-xl border border-slate-800 bg-slate-900 p-5 sm:p-6"
+      className={`rounded-xl border bg-slate-900 p-5 sm:p-6 ${
+        hasRelayFault ? 'border-red-500' : 'border-slate-800'
+      }`}
     >
-      {/* Felső sor: cím + állapot badge */}
+      {/* Felső sor: cím + állapot badge + Kért/Relé visszacsatolás */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 pb-4">
-        <h2 id="pump-control-title" className="text-lg font-semibold text-slate-100">
-          Kazánvédelem / Szivattyú
-        </h2>
+        <div>
+          <h2 id="pump-control-title" className="text-lg font-semibold text-slate-100">
+            Kazánvédelem / Szivattyú
+          </h2>
+          <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs">
+            <span className="inline-flex items-center gap-1.5 rounded-md border border-slate-700/80 bg-slate-950 px-2.5 py-1 font-medium text-slate-300">
+              <span className="text-slate-400">Kért:</span>
+              <span className={effectiveCommanded ? 'font-semibold text-orange-300' : 'font-semibold text-slate-200'}>
+                {effectiveCommanded ? 'BE' : 'KI'}
+              </span>
+            </span>
+            <span
+              className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 font-medium ${
+                hasRelayFault
+                  ? 'border-red-500/70 bg-red-950/70 text-red-200'
+                  : 'border-slate-700/80 bg-slate-950 text-slate-300'
+              }`}
+              title="Nano D7 fizikai DPDT relé visszacsatolás"
+            >
+              <span className={hasRelayFault ? 'text-red-300' : 'text-slate-400'}>Relé:</span>
+              <span
+                className={
+                  hasFeedback
+                    ? effectiveFeedback
+                      ? hasRelayFault
+                        ? 'font-semibold text-red-100'
+                        : 'font-semibold text-emerald-300'
+                      : hasRelayFault
+                        ? 'font-semibold text-red-100'
+                        : 'font-semibold text-slate-200'
+                    : 'font-semibold text-slate-500'
+                }
+              >
+                {hasFeedback ? (effectiveFeedback ? 'BE' : 'KI') : 'Nincs adat'}
+              </span>
+            </span>
+          </div>
+        </div>
 
-        <div
-          className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-semibold whitespace-nowrap shrink-0 ${
-            isPumpRunning
-              ? 'border-orange-500/40 bg-orange-500/15 text-orange-300'
-              : 'border-slate-700 bg-slate-800 text-slate-300'
-          }`}
-        >
-          {isPumpRunning ? (
-            <Flame className="h-3.5 w-3.5 text-orange-400" aria-hidden="true" />
-          ) : (
-            <PauseCircle className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
+        <div className="flex flex-wrap items-center gap-2">
+          {hasRelayFault && (
+            <div
+              role="alert"
+              className="inline-flex items-center gap-2 rounded-lg border border-red-500 bg-red-950/90 px-3 py-1.5 text-xs font-bold text-red-100 whitespace-nowrap shrink-0 animate-pulse"
+            >
+              <AlertTriangle className="h-3.5 w-3.5 text-red-400" aria-hidden="true" />
+              <span>
+                RELÉ HIBA - Kért {effectiveCommanded ? 'BE' : 'KI'}, relé {effectiveFeedback ? 'BE' : 'KI'}
+              </span>
+            </div>
           )}
-          <span>
-            {disabled
-              ? 'SZERVIZ - Szivattyú BE (Nano)'
-              : isPumpRunning
-                ? 'FŰTÉS - Szivattyú BE'
-                : 'VÁRAKOZÁS - Szivattyú KI'}
-          </span>
+
+          <div
+            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-semibold whitespace-nowrap shrink-0 ${
+              isPumpRunning
+                ? 'border-orange-500/40 bg-orange-500/15 text-orange-300'
+                : 'border-slate-700 bg-slate-800 text-slate-300'
+            }`}
+          >
+            {isPumpRunning ? (
+              <Flame className="h-3.5 w-3.5 text-orange-400" aria-hidden="true" />
+            ) : (
+              <PauseCircle className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
+            )}
+            <span>
+              {disabled
+                ? 'SZERVIZ - Szivattyú BE (Nano)'
+                : isPumpRunning
+                  ? 'FŰTÉS - Szivattyú BE'
+                  : 'VÁRAKOZÁS - Szivattyú KI'}
+            </span>
+          </div>
         </div>
       </div>
 
       {/* Figyelmeztető sávok */}
+      {hasRelayFault && (
+        <div
+          role="alert"
+          className="mt-4 flex items-center gap-2.5 rounded-lg border border-red-500 bg-red-950/80 px-4 py-3 text-sm font-semibold text-red-100 animate-pulse"
+        >
+          <AlertTriangle className="h-5 w-5 shrink-0 text-red-400" aria-hidden="true" />
+          <span>
+            RELÉ HIBA - Kért {effectiveCommanded ? 'BE' : 'KI'}, relé {effectiveFeedback ? 'BE' : 'KI'} (Nano D7 fizikai visszacsatolás eltérés! Ellenőrizd a relét!)
+          </span>
+        </div>
+      )}
+
       {isOverheat && (
         <div
           role="alert"
@@ -226,7 +303,7 @@ export function PumpControl({
             max={50}
             step={0.5}
             value={draftConfig.pumpStartTemp}
-            disabled={disabled}
+            disabled={actionDisabled}
             onPointerDown={() => {
               isSlidingRef.current = true;
             }}
@@ -277,7 +354,7 @@ export function PumpControl({
             max={40}
             step={0.5}
             value={draftConfig.pumpStopTemp}
-            disabled={disabled}
+            disabled={actionDisabled}
             onPointerDown={() => {
               isSlidingRef.current = true;
             }}
@@ -349,6 +426,8 @@ export function PumpControl({
           ))}
         </select>
       </div>
+
+      <CommandAckBanner ackState={ackState} />
     </section>
   );
 }

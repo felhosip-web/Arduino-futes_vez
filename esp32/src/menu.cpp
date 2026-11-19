@@ -658,9 +658,9 @@ void MenuController::handleInput(int8_t encSteps,
         return;
     }
 
-    // 4c. CHECK diagnosztikai néző (`MENU_CHECK` - 5 görgethető sor)
+    // 4c. CHECK diagnosztikai néző (`MENU_CHECK` - 6 görgethető sor)
     if (_menuState == MENU_CHECK) {
-        constexpr uint8_t CHECK_LINES = 5;
+        constexpr uint8_t CHECK_LINES = 6;
         if (steps != 0) {
             _lastActivityMs = now;
             int16_t next = static_cast<int16_t>(_checkCursor) + steps;
@@ -939,6 +939,9 @@ void MenuController::drawMainScreen(bool alarmBlinkPhase) {
                 case ALARM_REASON_SENSOR_FAIL:
                     snprintf(line2, sizeof(line2), "SZERVIZ SZENZOR!");
                     break;
+                case ALARM_REASON_PUMP_FAULT:
+                    snprintf(line2, sizeof(line2), "SZERVIZ RELE HIBA");
+                    break;
                 case ALARM_REASON_NRF_FAIL:
                 default:
                     snprintf(line2, sizeof(line2), "SZERVIZ NRF HIBA!");
@@ -957,6 +960,9 @@ void MenuController::drawMainScreen(bool alarmBlinkPhase) {
                 }
                 case ALARM_REASON_SENSOR_FAIL:
                     snprintf(line2, sizeof(line2), "RIASZTAS! SZENZOR!");
+                    break;
+                case ALARM_REASON_PUMP_FAULT:
+                    snprintf(line2, sizeof(line2), "RIASZTAS! RELE HIBA");
                     break;
                 case ALARM_REASON_NRF_FAIL:
                 default:
@@ -1036,7 +1042,7 @@ void MenuController::drawLogViewer() {
 void MenuController::drawCheckViewer() {
     if (!_lcd || !_state) return;
 
-    if (_checkCursor >= 5) {
+    if (_checkCursor >= 6) {
         _checkCursor = 0;
     }
 
@@ -1044,7 +1050,7 @@ void MenuController::drawCheckViewer() {
     char line2[24];
     uint32_t now = millis();
 
-    snprintf(line1, sizeof(line1), "CHECK (%u/5)", static_cast<unsigned>(_checkCursor + 1));
+    snprintf(line1, sizeof(line1), "CHECK (%u/6)", static_cast<unsigned>(_checkCursor + 1));
 
     switch (_checkCursor) {
         case 0: {
@@ -1093,9 +1099,21 @@ void MenuController::drawCheckViewer() {
             break;
         }
 
-        case 4:
-        default: {
+        case 4: {
             snprintf(line2, sizeof(line2), "Szerviz: %s", _state->serviceMode ? "BE" : "KI");
+            break;
+        }
+
+        case 5:
+        default: {
+            bool anyLoopFault = _state->loopFault || _state->nanoLoopFault;
+            if (anyLoopFault) {
+                snprintf(line2, sizeof(line2), "Loop: LASSU %lums",
+                         static_cast<unsigned long>(_state->loopMaxMs));
+            } else {
+                snprintf(line2, sizeof(line2), "Loop: OK (%lums)",
+                         static_cast<unsigned long>(_state->loopLastMs));
+            }
             break;
         }
     }
@@ -1224,6 +1242,8 @@ void MenuController::formatMenuItemValue(const MenuItem& item, char* buf, size_t
                         snprintf(buf, bufLen, "TULMELEGEDES");
                     } else if (_state->alarmState.reason == ALARM_REASON_SENSOR_FAIL) {
                         snprintf(buf, bufLen, "SZENZOR HIBA");
+                    } else if (_state->alarmState.reason == ALARM_REASON_PUMP_FAULT) {
+                        snprintf(buf, bufLen, "RELE HIBA");
                     } else if (_state->alarmState.reason == ALARM_REASON_NRF_FAIL) {
                         snprintf(buf, bufLen, "NRF HIBA");
                     } else {

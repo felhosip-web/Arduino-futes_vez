@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { Flame, Minus, Plus, Snowflake } from 'lucide-react';
-import type { HeatingMode, HeatingStatusPayload } from '../types/heating';
+import type { CommandAckState, HeatingMode, HeatingStatusPayload } from '../types/heating';
+import { CommandAckBanner } from './CommandAckBanner';
 
 interface HeatingControlProps {
   status: HeatingStatusPayload;
   sending: boolean;
   disabled?: boolean;
+  ackState?: CommandAckState;
   onSendRoomCommand: (patch: {
     targetTemp: number;
     mode: HeatingMode;
@@ -32,6 +34,7 @@ export function HeatingControl({
   status,
   sending,
   disabled = false,
+  ackState,
   onSendRoomCommand,
 }: HeatingControlProps) {
   const [draftTargetTemp, setDraftTargetTemp] = useState<number>(status.targetTemp);
@@ -182,7 +185,7 @@ export function HeatingControl({
               <button
                 type="button"
                 onClick={() => handleStepTemp(-TARGET_STEP)}
-                disabled={disabled || draftTargetTemp <= TARGET_MIN}
+                disabled={actionDisabled || draftTargetTemp <= TARGET_MIN}
                 aria-label="Célhőmérséklet csökkentése 0.5 fokkal"
                 className="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-slate-700 bg-slate-800 text-slate-100 transition-colors hover:bg-slate-700 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
               >
@@ -191,7 +194,7 @@ export function HeatingControl({
               <button
                 type="button"
                 onClick={() => handleStepTemp(TARGET_STEP)}
-                disabled={disabled || draftTargetTemp >= TARGET_MAX}
+                disabled={actionDisabled || draftTargetTemp >= TARGET_MAX}
                 aria-label="Célhőmérséklet növelése 0.5 fokkal"
                 className="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-slate-700 bg-slate-800 text-slate-100 transition-colors hover:bg-slate-700 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
               >
@@ -211,7 +214,7 @@ export function HeatingControl({
               max={TARGET_MAX}
               step={TARGET_STEP}
               value={draftTargetTemp}
-              disabled={disabled}
+              disabled={actionDisabled}
               onPointerDown={() => {
                 isSlidingRef.current = true;
               }}
@@ -280,6 +283,8 @@ export function HeatingControl({
           )}
         </div>
       </div>
+
+      <CommandAckBanner ackState={ackState} />
     </section>
   );
 }

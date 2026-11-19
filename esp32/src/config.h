@@ -22,6 +22,8 @@ constexpr const char* TOPIC_STATUS    = "futes/haz-futes/status";    // retained
 constexpr const char* TOPIC_TELEMETRY = "futes/haz-futes/telemetry"; // 30 mp-enként
 constexpr const char* TOPIC_LOG       = "futes/haz-futes/log";       // ERROR események azonnal
 constexpr const char* TOPIC_LOGS      = "futes/haz-futes/logs";      // getLogs válasz
+constexpr const char* TOPIC_ACK       = "futes/haz-futes/ack";       // End-to-end CMD_ACK
+constexpr const char* TOPIC_ACK_ALT   = "heating/haz-futes/ack";     // Kompatibilitási ACK topic
 
 // --- NTP időszinkron ---
 constexpr const char* NTP_SERVER_1           = "pool.ntp.org";
@@ -107,6 +109,9 @@ constexpr uint32_t ALARM_BLINK_INTERVAL_MS    = 500UL;    // 500ms BE / 500ms KI
 constexpr uint32_t NRF_RESPONSE_TIMEOUT_MS  = 500UL; // Max 500ms várakozás RESPONSE-ra
 constexpr uint8_t  NRF_MAX_ATTEMPTS         = 3;     // Max 3 próba egy ping ciklusban
 constexpr uint8_t  NRF_MAX_MISSED_CYCLES    = 3;     // 3 egymás utáni sikertelen ciklus -> nrf_fail
+constexpr uint32_t CMD_ACK_TIMEOUT_MS       = 3000UL; // Max 3000ms end-to-end CMD_ACK várakozás
+constexpr uint32_t RELAY_FAULT_DELAY_MS     = 500UL;  // Max 500ms eltérés kért vs D7 visszacsatolás között
+constexpr uint32_t CMD_RELAY_SETTLE_POLL_MS = 75UL;   // Relé D7 beállási újrakérdezés (50ms debounce után)
 
 // --- TLS biztonsági beállítások (kizárólag CA tanúsítvány-ellenőrzéssel) ---
 constexpr bool     TLS_REQUIRE_CA_CERT    = true;
@@ -118,6 +123,21 @@ constexpr uint32_t WIFI_RECONNECT_MS      = 10000UL; // 10 mp nem-blokkoló WiFi
 constexpr uint32_t WIFI_PORTAL_TIMEOUT_MS = 30000UL; // 30 mp sikertelen WiFi után beállító portál
 constexpr uint32_t MQTT_RECONNECT_MS      = 5000UL;  // 5 mp nem-blokkoló MQTT retry
 constexpr uint32_t BTN_DEBOUNCE_MS        = 50UL;
+
+// Állítsd 1-re (vagy adj meg -DDEBUG build flag-et), ha a >50 ms loop() ciklusidő naplózást kéred sorosra
+#ifndef DEBUG_MODE
+#define DEBUG_MODE 0
+#endif
+
+// --- Loop Monitor (cél < 20 ms) + Hardveres Watchdog (5 mp) ---
+constexpr uint32_t ESP_WDT_TIMEOUT_SEC       = 5UL;       // 5 mp hardware task watchdog
+constexpr uint32_t ESP_LOOP_WARN_US          = 100000UL;  // >100 ms -> WARN + overrun
+constexpr uint32_t ESP_LOOP_FAULT_STREAK_US  = 500000UL;  // 5 egymást követő >500 ms -> loopFault
+constexpr uint32_t ESP_LOOP_FAULT_SINGLE_US  = 2000000UL; // 1 loop >2000 ms -> azonnali loopFault
+constexpr uint32_t ESP_LOOP_RECOVER_US       = 20000UL;   // 10 egymást követő <20 ms -> helyreáll
+constexpr uint32_t ESP_LOOP_WARN_COOLDOWN_MS = 10000UL;   // 10 mp cooldown log spam ellen
+constexpr uint8_t  ESP_LOOP_FAULT_STREAK_CNT = 5;
+constexpr uint8_t  ESP_LOOP_RECOVER_CNT      = 10;
 
 // --- Előremenő hőmérséklet trend és napi statisztika ---
 constexpr uint32_t TREND_SAMPLE_INTERVAL_MS = 60000UL; // 1 perces mintavétel

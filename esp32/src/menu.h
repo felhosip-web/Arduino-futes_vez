@@ -47,6 +47,9 @@ struct SystemState {
     };
     uint8_t  pumpState         = PUMP_STATE_VARAKOZAS;
     bool     pumpOn            = false;
+    bool     relayFeedbackOn   = false;
+    bool     relayFault        = false;
+    bool     hasRelayFeedback  = false;
     uint32_t manualOffStartMs  = 0;
     bool     safetyOverheat    = false;
     bool     safetySensorFault = false;
@@ -84,6 +87,12 @@ struct SystemState {
     char     eloremenoMaxAt[6]   = { 0 };
     char     eloremenoMinAt[6]   = { 0 };
     char     statsSinceStr[24]   = { 0 };
+
+    // Loop monitor állapot (ESP32 + Nano)
+    bool     loopFault           = false;
+    bool     nanoLoopFault       = false;
+    uint32_t loopMaxMs           = 0;
+    uint32_t loopLastMs          = 0;
 };
 
 // ============================================================================

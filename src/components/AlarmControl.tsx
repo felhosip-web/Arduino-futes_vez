@@ -5,8 +5,10 @@ import {
   type AlarmConfig,
   type AlarmReason,
   type AlarmState,
+  type CommandAckState,
   type SafetyConfig,
 } from '../types/heating';
+import { CommandAckBanner } from './CommandAckBanner';
 
 interface AlarmControlProps {
   alarmConfig: AlarmConfig;
@@ -14,6 +16,7 @@ interface AlarmControlProps {
   safety?: SafetyConfig;
   kazanTemp: number | null;
   sending: boolean;
+  ackState?: CommandAckState;
   onSendAlarmConfig: (config: AlarmConfig) => Promise<void>;
 }
 
@@ -32,6 +35,8 @@ function getAlarmBadgeText(reason: AlarmReason): string {
       return 'RIASZTÁS: TÚLMELEGEDÉS';
     case 'sensor_fail':
       return 'RIASZTÁS: SZENZOR HIBA';
+    case 'pump_fault':
+      return 'RIASZTÁS: RELÉ / SZIVATTYÚ HIBA';
     case 'nrf_fail':
       return 'RIASZTÁS: NRF HIBA';
     default:
@@ -45,6 +50,7 @@ export function AlarmControl({
   safety = DEFAULT_SAFETY_CONFIG,
   kazanTemp,
   sending,
+  ackState,
   onSendAlarmConfig,
 }: AlarmControlProps) {
   const [draftConfig, setDraftConfig] = useState<AlarmConfig>(alarmConfig);
@@ -170,7 +176,7 @@ export function AlarmControl({
             min={OVERHEAT_MIN}
             max={OVERHEAT_MAX}
             step={OVERHEAT_STEP}
-            disabled={!draftConfig.alarmEnabled}
+            disabled={!draftConfig.alarmEnabled || sending}
             value={draftConfig.alarmTemp}
             onPointerDown={() => {
               isSlidingRef.current = true;
@@ -259,6 +265,8 @@ export function AlarmControl({
           (nem állítható) - e fölött a szivattyú mindenképp BEkapcsol, akkor is, ha a riasztás ki van kapcsolva.
         </span>
       </div>
+
+      <CommandAckBanner ackState={ackState} />
     </section>
   );
 }

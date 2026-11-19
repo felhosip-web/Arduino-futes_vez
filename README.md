@@ -62,7 +62,8 @@ A 4 db **DS18B20** hőmérséklet-szenzor közös **OneWire** buszon van a **D2*
 | **Zöld LED (`led_zold`)** | `D5` | Kimenet | Állapot / felhasználói kimenet (Szerviz módban folyamatos BE) |
 | **Szerviz kapcsoló (`serviceMode`)** | `D6` | Bemenet (`INPUT_PULLUP`) | SPST billenőkapcsoló **GND-re** (`LOW` = Szerviz BE, 50 ms szoftveres debounce) |
 | **Piros LED (`led_piros`)** | `A2` (`16`) | Kimenet | Riasztás jelzés (aktív riasztáskor 500 ms BE / 500 ms KI villogás; a `D6` átadva a szerviz kapcsolónak) |
-| **Szivattyú relé (`szivattyu`)** | `D7` | Kimenet | Keringető szivattyú relévezérlés |
+| **Relé visszacsatolás (`relayFeedbackOn`)** | `D7` | Bemenet (`INPUT_PULLUP`) | Kétpólusú (**DPDT**) relé **2. pólusa**: `COM -> Nano GND`, `NC -> Nano D7` (`HIGH` = relé fizikailag BE, `LOW` = KI; 50 ms debounce). **230V SOHA nem kerülhet erre a pólusra!** |
+| **Szivattyú relé meghajtás (`szivattyu`)** | `A1` (`15`) | Kimenet | Keringető szivattyú DPDT relé tekercsvezérlés (`D7` átadva a visszacsatolásnak) |
 | **Tartalék 1 (`tartalek1`)** | `D8` | Kimenet | Szabadon kapcsolható kimenet |
 | **Tartalék 2 (`tartalek2`)** | `D9` | Kimenet | Szabadon kapcsolható kimenet |
 | **Tartalék 3 (`tartalek3`)** | `D10` | Kimenet | **OUTPUT módban kell maradnia** az AVR hardveres SPI Master feltétel miatt |
@@ -105,7 +106,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 | Struktúra (31 byte payload) | Mezők pontos sorrendben | Leírás |
 | :--- | :--- | :--- |
 | **`EspToNanoPayload`** | `outputsMask`, `targetTemp`, `mode`, `manualHeating`, `pumpConfig`, `alarmConfig`, `heartbeatIntervalSec`, `seq`, `timeSyncEpoch` | Az ESP32 kimeneti bitmaszkja, termosztát, szivattyú-, riasztás- és ping beállításai, a növekvő `seq` sorszám, valamint a 4 byte-os `timeSyncEpoch` időszinkron érték. |
-| **`NanoToEspPayload`** | `eloremeno`, `visszatero`, `kazan`, `kulteri`, `kazanStatusMask`, `counter`, `seq`, `sensorValidMask`, `alarmState`, `syncFlags`, `syncEpochLow16` | A 4 mért hőfok (`-127.0f` hiba esetén), az 1 byte-os `kazanStatusMask` (amelyet az ESP32 bont vissza 8 elemű `kazan_status` tömbbé), a válasz `counter`, a szenzor-érvényességi maszk, az `alarmState`, a `syncFlags` (`bit0`: `ACK`, `bit1`: `STALE`, `bit2`: `SYNC_FLAG_SERVICE_MODE`) + `syncEpochLow16`, és az eredeti `seq`. |
+| **`NanoToEspPayload`** | `eloremeno`, `visszatero`, `kazan`, `kulteri`, `kazanStatusMask`, `counter`, `seq`, `sensorValidMask`, `alarmPacked`, `cmdSeq`, `syncFlags`, `syncEpochLow16` | A 4 mért hőfok (`-127.0f` hiba esetén), az 1 byte-os `kazanStatusMask` (amelyet az ESP32 bont vissza 8 elemű `kazan_status` tömbbé), a válasz `counter`, a szenzor-érvényességi maszk, az `alarmPacked` (`bit0`: active, `bit1..3`: reason, `bit4`: `SYNC_FLAG_LOOP_FAULT = 0x10`), a `syncFlags` (`bit0`: `ACK`, `bit1`: `STALE`, `bit2`: `SYNC_FLAG_SERVICE_MODE`, `bit3`: `CMD_ACK`, `bit4`: `PUMP_ON` kért állapot, `bit5`: `CMD_REJECTED_SERVICE`, `bit6`: `SYNC_FLAG_RELAY_FB_ON` D7 fizikai visszacsatolás, `bit7`: `SYNC_FLAG_RELAY_MISMATCH` >500 ms eltérés) + `syncEpochLow16` + `cmdSeq` (továbbra is fix 32 byte-os `NrfPacket`). |
 
 ### MQTT topicok (HiveMQ Cloud TLS 8883)
 
@@ -182,6 +183,9 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
     "pumpStartSensor": "kazan"
   },
   "pumpState": "futes",
+  "pumpOn": true,
+  "relayFeedbackOn": true,
+  "relayFault": false,
   "pumpControl": "AUTO",
   "alarmConfig": {
     "alarmTemp": 85.0,
@@ -198,6 +202,10 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
     "intervalSec": 5
   },
   "nrf24_ok": true,
+  "loopFault": false,
+  "nanoLoopFault": false,
+  "loopMaxMs": 12,
+  "loopLastMs": 2,
   "time": {
     "espNtpSynced": true,
     "espTime": "2026-11-17 12:00:00",
@@ -267,6 +275,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
   - `"none"` – nincs riasztás
   - `"overheat"` – a kazán elérte vagy meghaladta az `alarmTemp` értéket
   - `"sensor_fail"` – a kazán DS18B20 szenzor nem olvasható (`-127 °C`)
+  - `"pump_fault"` – relé fizikai visszacsatolási hiba (`commandedPumpOn != relayFeedbackOn` >500 ms)
   - `"nrf_fail"` – az ESP32 és Nano közötti rádiós kapcsolat megszakadt
 - **LED jelzés**:
   - Ha `alarmState.active == true` **ÉS** `alarmEnabled == true`, akkor **MINDKÉT piros LED** (Nano `D6` és ESP32 `GPIO 11`) szinkron nélkül, nem-blokkoló `millis()` időzítéssel villog **`500 ms BE / 500 ms KI`** ütemben (`delay()` használata nélkül).
@@ -304,6 +313,53 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 - **NTP szinkronizáció (ESP32-C3)**: WiFi csatlakozás után az ESP32 nem-blokkoló módon szinkronizál az `pool.ntp.org` és `time.nist.gov` szerverekről (`Europe/Budapest` időzóna + automatikus téli/nyári DST átállás). Sikertelen szinkronnál 60 mp-enként újrapróbál; WiFi vagy NTP hiányában minden naplóbejegyzés és állapot `UP <sec>s` formátumot használ, és a `setup()` sosem akad el.
 - **49 napos `millis()` túlcsordulás-védelem**: Mind az ESP32-C3, mind az Arduino Nano **kizárólag előjel nélküli kivonást** (`static_cast<uint32_t>(now - last) >= INTERVAL`) használ minden időzítőnél (NRF fail-safe, ping ciklus, 20 mp menü timeout, 500 ms riasztás LED, 10 mp DS18B20 olvasás, 10 perces `manual_off`, 30 mp telemetria, hosszú/gyári gombnyomás). Ez a 32 bites számláló ~49,7 napos körbefordulásakor is pontos marad.
 - **ESP–Nano időszinkron (naponta 2×)**: Az ESP32 boot-kor egyszer, majd naponta `00:00`-kor és `12:00`-kor (valamint kézi `POST /api/heating/:id/sync` vagy `{"action": "forceSync"}` parancsra azonnal) elküldi az aktuális epoch időt a 32 byte-os `REQUEST` csomag `timeSyncEpoch` mezőjében. A Nano a `RESPONSE` csomagban (`syncFlags` + `syncEpochLow16`) visszaigazolja a szinkront, és `(uint32_t)(millis() - syncMillis) / 1000` képlettel számolja tovább az idejét. Sikertelen szinkronnál (`3` próba után) 1 óra múlva automatikus újrapróba történik; ha 13 órán át nem kap friss szinkront, `nanoStale = true` jelzés jelenik meg, miközben a kazánvédelem és fail-safe zavartalanul működik tovább.
+
+### 6.2 Parancs-visszaigazolás (Végponttól végpontig tartó CMD_ACK)
+
+- **Miért nem elég a QoS 1 broker-ACK?** Az MQTT QoS 1 visszaigazolás kizárólag azt bizonyítja, hogy a HiveMQ broker megkapta a parancsot – azt viszont nem, hogy az ESP32 továbbította a rádiócsatornán, és a Nano ténylegesen átkapcsolta a kazánoldali relét. Ha közben NRF24 szakadás vagy szerviz mód felülbírálás történik, a pusztán broker-ACK-ra építő felület hamis sikert mutatna.
+- **Végponttól végpontig tartó `cmdId + cmdSeq` lánc**:
+  1. **Backend**: Minden vezérlőparancsnál egyedi `cmdId`-t (`cmd_<timestamp>_<rand>`) és 8 bites `cmdSeq` azonosítót (`1..255`) generál, elküldi az MQTT `cmd` üzenetben, és nem-blokkoló módon max. **`3000 ms`**-ig vár a `CMD_ACK` válaszra.
+  2. **ESP32-C3**: A bejövő parancsot NVS-be menti, eltárolja a `pendingCmdId`/`pendingCmdSeq` értékét, és a nem-blokkoló NRF állapotgépen keresztül **azonnal** elküldi a Nano-nak (nem vár a következő 5–30 mp-es pingre).
+  3. **Arduino Nano**: A `REQUEST` vételével egy időben azonnal frissíti a kimeneteket, és a `RESPONSE` csomagban (`cmdSeq` + `syncFlags`: `CMD_ACK`, `PUMP_ON`, `CMD_REJECTED_SERVICE`, **továbbra is 32 byte-os `NrfPacket`-ben**) visszaküldi a fizikai reléállapotot és a nyugtát.
+  4. **Visszaigazolás vagy hiba**: Ha a Nano által jelentett reléállapot megegyezik a kért állapottal, az ESP32 `CMD_ACK` üzenetet publikál (`ok: true, pumpOn, executedAt`) a `futes/haz-futes/ack` (és `heating/haz-futes/ack`) topicra, a backend `HTTP 200` (`acked: true`) választ ad, a frontend pedig 2 mp-ig zöld pipával jelzi: *„Végrehajtva - Nano visszaigazolta”*.
+- **Hibakezelés és `SERVICE_MODE` elutasítás**:
+  - **Szerviz mód (`SERVICE_MODE`)**: Ha a kazánnál a fizikai `D6` szerviz kapcsoló BE van kapcsolva, a Nano elutasítja a szivattyú kikapcsolására irányuló parancsot (`CMD_REJECTED_SERVICE`), az ESP32 pedig `ok: false, reason: "SERVICE_MODE"` választ küld.
+  - **Rádió- vagy időtúllépés (`NRF_TIMEOUT` / `ACK_TIMEOUT`)**: Ha a 3 NRF újrapróbálkozás sikertelen vagy 3000 ms alatt nem érkezik visszaigazolás, a backend `WARN CMD_ACK_TIMEOUT` bejegyzést naplóz és **`HTTP 504`** (`acked: false`) választ küld; a frontend piros hibaüzenetet jelenít meg (*„Nincs visszaigazolás a Nano-tól - ellenőrizd a rádiót”* / *„szerviz módban van”*).
+  - **Relé eltérés (`RELAY_MISMATCH`)**: Ha a parancs megérkezett a Nano-hoz, de a `D7` fizikai visszacsatolás `500 ms` múlva sem követi a kért állapotot, az ESP32 `ok: false, reason: "RELAY_MISMATCH"` választ ad, a frontend pedig piros reléhiba üzenetet jelenít meg.
+
+### 6.3 Relé visszacsatolás
+
+- **Kötelező DPDT (kétpólusú) relé és érintésvédelem**:
+  - **1. pólus**: kizárólag a szivattyú **230 V AC** hálózati fázisát kapcsolja (változatlan).
+  - **2. pólus (visszacsatolás)**: teljesen galvanikusan leválasztott kisfeszültségű segédérintkező — **230 V SOHA nem kerülhet erre a pólusra!**
+  - **Bekötés**: 2. pólus `COM` → **Nano `GND`**, 2. pólus `NC` (alapból zárt) → **Nano `D7`** (`INPUT_PULLUP`). A relé tekercsének meghajtása az **`A1` (`15`)** lábon történik, így a `D7` kizárólag a visszacsatolásé.
+  - **Logika**: nyugalmi (KI) állapotban az `NC` érintkező zárt, ezért `D7 = LOW` (`relayFeedbackOn = false`). Behúzott (BE) állapotban az `NC` érintkező kinyit, a belső pull-up felhúzza, ezért **`D7 HIGH = relé fizikailag BE`**, **`D7 LOW = relé fizikailag KI`**.
+- **Folyamatos D7 figyelés (50 ms debounce + 500 ms hibadetektálás)**:
+  - A Nano minden `loop()` ciklusban olvassa a `D7` lábat **50 ms** szoftveres debounce-szal (`updateRelayFeedback`), és a 32 byte-os `NrfPacket` `syncFlags` mezőjében (`SYNC_FLAG_RELAY_FB_ON = 0x40`, `SYNC_FLAG_RELAY_MISMATCH = 0x80`) azonnal jelzi a fizikai állapotot.
+  - Ha `commandedPumpOn != relayFeedbackOn` **500 ms**-nál tovább fennáll (pl. beégett, beragadt vagy nem húzott be a relé, illetve szakadt a `D7` visszacsatoló vezeték), a Nano soros portra írja a **`RELAY_STUCK_ON`** (kért KI, de `D7 HIGH`) vagy **`RELAY_STUCK_OFF`** (kért BE, de `D7 LOW`) eseményt, és a `CMD_ACK` válasza `ok: false, reason: "RELAY_MISMATCH"` lesz.
+- **ESP32-C3, Backend és Frontend kezelés**:
+  - Az ESP32 a `STATUS` JSON-ba beteszi a **`"pumpOn"`** (kért állapot), **`"relayFeedbackOn"`** (fizikai D7 állapot) és **`"relayFault"`** (`true`/`false`) mezőket. Eltéréskor (>500 ms) **egyszer** naplózza a `WARN RELAY_FAULT` eseményt, és aktív riasztást (`alarmState.reason = "pump_fault"`) indít addig, amíg a két állapot újra meg nem egyezik.
+  - A frontend **`Kazánvédelem / Szivattyú`** kártyáján látszik a **`Kért: BE/KI`** és **`Relé: BE/KI`** állapot, hiba esetén pirosan villogó **`RELÉ HIBA - Kért BE, relé KI`** (vagy fordítva) jelvény jelenik meg, és a **`PushNotifications`** kritikus `Szivattyúhiba` riasztása is aktiválódik.
+
+### 6.4 Loop monitor + Watchdog
+
+- **Túlcsordulás-biztos ciklusidő mérés (`micros()`)**: Mindkét mikrokontroller minden `loop()` ciklus végén `uint32_t` előjel nélküli kivonással méri a futásidőt (71 perces `micros()` körbefordulás esetén is pontos), és nyilvántartja a `lastLoopUs`, `maxLoopUs`, `loopOverrunCount` és `loopFault` értékeket.
+- **Tudatosan hosszú műveletek kizárása (`loopMonitorSuspend`)**:
+  - **Arduino Nano**: a 750 ms-os DS18B20 konverzió teljesen aszinkron (`setWaitForConversion(false)`), a 4 szenzor kiolvasása pedig ciklusonként 1 szenzorra bontva fut (`stepAsyncTemperatureRead`); a soros `'a'` címkereső (`runAddressScanner`) alatt a mérés felfüggesztésre kerül.
+  - **ESP32-C3**: a WiFi csatlakozás/AP portál, a TLS MQTT handshake (`mqtt.connect`) és az NTP időszinkron (`configTime`) idejére `loopMonitorSuspend = true` lép életbe, hogy ne generáljanak téves riasztást.
+- **Küszöbök és visszaállás**:
+
+| Eszköz | Normál cél | `WARN` küszöb (`10 mp` cooldown) | `FAULT` feltétel | Helyreállás (`LOOP_OK`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Arduino Nano** | `< 10 ms` | `> 50 ms` (`LOOP_SLOW`) | `5` egymást követő `> 100 ms` vagy `1` db `> 500 ms` | `10` egymást követő `< 10 ms` |
+| **ESP32-C3** | `< 20 ms` | `> 100 ms` (`ESP_LOOP_SLOW`) | `5` egymást követő `> 500 ms` vagy `1` db `> 2000 ms` | `10` egymást követő `< 20 ms` |
+
+- **Jelzések és továbbítás**:
+  - **Nano**: `loopFault == true` esetén a zöld LED (`D5`) gyorsan, **100 ms** ütemben villog, és az állapot az `alarmPacked` bit4-en (`SYNC_FLAG_LOOP_FAULT = 0x10`) átkerül az ESP32-nek a változatlan 32 byte-os `NrfPacket`-ben.
+  - **ESP32-C3 + Backend + Frontend**: a `STATUS` JSON tartalmazza a `loopFault`, `nanoLoopFault`, `loopMaxMs` és `loopLastMs` mezőket. Az LCD `STATUS -> CHECK (6/6)` nézetben és a webes **`Rendszer ellenőrzés`** (`SystemCheck`) 6. kártyáján `Loop: OK` vagy pirosan villogó `LASSÚ (max Xms)` jelzés látható, a **`PushNotifications`** pedig `Loop hiba - ESP/Nano lelassult` értesítést küld.
+- **Hardveres Watchdog**:
+  - **Arduino Nano (`<avr/wdt.h>`)**: `wdt_enable(WDTO_2S)` (2 mp timeout) a `setup()` végén, `wdt_reset()` minden `loop()` végén; boot-kor `MCUSR` ellenőrzés (`WDRF` esetén `WATCHDOG_RESET` soros napló).
+  - **ESP32-C3 (`<esp_task_wdt.h>`)**: 5 mp task watchdog (`esp_task_wdt_init(5, true)` / IDF5 `esp_task_wdt_reconfigure` + `esp_task_wdt_add(nullptr)`), `esp_task_wdt_reset()` minden `loop()` végén; boot-kor `esp_reset_reason()` ellenőrzés (`ESP_RST_TASK_WDT` esetén `WDT_RESET` napló).
 
 ---
 
@@ -364,7 +420,7 @@ FŐKÉPERNYŐ
       │    ├── Radio
       │    ├── Bizt. Hatar        (95.0C (FIX), csak olvasható)
       │    ├── NAPLO
-      │    ├── CHECK              (5 sor: NTP, Nano, Radio, Millis, Szerviz)
+      │    ├── CHECK              (6 sor: NTP, Nano, Radio, Millis, Szerviz, Loop)
       │    └── VISSZA
       ├── BEALLITAS
       │    ├── Celhofok           (16.0 - 26.0 °C, lépés: 0.5 °C)
@@ -549,7 +605,7 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
 │       ├── lcd.h                   # 2x20 I2C LCD + 0..5 állapot + 6..7 trend ikonok + 100ms refresh
 │       ├── menu.h                  # Menürendszer típusok és osztálydeklaráció
 │       ├── menu.cpp                # Főképernyő, almenük, TREND nézet, szerkesztés, 20s timeout
-│       └── main.cpp                # LM35, NRF24 master, MQTT TLS, NVS, NTP, trend & statisztika
+│       └── main.cpp                # LM35, nem-blokkoló NRF24 master, MQTT TLS, NVS, NTP, trend & statisztika
 ├── server/                         # Backend modulok
 │   ├── types.ts                    # V4 + alarm + heartbeat + trend TypeScript típusok
 │   ├── validation.ts               # Validáció és frissességi alapú parancsépítés
@@ -603,3 +659,5 @@ Indítsd el a rendszert pontosan ebben a sorrendben:
 | **Trend nyíl villog fel-le** | Túl rövid mintavétel / szenzor ugrál | Ellenőrizd, hogy a 20 perces puffer megvan-e (`TREND_BUFFER_SIZE = 20`, `TREND_SAMPLE_INTERVAL_MS = 60000`), ne 1 perces különbséget nézz. |
 | **Reggelre eltűnt a tegnapi max** | Ez nem hiba, boot volt éjszaka (áramkimaradás) | Ha áramkimaradás volt, a statisztika újraindul, ez normális (nincs éjféli automatikus nullázás). |
 | **Nem lehet kikapcsolni a szivattyút frontendről** | Szerviz kapcsoló BE van | Kapcsold KI a kapcsolót a kazánnál. |
+| **RELÉ HIBA, Kért BE, relé KI** | Beragadt / beégett érintkező, vagy szakadt vezeték a D7-en | Ellenőrizd a relét, cseréld ki, ne használd a rendszert hiba mellett. |
+| **`LOOP_SLOW` / `LOOP_FAULT`** | Blokkoló kód, NRF várakozás, WiFi szakadás | Ellenőrizd, hogy nincs-e `delay()` a `loop()`-ban, és nézd meg a soros logot / `CHECK` menüt. |

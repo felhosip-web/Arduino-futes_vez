@@ -1,16 +1,19 @@
 import { Lock } from 'lucide-react';
 import {
   OUTPUT_ITEMS,
+  type CommandAckState,
   type HeatingOutputs,
   type OutputKey,
   type PumpMode,
 } from '../types/heating';
+import { CommandAckBanner } from './CommandAckBanner';
 
 interface BoilerControlProps {
   outputs: HeatingOutputs;
   pumpMode: PumpMode;
   pendingKey: OutputKey | null;
   disabled?: boolean;
+  ackState?: CommandAckState;
   onToggleOutput: (key: OutputKey, nextVal: boolean) => Promise<void>;
 }
 
@@ -19,9 +22,11 @@ export function BoilerControl({
   pumpMode,
   pendingKey,
   disabled = false,
+  ackState,
   onToggleOutput,
 }: BoilerControlProps) {
   const isPumpAuto = pumpMode === 'auto';
+  const anyPending = pendingKey !== null || ackState?.status === 'pending';
 
   return (
     <section
@@ -44,7 +49,7 @@ export function BoilerControl({
           const isLockedByAuto = isPumpRow && isPumpAuto;
           const isLockedByService = Boolean(disabled);
           const isPending = pendingKey === item.key;
-          const rowDisabled = isLockedByAuto || isPending || isLockedByService;
+          const rowDisabled = isLockedByAuto || anyPending || isLockedByService;
 
           return (
             <button
@@ -64,7 +69,7 @@ export function BoilerControl({
                   : isOn
                     ? 'border-emerald-500/40 bg-emerald-950/30 hover:bg-emerald-950/45'
                     : 'border-slate-800 bg-slate-950/60 hover:border-slate-700 hover:bg-slate-800/70'
-              } ${isPending ? 'opacity-60' : ''}`}
+              } ${rowDisabled ? 'opacity-60' : ''}`}
             >
               <div className="min-w-0">
                 <div className="flex items-center gap-1.5 text-sm font-medium text-slate-100">
@@ -74,15 +79,17 @@ export function BoilerControl({
                   )}
                 </div>
                 <div className="mt-0.5 text-xs text-slate-400">
-                  {isLockedByService
-                    ? isPumpRow
-                      ? 'SZERVIZ - Nano vezérli'
-                      : 'Szerviz módban letiltva'
-                    : isLockedByAuto
-                      ? 'AUTO - Kazánvédelem vezérli'
-                      : isOn
-                        ? 'Bekapcsolva'
-                        : 'Kikapcsolva'}
+                  {isPending
+                    ? 'Folyamatban...'
+                    : isLockedByService
+                      ? isPumpRow
+                        ? 'SZERVIZ - Nano vezérli'
+                        : 'Szerviz módban letiltva'
+                      : isLockedByAuto
+                        ? 'AUTO - Kazánvédelem vezérli'
+                        : isOn
+                          ? 'Bekapcsolva'
+                          : 'Kikapcsolva'}
                 </div>
               </div>
 
@@ -102,6 +109,8 @@ export function BoilerControl({
           );
         })}
       </div>
+
+      <CommandAckBanner ackState={ackState} />
     </section>
   );
 }
