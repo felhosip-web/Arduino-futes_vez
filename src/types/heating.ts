@@ -85,6 +85,8 @@ export interface SensorLearnApiResponse {
   executedAt?: string;
   role?: SensorRoleKey;
   address?: string;
+  oldRole?: SensorRoleKey;
+  reassignedFrom?: SensorRoleKey;
   reason?: string;
   error?: string;
 }

@@ -76,11 +76,14 @@ A 4 db **DS18B20** hőmérséklet-szenzor közös **OneWire** buszon van a **D2*
 
 - **Boot felderítés és ellenőrzés**: Induláskor a Nano betölti a 4 szerephez (`eloremeno`, `visszatero`, `kazan`, `kulteri`) tartozó ROM címeket az **EEPROM**-ból (magic + verzió + checksum ellenőrzéssel), majd OneWire kereséssel összeveti a buszon lévő érzékelőkkel.
 - **Szenzorhiba / csere biztonság**: Ha az EEPROM üres, `< 4` szenzor található, vagy egy elmentett cím már nem szerepel a buszon (pl. hibás szenzor cseréje után), a rendszer **SOHA nem tippel index alapján**. Az érintett szerep **`ISMERETLEN`** állapotba kerül (`-127.0 °C`), a Nano `SYNC_FLAG_SENSOR_UNKNOWN` jelzést és `sensor_fail` riasztást küld, a biztonsági logika pedig bekapcsolva tartja a szivattyút.
-- **Tanítás LCD-ről (`BEALLITAS -> Szenzor Tanitas`)**:
-  - **`SZENZOR KERESES`**: kilistázza a buszon talált összes DS18B20 címet és aktuális hőmérsékletét (`01 28:FF.. 23.5C`).
-  - **`TANITAS` (10 mp melegítéses varázsló)**: szerepenként végigvezeti a felhasználót: melegítsd meg a kijelzett szenzort kézzel (**`> 2,0 °C`** emelkedés 10 mp alatt) → `[OK]` megjelenésekor rövid gombnyomással menthető EEPROM-ba (ellenőrző visszaolvasással), vagy ha nem melegedett, újrapróbálható.
-- **Tanítás Frontendről (`Szenzorok` kártya)**:
-  - A **`Tanítás indítása`** gombbal lekérdezi a buszt (`GET /api/heating/:id/sensor/scan`), majd szerepenként legördülő listából (**dropdown**) egyetlen kattintással elmenthető (`POST /api/heating/:id/sensor/learn`) — így **egyetlen kicserélt szenzor is** újratanítható a többi érintése nélkül. Opcionálisan böngészős **10 mp-es melegítéses segéd** is indítható.
+- **Tanítás 3 módon (`BEALLITAS -> Szenzor Tanitas` és `Szenzorok` kártya)**:
+  1. **Melegítéses tanítás (ESP32 LCD menü — `TANITAS`)**: a `SZENZOR KERESES` kilistázza a buszon talált szenzorokat, a `TANITAS` varázsló pedig szerepenként végigvezeti a felhasználót (`> 2,0 °C` melegedés `10 mp` alatt → `[OK]` rövid gombnyomásra EEPROM mentés).
+  2. **Kézi tanítás (ESP32 LCD menü — `KEZI TANITAS`, rotary encoderrel tekerve)**:
+     - Belépéskor automatikusan futtat egy `sensorScan`-t (ha `0 db`, `"NINCS SZENZOR!"` hibaüzenettel kilép; `< 4` szenzor esetén is használható).
+     - **1. lépcső (`SZEREP`)**: `Eloremeno / Visszatero / Kazan / Kulteri` kiválasztása.
+     - **2. lépcső (`CIM`)**: a 2×20 LCD-re optimalizálva a 8 byte-os `28:FF:XX:...` cím **utolsó 3 byte-ja** jelenik meg (pl. `12:AB:3F`), alatta az aktuális hőfokkal és az esetleges meglévő szereppel (`MAR: ...`, ütközésnél villogó `!` figyelmeztetéssel).
+     - **3. lépcső (`MENTES?` vagy dupla cím figyelmeztetés)**: normál esetben `5 mp`-es kétlépcsős megerősítés után küldi el a `sensorLearn` parancsot (max `3000 ms` `CMD_ACK`, `SENSOR_LEARN_BY_MENU`). **Dupla cím esetén** az ESP32 és a frontend is figyelmeztet (**„Már használatban — Csere vagy Mégse?”**, alapértelmezett a **`Mégse`**): az ESP32 külön képernyőn (`FIGYELEM! >MEGSE` / `>CSERE`, `Kazan->Elorem.?`), tekeréssel **`CSERE`** választása után `5 mp`-es **`BIZTOS? CSERE!`** kétlépcsős megerősítéssel hajtja végre (`ATTEVE!`, `SENSOR_REASSIGNED_BY_MENU`), és a régi szerep **`ISMERETLEN`** állapotba kerül (`STATUS`-ban és EEPROM-ban is). Az inaktivitási `20 mp` timeout változatlanul él.
+  3. **Kézi tanítás Frontendről (`Szenzorok` kártya)**: a **`Tanítás indítása`** (`GET /api/heating/:id/sensor/scan`) után legördülő listából (**dropdown**) szerepenként egy kattintással menthető (`POST /api/heating/:id/sensor/learn`), vagy elindítható a böngészős **10 mp-es melegítéses segéd** is — így **egyetlen kicserélt szenzor is** újratanítható a többi érintése nélkül. Ha a választott cím már egy másik szerephez tartozik, **`allowReassign`** megerősítő ablak jelenik meg (`[Áthelyezés]` / `[Mégse]`, alapértelmezetten a **`Mégse`** van fókuszban; `allowReassign: false` esetén a backend `HTTP 409` `ADDRESS_ALREADY_USED` választ ad `oldRole`-lal). Csere után a korábbi szerep **`ISMERETLEN`** lesz.
 
 ### 2.3 ESP32-C3 (szobában, MASTER / Gateway)
 
@@ -451,7 +454,10 @@ FŐKÉPERNYŐ
       │    ├── Riasztas           (BE / KI)
       │    ├── Ping               (5s / 10s / 15s / 20s / 25s / 30s)
       │    ├── Manual Futes       (BE / KI)
-      │    ├── Szenzor Tanitas    (SZENZOR KERESES / TANITAS 10mp varázsló)
+      │    ├── Szenzor Tanitas
+      │    │    ├── SZENZOR KERESES  (Buszon talált DS18B20 címek + hőfokok)
+      │    │    ├── TANITAS          (10 mp melegítéses varázsló, > 2.0 °C)
+      │    │    └── KEZI TANITAS     (Szerep -> Cím utolsó 3 byte -> Megerősítés)
       │    ├── Gyari visszaallit  (Tartsd 3mp-ig!)
       │    └── VISSZA
       └── KIMENETEK

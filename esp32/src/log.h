@@ -24,8 +24,8 @@ struct LogEntry {
     uint32_t uptimeSec;
     char     timestamp[20];
     uint8_t  level;
-    char     code[16];
-    char     message[48];
+    char     code[32];
+    char     message[64];
 };
 
 class Logger {

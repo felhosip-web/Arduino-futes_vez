@@ -275,6 +275,7 @@ export function createHeatingRouter(
     const body = req.body as Record<string, unknown> | undefined;
     const rawRole = typeof body?.role === 'string' ? body.role.trim() : '';
     const rawAddress = typeof body?.address === 'string' ? body.address.trim() : '';
+    const allowReassign = body?.allowReassign === true;
 
     if (!(VALID_SENSOR_ROLES as readonly string[]).includes(rawRole)) {
       res.status(400).json({
@@ -298,8 +299,32 @@ export function createHeatingRouter(
       const result = await withDeviceLock(id, async () => {
         const current = bridge.getDeviceState(id);
         if (!hasValidEspStatus(current)) {
-          return { conflict: true as const };
+          return { noStatus: true as const };
         }
+
+        const sensorsMap = current.lastStatus?.sensors;
+        let conflictRole: SensorRoleKey | null = null;
+        if (sensorsMap) {
+          for (const candidateRole of VALID_SENSOR_ROLES) {
+            if (candidateRole === role) continue;
+            const candidateAddr = sensorsMap[candidateRole]?.address;
+            if (
+              typeof candidateAddr === 'string' &&
+              candidateAddr.trim().toUpperCase() === normalizedAddr
+            ) {
+              conflictRole = candidateRole;
+              break;
+            }
+          }
+        }
+
+        if (conflictRole && !allowReassign) {
+          return {
+            noStatus: false as const,
+            duplicateRole: conflictRole,
+          };
+        }
+
         const meta = bridge.generateCmdId();
         const waiter = bridge.createCommandAckWaiter(meta.cmdId, 3500);
         try {
@@ -315,14 +340,23 @@ export function createHeatingRouter(
           throw err;
         }
         return {
-          conflict: false as const,
+          noStatus: false as const,
+          duplicateRole: conflictRole,
           cmdId: meta.cmdId,
           ackPromise: waiter.promise,
         };
       });
 
-      if (result.conflict) {
+      if (result.noStatus) {
         res.status(409).json({ error: 'Nincs még ESP állapot' });
+        return;
+      }
+
+      if (!result.ackPromise) {
+        res.status(409).json({
+          error: 'ADDRESS_ALREADY_USED',
+          oldRole: result.duplicateRole,
+        });
         return;
       }
 
@@ -337,11 +371,19 @@ export function createHeatingRouter(
         return;
       }
 
-      bridge.logBackendEvent(
-        'INFO',
-        'SENSOR_LEARN',
-        `${id} role=${role} address=${normalizedAddr} (cmdId=${ack.cmdId})`
-      );
+      if (result.duplicateRole && allowReassign) {
+        bridge.logBackendEvent(
+          'INFO',
+          'SENSOR_REASSIGNED',
+          `${id} old=${result.duplicateRole} new=${role} address=${normalizedAddr} (cmdId=${ack.cmdId})`
+        );
+      } else {
+        bridge.logBackendEvent(
+          'INFO',
+          'SENSOR_LEARN',
+          `${id} role=${role} address=${normalizedAddr} (cmdId=${ack.cmdId})`
+        );
+      }
 
       res.json({
         ok: true,
@@ -350,6 +392,9 @@ export function createHeatingRouter(
         ...(ack.executedAt !== undefined ? { executedAt: ack.executedAt } : {}),
         role,
         address: normalizedAddr,
+        ...(result.duplicateRole && allowReassign
+          ? { reassignedFrom: result.duplicateRole }
+          : {}),
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'MQTT küldési hiba.';

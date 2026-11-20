@@ -137,7 +137,8 @@ enum MenuState : uint8_t {
     MENU_EDIT,         // Érték szerkesztés (BEALLITAS pont)
     MENU_SENSOR_MENU,  // BEALLITAS -> SZENZOR TANITAS almenü
     MENU_SENSOR_SCAN,  // SZENZOR KERESES néző
-    MENU_SENSOR_TEACH  // TANITAS (10 mp melegítéses varázsló)
+    MENU_SENSOR_TEACH, // TANITAS (10 mp melegítéses varázsló)
+    MENU_SENSOR_MANUAL // KEZI TANITAS (Szerep -> Cím -> Megerősítés)
 };
 
 enum MenuItemType : uint8_t {
@@ -203,6 +204,7 @@ public:
     void drawTrendViewer();
     void drawSensorScanViewer();
     void drawSensorTeachViewer(uint32_t now);
+    void drawSensorManualViewer(uint32_t now);
 
 private:
     enum TeachPhase : uint8_t {
@@ -211,6 +213,16 @@ private:
         TEACH_PHASE_CONFIRM,
         TEACH_PHASE_SAVING,
         TEACH_PHASE_TIMEOUT
+    };
+
+    enum ManualTeachPhase : uint8_t {
+        MANUAL_PHASE_SCANNING = 0,
+        MANUAL_PHASE_ROLE,
+        MANUAL_PHASE_ADDR,
+        MANUAL_PHASE_DUPLICATE,
+        MANUAL_PHASE_REASSIGN_CONFIRM,
+        MANUAL_PHASE_CONFIRM,
+        MANUAL_PHASE_SAVING
     };
 
     HeatingLcd*   _lcd   = nullptr;
@@ -246,6 +258,18 @@ private:
     float      _teachBaseTemp[MAX_DISCOVERED_SENSORS]    = { 0 };
     uint8_t    _teachFoundAddr[8]    = { 0 };
 
+    // Kézi szenzor tanítás állapota (`KEZI TANITAS`)
+    ManualTeachPhase _manualPhase            = MANUAL_PHASE_SCANNING;
+    uint8_t          _manualRole             = 0;
+    uint8_t          _manualAddrIdx          = 0;
+    int8_t           _manualReassignFromRole = -1;
+    bool             _manualReassignChoice   = false; // false = MEGSE (alapértelmezett), true = CSERE
+    uint32_t         _manualScanStartMs      = 0;
+    uint32_t         _manualConfirmStartMs   = 0;
+    uint32_t         _manualSaveStartMs      = 0;
+    uint32_t         _lastManualBlinkMs      = 0;
+    bool             _manualBlinkOn          = true;
+
     uint32_t _lastActivityMs  = 0;
     uint32_t _lastMenuDrawMs  = 0;
     uint32_t _lastMainDrawMs  = 0;
@@ -275,6 +299,10 @@ private:
     void toggleOutput(uint8_t itemIndex, uint32_t now);
     void navigateBack(uint32_t now);
     void updateSensorTeaching(uint32_t now);
+    void updateSensorManualTeaching(uint32_t now);
+
+    int8_t findAssignedRoleForAddress(const uint8_t addr[8]) const;
+    static void formatAddressLast3Bytes(const uint8_t addr[8], char* buf, size_t bufLen);
 
     void formatMenuItemValue(const MenuItem& item, char* buf, size_t bufLen) const;
     void formatEditValueString(const MenuItem& item, char* buf, size_t bufLen) const;

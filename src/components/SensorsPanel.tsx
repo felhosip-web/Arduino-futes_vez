@@ -42,6 +42,14 @@ interface StoredScanCache {
   found: SensorScanItem[];
 }
 
+interface ReassignConfirmState {
+  oldRole: SensorRoleKey;
+  oldLabel: string;
+  newRole: SensorRoleKey;
+  newLabel: string;
+  address: string;
+}
+
 function loadCachedScan(): StoredScanCache {
   if (typeof window === 'undefined') {
     return { scannedAt: 0, found: [] };
@@ -119,6 +127,8 @@ export function SensorsPanel({ status, onSensorLearned }: SensorsPanelProps) {
   const [savingLearn, setSavingLearn] = useState<boolean>(false);
   const [scanError, setScanError] = useState<string | null>(null);
   const [learnFeedback, setLearnFeedback] = useState<string | null>(null);
+  const [reassignConfirm, setReassignConfirm] = useState<ReassignConfirmState | null>(null);
+  const cancelReassignButtonRef = useRef<HTMLButtonElement | null>(null);
 
   // 10 másodperces melegítéses azonosítás állapot
   const [heatRole, setHeatRole] = useState<SensorRoleKey>('eloremeno');
@@ -137,19 +147,37 @@ export function SensorsPanel({ status, onSensorLearned }: SensorsPanelProps) {
     [sensorMap, status.sensorUnknown]
   );
 
-  // Szerepekhez jelenleg rendelt ROM címek gyors visszakeresése
-  const assignedRoleByAddr = useMemo(() => {
-    const map = new Map<string, string>();
+  // Szerepekhez jelenleg rendelt ROM címek gyors visszakeresése (akkor is, ha jelenleg !ok)
+  const assignedRoleInfoByAddr = useMemo(() => {
+    const map = new Map<string, { key: SensorRoleKey; label: string }>();
     if (sensorMap) {
       for (const { key, label } of SENSOR_ROLES) {
         const addr = sensorMap[key]?.address;
-        if (addr && sensorMap[key]?.ok) {
-          map.set(addr, label);
+        if (addr) {
+          map.set(addr.trim().toUpperCase(), { key, label });
         }
       }
     }
     return map;
   }, [sensorMap]);
+
+  // Dupla cím megerősítő ablak megnyitásakor a "Mégse" gomb kapja az alapértelmezett fókuszt
+  useEffect(() => {
+    if (!reassignConfirm) return;
+    const focusTimer = window.setTimeout(() => {
+      cancelReassignButtonRef.current?.focus();
+    }, 0);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setReassignConfirm(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [reassignConfirm]);
 
   // Ha nincs még kézi cím kiválasztva, ajánljuk fel a választott szerephez vagy az első keresett címet
   useEffect(() => {
@@ -162,10 +190,12 @@ export function SensorsPanel({ status, onSensorLearned }: SensorsPanelProps) {
       if (currentForRole && foundSensors.some((s) => s.address === currentForRole)) {
         return currentForRole;
       }
-      const unassigned = foundSensors.find((s) => !assignedRoleByAddr.has(s.address));
+      const unassigned = foundSensors.find(
+        (s) => !assignedRoleInfoByAddr.has(s.address.trim().toUpperCase())
+      );
       return unassigned?.address ?? foundSensors[0]?.address ?? '';
     });
-  }, [assignedRoleByAddr, foundSensors, manualRole, sensorMap]);
+  }, [assignedRoleInfoByAddr, foundSensors, manualRole, sensorMap]);
 
   const stopHeatHelper = useCallback(() => {
     if (heatTimerRef.current !== null) {
@@ -277,11 +307,33 @@ export function SensorsPanel({ status, onSensorLearned }: SensorsPanelProps) {
   };
 
   const submitSensorLearn = useCallback(
-    async (role: SensorRoleKey, addressRaw: string): Promise<boolean> => {
+    async (
+      role: SensorRoleKey,
+      addressRaw: string,
+      allowReassign = false
+    ): Promise<boolean> => {
       const address = addressRaw.trim().toUpperCase();
       if (!address) {
         setScanError('Válassz egy DS18B20 címet a legördülő menüből a mentés előtt.');
         return false;
+      }
+
+      const roleLabel = SENSOR_ROLES.find((r) => r.key === role)?.label ?? role;
+
+      if (!allowReassign) {
+        const conflict = assignedRoleInfoByAddr.get(address);
+        if (conflict && conflict.key !== role) {
+          setScanError(null);
+          setLearnFeedback(null);
+          setReassignConfirm({
+            oldRole: conflict.key,
+            oldLabel: conflict.label,
+            newRole: role,
+            newLabel: roleLabel,
+            address,
+          });
+          return false;
+        }
       }
 
       setSavingLearn(true);
@@ -292,9 +344,27 @@ export function SensorsPanel({ status, onSensorLearned }: SensorsPanelProps) {
         const res = await fetch(`${API_URL}/api/heating/${DEVICE_ID}/sensor/learn`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ role, address }),
+          body: JSON.stringify({ role, address, allowReassign }),
         });
         const body = (await res.json().catch(() => null)) as SensorLearnApiResponse | null;
+
+        if (
+          res.status === 409 &&
+          body?.error === 'ADDRESS_ALREADY_USED' &&
+          body.oldRole &&
+          !allowReassign
+        ) {
+          const oldLabel = SENSOR_ROLES.find((r) => r.key === body.oldRole)?.label ?? body.oldRole;
+          setReassignConfirm({
+            oldRole: body.oldRole,
+            oldLabel,
+            newRole: role,
+            newLabel: roleLabel,
+            address,
+          });
+          return false;
+        }
+
         if (!res.ok || !body?.acked) {
           const reason =
             body?.reason === 'NRF_TIMEOUT' || body?.reason === 'ACK_TIMEOUT'
@@ -305,10 +375,18 @@ export function SensorsPanel({ status, onSensorLearned }: SensorsPanelProps) {
           throw new Error(reason);
         }
 
-        const roleLabel = SENSOR_ROLES.find((r) => r.key === role)?.label ?? role;
-        setLearnFeedback(
-          `${roleLabel} (${role}) sikeresen hozzárendelve és elmentve EEPROM-ba: ${address}`
-        );
+        if (body.reassignedFrom) {
+          const oldLabel =
+            SENSOR_ROLES.find((r) => r.key === body.reassignedFrom)?.label ??
+            body.reassignedFrom;
+          setLearnFeedback(
+            `${roleLabel} (${role}) hozzárendelve és elmentve (${address}). A korábbi ${oldLabel} szerep ISMERETLEN lett.`
+          );
+        } else {
+          setLearnFeedback(
+            `${roleLabel} (${role}) sikeresen hozzárendelve és elmentve EEPROM-ba: ${address}`
+          );
+        }
         await onSensorLearned?.();
         return true;
       } catch (err) {
@@ -320,8 +398,15 @@ export function SensorsPanel({ status, onSensorLearned }: SensorsPanelProps) {
         setSavingLearn(false);
       }
     },
-    [onSensorLearned]
+    [assignedRoleInfoByAddr, onSensorLearned]
   );
+
+  const handleConfirmReassign = async () => {
+    if (!reassignConfirm || savingLearn) return;
+    const pending = reassignConfirm;
+    setReassignConfirm(null);
+    await submitSensorLearn(pending.newRole, pending.address, true);
+  };
 
   const handleStartHeatHelper = async () => {
     stopHeatHelper();
@@ -674,12 +759,14 @@ export function SensorsPanel({ status, onSensorLearned }: SensorsPanelProps) {
                       <>
                         <option value="">— Válassz DS18B20 szenzorcímet —</option>
                         {foundSensors.map((item) => {
-                          const assignedLabel = assignedRoleByAddr.get(item.address);
+                          const assignedInfo = assignedRoleInfoByAddr.get(
+                            item.address.trim().toUpperCase()
+                          );
                           return (
                             <option key={item.address} value={item.address}>
                               {item.address}
                               {item.temp !== null ? ` (${item.temp.toFixed(1)} °C)` : ''}
-                              {assignedLabel ? ` — ${assignedLabel}` : ''}
+                              {assignedInfo ? ` — ${assignedInfo.label}` : ''}
                             </option>
                           );
                         })}
@@ -808,7 +895,10 @@ export function SensorsPanel({ status, onSensorLearned }: SensorsPanelProps) {
             ) : (
               <div className="grid gap-2 sm:grid-cols-2">
                 {foundSensors.map((sensor) => {
-                  const assignedLabel = assignedRoleByAddr.get(sensor.address);
+                  const assignedInfo = assignedRoleInfoByAddr.get(
+                    sensor.address.trim().toUpperCase()
+                  );
+                  const assignedLabel = assignedInfo?.label;
                   const baseTemp = heatBaseline[sensor.address];
                   const delta =
                     typeof baseTemp === 'number' && typeof sensor.temp === 'number'
@@ -852,6 +942,67 @@ export function SensorsPanel({ status, onSensorLearned }: SensorsPanelProps) {
                 })}
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Dupla cím figyelmeztető és áthelyezést megerősítő ablak (alapértelmezetten a Mégse van fókuszban) */}
+      {reassignConfirm && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reassign-dialog-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm"
+        >
+          <div className="w-full max-w-md rounded-xl border border-amber-500/70 bg-slate-900 p-6 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="rounded-lg border border-amber-500/50 bg-amber-950/60 p-2.5 text-amber-400">
+                <AlertTriangle className="h-5 w-5" aria-hidden="true" />
+              </div>
+              <div className="min-w-0">
+                <h3
+                  id="reassign-dialog-title"
+                  className="text-base font-bold text-slate-100"
+                >
+                  Cím már használatban van
+                </h3>
+                <p className="mt-1 font-mono text-xs text-amber-300">
+                  {reassignConfirm.address}
+                </p>
+              </div>
+            </div>
+
+            <p className="mt-4 text-sm leading-relaxed text-slate-200">
+              Ez a cím már a{' '}
+              <span className="font-semibold text-amber-300">{reassignConfirm.oldLabel}</span>{' '}
+              szerephez tartozik. Áthelyezed az{' '}
+              <span className="font-semibold text-orange-300">{reassignConfirm.newLabel}</span>
+              -re? A{' '}
+              <span className="font-semibold text-red-300">
+                {reassignConfirm.oldLabel} ISMERETLEN lesz
+              </span>
+              .
+            </p>
+
+            <div className="mt-6 flex flex-wrap justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => void handleConfirmReassign()}
+                disabled={savingLearn}
+                className="inline-flex min-h-[44px] items-center justify-center rounded-lg border border-amber-500/70 bg-amber-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-amber-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 disabled:opacity-50"
+              >
+                {savingLearn ? 'Áthelyezés...' : 'Áthelyezés'}
+              </button>
+              <button
+                ref={cancelReassignButtonRef}
+                type="button"
+                autoFocus
+                onClick={() => setReassignConfirm(null)}
+                className="inline-flex min-h-[44px] items-center justify-center rounded-lg border border-slate-600 bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-400"
+              >
+                Mégse
+              </button>
+            </div>
           </div>
         </div>
       )}

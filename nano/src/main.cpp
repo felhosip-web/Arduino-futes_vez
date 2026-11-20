@@ -464,6 +464,21 @@ bool saveSensorAddressToEeprom(uint8_t role, const uint8_t newAddr[8]) {
         return false;
     }
 
+    for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
+        if (r != role &&
+            (roleAssignedMask & (1U << r)) != 0 &&
+            memcmp(sensorAddr[r], newAddr, 8) == 0) {
+            memset(sensorAddr[r], 0, 8);
+            roleAssignedMask &= static_cast<uint8_t>(~(1U << r));
+            if (r == SENSOR_ROLE_ELOREMENO)       latestEloremeno  = SENSOR_DISCONNECTED_VAL;
+            else if (r == SENSOR_ROLE_VISSZATERO) latestVisszatero = SENSOR_DISCONNECTED_VAL;
+            else if (r == SENSOR_ROLE_KAZAN)      latestKazan      = SENSOR_DISCONNECTED_VAL;
+            else if (r == SENSOR_ROLE_KULTERI)    latestKulteri    = SENSOR_DISCONNECTED_VAL;
+            Serial.print(F("[SENSOR] Regi szerep torolve (csere): "));
+            Serial.println(sensorRoleToKey(r));
+        }
+    }
+
     memcpy(sensorAddr[role], newAddr, 8);
     roleAssignedMask |= static_cast<uint8_t>(1U << role);
 

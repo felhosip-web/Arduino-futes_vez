@@ -60,6 +60,26 @@ const char* pumpSensorLabel(uint8_t ps) {
     if (ps == PUMP_SENSOR_MAX)       return "MAX";
     return "KAZAN";
 }
+
+const char* sensorRoleShortLabel(uint8_t role) {
+    switch (role) {
+        case SENSOR_ROLE_ELOREMENO:  return "Eloremeno";
+        case SENSOR_ROLE_VISSZATERO: return "Visszat.";
+        case SENSOR_ROLE_KAZAN:      return "Kazan";
+        case SENSOR_ROLE_KULTERI:    return "Kulteri";
+        default:                     return "Ismeretl.";
+    }
+}
+
+const char* sensorRoleCompactLabel(uint8_t role) {
+    switch (role) {
+        case SENSOR_ROLE_ELOREMENO:  return "Elorem.";
+        case SENSOR_ROLE_VISSZATERO: return "Vissz.";
+        case SENSOR_ROLE_KAZAN:      return "Kazan";
+        case SENSOR_ROLE_KULTERI:    return "Kulteri";
+        default:                     return "Ism.";
+    }
+}
 } // namespace
 
 // ============================================================================
@@ -181,6 +201,7 @@ void MenuController::buildItemsForState(MenuState targetState) {
         case MENU_SENSOR_MENU:
             _items[_itemCount++] = { "SZENZOR KERESES", ITEM_SUBMENU,     nullptr, 0, 0, 0, MENU_SENSOR_SCAN };
             _items[_itemCount++] = { "TANITAS",         ITEM_SUBMENU,     nullptr, 0, 0, 0, MENU_SENSOR_TEACH };
+            _items[_itemCount++] = { "KEZI TANITAS",    ITEM_SUBMENU,     nullptr, 0, 0, 0, MENU_SENSOR_MANUAL };
             _items[_itemCount++] = { "VISSZA",          ITEM_ACTION_BACK, nullptr, 0, 0, 0, MENU_BEALLITAS };
             break;
 
@@ -203,6 +224,7 @@ void MenuController::buildItemsForState(MenuState targetState) {
         case MENU_EDIT:
         case MENU_SENSOR_SCAN:
         case MENU_SENSOR_TEACH:
+        case MENU_SENSOR_MANUAL:
         default:
             break;
     }
@@ -254,6 +276,26 @@ void MenuController::enterSubmenu(MenuState sub, uint8_t initialCursor, uint32_t
         _seenLearnSeq        = _state ? _state->learnCompletedSeq : 0;
         _lastActivityMs      = now;
         _menuDirty           = true;
+        return;
+    }
+    if (sub == MENU_SENSOR_MANUAL) {
+        _manualPhase            = MANUAL_PHASE_SCANNING;
+        _manualRole             = SENSOR_ROLE_ELOREMENO;
+        _manualAddrIdx          = 0;
+        _manualReassignFromRole = -1;
+        _manualReassignChoice   = false;
+        _manualScanStartMs      = now;
+        _manualConfirmStartMs   = now;
+        _manualSaveStartMs      = now;
+        _lastManualBlinkMs      = now;
+        _manualBlinkOn          = true;
+        _seenScanSeq            = _state ? _state->scanCompletedSeq : 0;
+        _seenLearnSeq           = _state ? _state->learnCompletedSeq : 0;
+        _lastActivityMs         = now;
+        _menuDirty              = true;
+        if (_callbacks.onRequestSensorScan) {
+            _callbacks.onRequestSensorScan();
+        }
         return;
     }
     buildItemsForState(sub);
@@ -552,6 +594,31 @@ void MenuController::navigateBack(uint32_t now) {
             enterSubmenu(MENU_SENSOR_MENU, 1, now);
             break;
 
+        case MENU_SENSOR_MANUAL:
+            if (_manualPhase == MANUAL_PHASE_ADDR) {
+                _manualPhase            = MANUAL_PHASE_ROLE;
+                _manualReassignFromRole = -1;
+                _manualReassignChoice   = false;
+                _manualBlinkOn          = true;
+                _lastManualBlinkMs      = now;
+                _menuDirty              = true;
+            } else if (_manualPhase == MANUAL_PHASE_DUPLICATE ||
+                       _manualPhase == MANUAL_PHASE_REASSIGN_CONFIRM ||
+                       _manualPhase == MANUAL_PHASE_CONFIRM) {
+                _manualPhase            = MANUAL_PHASE_ADDR;
+                _manualReassignFromRole = -1;
+                _manualReassignChoice   = false;
+                _manualBlinkOn          = true;
+                _lastManualBlinkMs      = now;
+                _menuDirty              = true;
+            } else if (_manualPhase == MANUAL_PHASE_SAVING) {
+                // Mentés közben ne lépjen ki a CMD_ACK előtt
+                break;
+            } else {
+                enterSubmenu(MENU_SENSOR_MENU, 2, now);
+            }
+            break;
+
         case MENU_SENSOR_MENU:
             enterSubmenu(MENU_BEALLITAS, 10, now);
             break;
@@ -808,6 +875,145 @@ void MenuController::handleInput(int8_t encSteps,
         return;
     }
 
+    // 4g. KEZI TANITAS 3 lépcsős kézi szenzor tanítás (`MENU_SENSOR_MANUAL`)
+    if (_menuState == MENU_SENSOR_MANUAL) {
+        if (_manualPhase == MANUAL_PHASE_SCANNING || _manualPhase == MANUAL_PHASE_SAVING) {
+            return;
+        }
+
+        if (_manualPhase == MANUAL_PHASE_ROLE) {
+            if (steps != 0) {
+                _lastActivityMs = now;
+                int16_t next = static_cast<int16_t>(_manualRole) + steps;
+                while (next < 0) next += SENSOR_ROLE_COUNT;
+                _manualRole = static_cast<uint8_t>(next % SENSOR_ROLE_COUNT);
+                _menuDirty  = true;
+            }
+            if (shortPress) {
+                _lastActivityMs    = now;
+                _manualAddrIdx     = 0;
+                _manualBlinkOn     = true;
+                _lastManualBlinkMs = now;
+                _manualPhase       = MANUAL_PHASE_ADDR;
+                _menuDirty         = true;
+            }
+            return;
+        }
+
+        if (_manualPhase == MANUAL_PHASE_ADDR) {
+            uint8_t cnt = _state->scanFoundCount;
+            if (cnt == 0) {
+                enterSubmenu(MENU_SENSOR_MENU, 2, now);
+                showErrorBanner("NINCS SZENZOR!", "Ellenorizd a buszt", 2000);
+                return;
+            }
+            if (steps != 0) {
+                _lastActivityMs = now;
+                int16_t next = static_cast<int16_t>(_manualAddrIdx) + steps;
+                while (next < 0) next += cnt;
+                _manualAddrIdx     = static_cast<uint8_t>(next % cnt);
+                _manualBlinkOn     = true;
+                _lastManualBlinkMs = now;
+                _menuDirty         = true;
+            }
+            if (shortPress) {
+                _lastActivityMs = now;
+                int8_t assignedRole = findAssignedRoleForAddress(_state->scanFound[_manualAddrIdx].address);
+                if (assignedRole >= 0 && assignedRole != static_cast<int8_t>(_manualRole)) {
+                    // Dupla cím: alapértelmezett a MEGSE, ne írjuk felül csendben!
+                    _manualReassignFromRole = assignedRole;
+                    _manualReassignChoice   = false;
+                    _manualBlinkOn          = true;
+                    _lastManualBlinkMs      = now;
+                    _manualPhase            = MANUAL_PHASE_DUPLICATE;
+                } else {
+                    _manualReassignFromRole = -1;
+                    _manualReassignChoice   = false;
+                    _manualConfirmStartMs   = now;
+                    _manualPhase            = MANUAL_PHASE_CONFIRM;
+                }
+                _menuDirty = true;
+            }
+            return;
+        }
+
+        if (_manualPhase == MANUAL_PHASE_DUPLICATE) {
+            if (steps != 0) {
+                _lastActivityMs = now;
+                if ((steps & 1) != 0) {
+                    _manualReassignChoice = !_manualReassignChoice;
+                    _menuDirty            = true;
+                }
+                return;
+            }
+            if (shortPress) {
+                _lastActivityMs = now;
+                if (!_manualReassignChoice) {
+                    // MEGSE: nem ment, nem logol, visszalép a 2. lépcsőre
+                    _manualReassignFromRole = -1;
+                    _manualBlinkOn          = true;
+                    _lastManualBlinkMs      = now;
+                    _manualPhase            = MANUAL_PHASE_ADDR;
+                    _menuDirty              = true;
+                } else {
+                    // CSERE: tovább a 5 mp-es kétlépcsős megerősítésre
+                    _manualConfirmStartMs = now;
+                    _manualPhase          = MANUAL_PHASE_REASSIGN_CONFIRM;
+                    _menuDirty            = true;
+                }
+            }
+            return;
+        }
+
+        if (_manualPhase == MANUAL_PHASE_CONFIRM || _manualPhase == MANUAL_PHASE_REASSIGN_CONFIRM) {
+            if (steps != 0) {
+                // Tekerésre visszalép megerősítés nélkül, nem ment, nem logol
+                _lastActivityMs         = now;
+                _manualReassignFromRole = -1;
+                _manualReassignChoice   = false;
+                _manualBlinkOn          = true;
+                _lastManualBlinkMs      = now;
+                _manualPhase            = MANUAL_PHASE_ADDR;
+                _menuDirty              = true;
+                return;
+            }
+            if (shortPress) {
+                _lastActivityMs = now;
+                // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+                if (static_cast<uint32_t>(now - _manualConfirmStartMs) < 5000UL &&
+                    _manualAddrIdx < _state->scanFoundCount) {
+                    _manualSaveStartMs = now;
+                    _seenLearnSeq      = _state->learnCompletedSeq;
+                    _manualPhase       = MANUAL_PHASE_SAVING;
+                    _menuDirty         = true;
+                    if (_callbacks.onRequestSensorLearn) {
+                        _callbacks.onRequestSensorLearn(_manualRole, _state->scanFound[_manualAddrIdx].address);
+                    }
+                    if (!_state->learnInProgress && _state->learnCompletedSeq == _seenLearnSeq) {
+                        _manualPhase            = MANUAL_PHASE_ADDR;
+                        _manualReassignFromRole = -1;
+                        _manualReassignChoice   = false;
+                        _manualBlinkOn          = true;
+                        _lastManualBlinkMs      = now;
+                        _menuDirty              = true;
+                        logEvent(LOG_WARN, "SENSOR_LEARN_FAIL", "Kezi tanitas nem indithato");
+                        showErrorBanner("HIBA! Probald ujra", "NRF foglalt", 2000);
+                    }
+                } else {
+                    _manualPhase            = MANUAL_PHASE_ADDR;
+                    _manualReassignFromRole = -1;
+                    _manualReassignChoice   = false;
+                    _manualBlinkOn          = true;
+                    _lastManualBlinkMs      = now;
+                    _menuDirty              = true;
+                }
+                return;
+            }
+            return;
+        }
+        return;
+    }
+
     // 5. Lista navigáció (`MENU_MAIN`, `MENU_FOKOK`, `MENU_STATUS`, `MENU_BEALLITAS`, `MENU_KIMENETEK`, `MENU_SENSOR_MENU`)
     if (steps != 0 && _itemCount > 0) {
         _lastActivityMs = now;
@@ -901,16 +1107,21 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
     if (_menuState == MENU_SENSOR_TEACH) {
         _lastActivityMs = now;
         updateSensorTeaching(now);
+    } else if (_menuState == MENU_SENSOR_MANUAL) {
+        // A 20 mp-es inaktivitási timeout KEZI TANITAS közben aktív marad
+        updateSensorManualTeaching(now);
     }
 
     // 2. 20 mp tétlenség ellenőrzése: vissza a főképernyőre, félbehagyott szerkesztés eldobva
     // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
     if (_menuState != MENU_HOME) {
         if (static_cast<uint32_t>(now - _lastActivityMs) >= MENU_TIMEOUT_MS) {
-            _trendConfirmActive = false;
-            _menuState          = MENU_HOME;
-            _mainDirty          = true;
-            _lastMainDrawMs     = 0;
+            _trendConfirmActive     = false;
+            _manualReassignFromRole = -1;
+            _manualReassignChoice   = false;
+            _menuState              = MENU_HOME;
+            _mainDirty              = true;
+            _lastMainDrawMs         = 0;
             logEvent(LOG_INFO, "MENU_TIMEOUT", "Menu 20s inaktivitas timeout");
         }
     }
@@ -946,7 +1157,8 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
     // 5. Menü LCD frissítése 100ms-enként, ha változott (vagy lekérdező/napló/check/trend/tanítás menüben 1mp-enként)
     if (_menuState == MENU_FOKOK || _menuState == MENU_STATUS || _menuState == MENU_LOGS ||
         _menuState == MENU_CHECK || _menuState == MENU_TREND ||
-        _menuState == MENU_SENSOR_SCAN || _menuState == MENU_SENSOR_TEACH) {
+        _menuState == MENU_SENSOR_SCAN || _menuState == MENU_SENSOR_TEACH ||
+        _menuState == MENU_SENSOR_MANUAL) {
         // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
         if (static_cast<uint32_t>(now - _lastMainDrawMs) >= LCD_MAIN_REFRESH_MS) {
             _lastMainDrawMs = now;
@@ -970,6 +1182,8 @@ void MenuController::update(uint32_t now, bool alarmBlinkPhase) {
             drawSensorScanViewer();
         } else if (_menuState == MENU_SENSOR_TEACH) {
             drawSensorTeachViewer(now);
+        } else if (_menuState == MENU_SENSOR_MANUAL) {
+            drawSensorManualViewer(now);
         } else {
             drawMenu();
         }
@@ -1122,7 +1336,7 @@ void MenuController::drawLogViewer() {
         return;
     }
 
-    char line1[24];
+    char line1[40];
     char line2[24];
     snprintf(line1, sizeof(line1), "%c %s", Logger::levelToShortChar(entry.level), entry.code);
     snprintf(line2, sizeof(line2), "%.20s", entry.message);
@@ -1421,6 +1635,271 @@ void MenuController::drawSensorTeachViewer(uint32_t now) {
             break;
     }
 
+    _lcd->printLines(line1, line2);
+}
+
+int8_t MenuController::findAssignedRoleForAddress(const uint8_t addr[8]) const {
+    if (!_state || !addr || !isDeviceAddressNonZero(addr)) return -1;
+    for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
+        if (_state->sensors[r].assigned && memcmp(_state->sensors[r].address, addr, 8) == 0) {
+            return static_cast<int8_t>(r);
+        }
+    }
+    return -1;
+}
+
+void MenuController::formatAddressLast3Bytes(const uint8_t addr[8], char* buf, size_t bufLen) {
+    if (!buf || bufLen == 0) return;
+    if (!addr) {
+        buf[0] = '\0';
+        return;
+    }
+    snprintf(buf, bufLen, "%02X:%02X:%02X", addr[5], addr[6], addr[7]);
+}
+
+void MenuController::updateSensorManualTeaching(uint32_t now) {
+    if (!_state) return;
+
+    switch (_manualPhase) {
+        case MANUAL_PHASE_SCANNING: {
+            if (_state->scanCompletedSeq != _seenScanSeq) {
+                _seenScanSeq = _state->scanCompletedSeq;
+                if (_state->scanLastOk && _state->scanFoundCount > 0) {
+                    _manualPhase       = MANUAL_PHASE_ROLE;
+                    _manualRole        = SENSOR_ROLE_ELOREMENO;
+                    _manualAddrIdx     = 0;
+                    _manualBlinkOn     = true;
+                    _lastManualBlinkMs = now;
+                    _lastActivityMs    = now;
+                    _menuDirty         = true;
+                } else {
+                    enterSubmenu(MENU_SENSOR_MENU, 2, now);
+                    showErrorBanner("NINCS SZENZOR!", "Ellenorizd a buszt", 2000);
+                }
+                return;
+            }
+            // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+            uint32_t scanElapsed = static_cast<uint32_t>(now - _manualScanStartMs);
+            if ((!_state->scanInProgress && scanElapsed >= 1500UL) || scanElapsed >= 5500UL) {
+                enterSubmenu(MENU_SENSOR_MENU, 2, now);
+                showErrorBanner("NINCS SZENZOR!", "Ellenorizd a buszt", 2000);
+            }
+            break;
+        }
+
+        case MANUAL_PHASE_ROLE:
+            break;
+
+        case MANUAL_PHASE_ADDR: {
+            if (_state->scanFoundCount == 0) {
+                enterSubmenu(MENU_SENSOR_MENU, 2, now);
+                showErrorBanner("NINCS SZENZOR!", "Ellenorizd a buszt", 2000);
+                return;
+            }
+            if (_manualAddrIdx >= _state->scanFoundCount) {
+                _manualAddrIdx = 0;
+                _menuDirty     = true;
+            }
+            int8_t assignedRole = findAssignedRoleForAddress(_state->scanFound[_manualAddrIdx].address);
+            if (assignedRole >= 0 && assignedRole != static_cast<int8_t>(_manualRole)) {
+                // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+                if (static_cast<uint32_t>(now - _lastManualBlinkMs) >= EDIT_BLINK_INTERVAL_MS) {
+                    _lastManualBlinkMs = now;
+                    _manualBlinkOn     = !_manualBlinkOn;
+                    _menuDirty         = true;
+                }
+            }
+            break;
+        }
+
+        case MANUAL_PHASE_DUPLICATE: {
+            // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+            if (static_cast<uint32_t>(now - _lastManualBlinkMs) >= 800UL) {
+                _lastManualBlinkMs = now;
+                _manualBlinkOn     = !_manualBlinkOn;
+                _menuDirty         = true;
+            }
+            break;
+        }
+
+        case MANUAL_PHASE_CONFIRM:
+        case MANUAL_PHASE_REASSIGN_CONFIRM:
+            // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+            if (static_cast<uint32_t>(now - _manualConfirmStartMs) >= 5000UL) {
+                _manualPhase            = MANUAL_PHASE_ADDR;
+                _manualReassignFromRole = -1;
+                _manualReassignChoice   = false;
+                _manualBlinkOn          = true;
+                _lastManualBlinkMs      = now;
+                _menuDirty              = true;
+            }
+            break;
+
+        case MANUAL_PHASE_SAVING:
+            if (_state->learnCompletedSeq != _seenLearnSeq) {
+                _seenLearnSeq = _state->learnCompletedSeq;
+                if (_state->learnLastOk) {
+                    char addr3[12];
+                    formatAddressLast3Bytes(_state->scanFound[_manualAddrIdx].address, addr3, sizeof(addr3));
+                    if (_manualReassignFromRole >= 0 &&
+                        _manualReassignFromRole < static_cast<int8_t>(SENSOR_ROLE_COUNT)) {
+                        uint8_t oldRole = static_cast<uint8_t>(_manualReassignFromRole);
+                        // Régi szerep biztosan ISMERETLEN legyen az állapotban is
+                        memset(_state->sensors[oldRole].address, 0, 8);
+                        _state->sensors[oldRole].assigned = false;
+                        _state->sensors[oldRole].ok       = false;
+                        _state->sensorUnknown             = true;
+
+                        char logMsg[64];
+                        snprintf(logMsg, sizeof(logMsg), "old=%s new=%s addr=%s",
+                                 sensorRoleToLabel(oldRole),
+                                 sensorRoleToLabel(_manualRole),
+                                 addr3);
+                        logEvent(LOG_INFO, "SENSOR_REASSIGNED_BY_MENU", logMsg);
+
+                        char bannerLine2[24];
+                        snprintf(bannerLine2, sizeof(bannerLine2), "%s->%s",
+                                 sensorRoleCompactLabel(oldRole),
+                                 sensorRoleCompactLabel(_manualRole));
+                        _manualReassignFromRole = -1;
+                        _manualReassignChoice   = false;
+                        enterSubmenu(MENU_SENSOR_MENU, 2, now);
+                        showErrorBanner("ATTEVE!", bannerLine2, 2000);
+                    } else {
+                        char logMsg[64];
+                        snprintf(logMsg, sizeof(logMsg), "Kezi tanitas: %s -> %s",
+                                 sensorRoleToKey(_manualRole), addr3);
+                        logEvent(LOG_INFO, "SENSOR_LEARN_BY_MENU", logMsg);
+                        enterSubmenu(MENU_SENSOR_MENU, 2, now);
+                        showErrorBanner("MENTVE!", sensorRoleToLabel(_manualRole), 2000);
+                    }
+                } else {
+                    _manualPhase            = MANUAL_PHASE_ADDR;
+                    _manualReassignFromRole = -1;
+                    _manualReassignChoice   = false;
+                    _manualBlinkOn          = true;
+                    _lastManualBlinkMs      = now;
+                    _lastActivityMs         = now;
+                    _menuDirty              = true;
+                    showErrorBanner("HIBA! Probald ujra", "EEPROM/NRF hiba", 2000);
+                }
+                return;
+            }
+            // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
+            if (static_cast<uint32_t>(now - _manualSaveStartMs) >= CMD_ACK_TIMEOUT_MS) {
+                logEvent(LOG_WARN, "SENSOR_LEARN_TIMEOUT", "Kezi tanitas 3000ms ACK timeout");
+                _manualPhase            = MANUAL_PHASE_ADDR;
+                _manualReassignFromRole = -1;
+                _manualReassignChoice   = false;
+                _manualBlinkOn          = true;
+                _lastManualBlinkMs      = now;
+                _lastActivityMs         = now;
+                _menuDirty              = true;
+                showErrorBanner("HIBA! Probald ujra", "Idotullepes (3mp)", 2000);
+            }
+            break;
+    }
+}
+
+void MenuController::drawSensorManualViewer(uint32_t now) {
+    if (!_lcd || !_state) return;
+
+    char line1[24];
+    char line2[24];
+
+    switch (_manualPhase) {
+        case MANUAL_PHASE_SCANNING:
+            snprintf(line1, sizeof(line1), "Szenzor kereses");
+            snprintf(line2, sizeof(line2), "Varj...");
+            break;
+
+        case MANUAL_PHASE_ROLE:
+            snprintf(line1, sizeof(line1), "SZEREP:");
+            snprintf(line2, sizeof(line2), "%s", sensorRoleToLabel(_manualRole));
+            break;
+
+        case MANUAL_PHASE_ADDR: {
+            uint8_t cnt = _state->scanFoundCount;
+            if (cnt == 0) {
+                snprintf(line1, sizeof(line1), "NINCS SZENZOR!");
+                snprintf(line2, sizeof(line2), "Ellenorizd a buszt");
+                break;
+            }
+            if (_manualAddrIdx >= cnt) {
+                _manualAddrIdx = 0;
+            }
+            char addr3[12];
+            formatAddressLast3Bytes(_state->scanFound[_manualAddrIdx].address, addr3, sizeof(addr3));
+            snprintf(line1, sizeof(line1), "CIM: %s %u/%u",
+                     addr3,
+                     static_cast<unsigned>(_manualAddrIdx + 1),
+                     static_cast<unsigned>(cnt));
+
+            char tempStr[10];
+            float tempC = _state->scanFound[_manualAddrIdx].temp;
+            if (isTempValid(tempC)) {
+                snprintf(tempStr, sizeof(tempStr), "%4.1fC", tempC);
+            } else {
+                snprintf(tempStr, sizeof(tempStr), "--.-C");
+            }
+
+            int8_t assignedRole = findAssignedRoleForAddress(_state->scanFound[_manualAddrIdx].address);
+            if (assignedRole < 0) {
+                snprintf(line2, sizeof(line2), "%s  MAR: -", tempStr);
+            } else if (assignedRole == static_cast<int8_t>(_manualRole)) {
+                snprintf(line2, sizeof(line2), "%s MAR:%s",
+                         tempStr, sensorRoleShortLabel(static_cast<uint8_t>(assignedRole)));
+            } else if (_manualBlinkOn) {
+                snprintf(line2, sizeof(line2), "%s !MAR:%s",
+                         tempStr, sensorRoleCompactLabel(static_cast<uint8_t>(assignedRole)));
+            } else {
+                snprintf(line2, sizeof(line2), "%s !ATIRAS!", tempStr);
+            }
+            break;
+        }
+
+        case MANUAL_PHASE_DUPLICATE: {
+            const char* choiceStr = _manualReassignChoice ? ">CSERE" : ">MEGSE";
+            if (_manualBlinkOn) {
+                snprintf(line1, sizeof(line1), "FIGYELEM!  %s", choiceStr);
+            } else {
+                snprintf(line1, sizeof(line1), "MAR HASZN! %s", choiceStr);
+            }
+            uint8_t oldRole = (_manualReassignFromRole >= 0 &&
+                               _manualReassignFromRole < static_cast<int8_t>(SENSOR_ROLE_COUNT))
+                                  ? static_cast<uint8_t>(_manualReassignFromRole)
+                                  : _manualRole;
+            snprintf(line2, sizeof(line2), "%s->%s?",
+                     sensorRoleCompactLabel(oldRole),
+                     sensorRoleCompactLabel(_manualRole));
+            break;
+        }
+
+        case MANUAL_PHASE_REASSIGN_CONFIRM:
+            snprintf(line1, sizeof(line1), "BIZTOS? CSERE!");
+            snprintf(line2, sizeof(line2), "Nyomd meg ujra");
+            break;
+
+        case MANUAL_PHASE_CONFIRM: {
+            char addr3[12];
+            if (_manualAddrIdx < _state->scanFoundCount) {
+                formatAddressLast3Bytes(_state->scanFound[_manualAddrIdx].address, addr3, sizeof(addr3));
+            } else {
+                snprintf(addr3, sizeof(addr3), "--:--:--");
+            }
+            snprintf(line1, sizeof(line1), "MENTES? %s", sensorRoleShortLabel(_manualRole));
+            snprintf(line2, sizeof(line2), "%s Nyomd ujra", addr3);
+            break;
+        }
+
+        case MANUAL_PHASE_SAVING:
+        default:
+            snprintf(line1, sizeof(line1), "Mentes...");
+            snprintf(line2, sizeof(line2), "%s -> EEPROM", sensorRoleShortLabel(_manualRole));
+            break;
+    }
+
+    (void)now;
     _lcd->printLines(line1, line2);
 }
 
