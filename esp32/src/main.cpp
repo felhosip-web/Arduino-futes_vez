@@ -1198,7 +1198,7 @@ void transmitCurrentNrfPacket() {
     state.dmaWaitUs = nrfDma.getLastWaitUs();
     if (nrfDma.consumeQueueFullWarning() && !dmaQueueFullLogged) {
         dmaQueueFullLogged = true;
-        logEvent(LOG_WARN, "DMA_QUEUE_FULL", "NRF SPI DMA sor megtelt (3), legregebbi retry eldobva");
+        logEvent(LOG_WARN, "DMA_QUEUE_FULL", "NRF SPI DMA sor megtelt (3)");
     }
     if (!queued) {
         // Queue hiba vagy rádió nincs inicializálva: az 500 ms-os NRF timeout fogja kezelni
@@ -1822,9 +1822,10 @@ void handleNrf(uint32_t now) {
     if (dmaRes.hasTimingUpdate) {
         state.dmaWaitUs = dmaRes.dmaWaitUs;
     }
-    if ((dmaRes.queueFullWarn || nrfDma.consumeQueueFullWarning()) && !dmaQueueFullLogged) {
+    bool qFull = nrfDma.consumeQueueFullWarning() || dmaRes.queueFullWarn;
+    if (qFull && !dmaQueueFullLogged) {
         dmaQueueFullLogged = true;
-        logEvent(LOG_WARN, "DMA_QUEUE_FULL", "NRF SPI DMA sor megtelt (3), legregebbi retry eldobva");
+        logEvent(LOG_WARN, "DMA_QUEUE_FULL", "NRF SPI DMA sor megtelt (3)");
     }
     if (dmaRes.txAckedNow) {
         nrfCycleAnyWriteOk = true;

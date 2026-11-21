@@ -6,6 +6,7 @@
 #include <driver/spi_master.h>
 #include <esp_heap_caps.h>
 #include "config.h"
+#include "nrf_dma_core.h"
 #include "../../nano/src/common.h"
 
 // ============================================================================
@@ -46,17 +47,11 @@ private:
 // - 10 MHz SPI órajel, queue_size = 3 (a 3 retry blokkolás nélkül elfér).
 // - post_cb ISR CSAK a volatile bool _dmaDone flag-et állítja true-ra.
 // - A loop() nem-blokkoló módon pollingolja a _dmaDone / get_trans_result-ot.
+// - Az állapotgép és a veszteségmentes sor-/hiba-kezelés az NrfDmaCore-ban fut.
 // ============================================================================
 class NrfDmaRadio {
 public:
-    struct PollResult {
-        bool     txAckedNow      = false;
-        bool     txFailedNow     = false;
-        bool     rxPacketReady   = false;
-        bool     queueFullWarn   = false;
-        bool     hasTimingUpdate = false;
-        uint32_t dmaWaitUs       = 0;
-    };
+    using PollResult = NrfDmaCore::PollResult;
 
     bool begin(SpiDmaBus& bus,
                uint8_t    cePin     = PIN_NRF_CE,
@@ -64,7 +59,8 @@ public:
                uint32_t   clockHz   = NRF_SPI_CLOCK_HZ,
                uint8_t    queueSize = NRF_SPI_QUEUE_SIZE);
 
-    bool isReady() const { return _ready; }
+    bool isReady() const { return _core.isReady(); }
+    bool isPendingResetCleanup() const { return _core.isPendingResetCleanup(); }
 
     // Nem-blokkoló adás indítása (W_TX_PAYLOAD 32B NrfPacket DMA sorba tétele)
     bool queueTransmitPacket(const NrfPacket& pkt);
@@ -78,80 +74,43 @@ public:
     // 500ms NRF timeout esetén: függő DMA tranzakciók lezárása + FLUSH_TX/FLUSH_RX
     uint32_t flushAndDrain();
 
-    bool     consumeQueueFullWarning();
-    uint32_t getLastWaitUs() const { return _lastWaitUs; }
-    uint32_t getMaxWaitUs() const { return _maxWaitUs; }
-    uint8_t  getInFlightCount() const { return _inFlightCount; }
+    bool     consumeQueueFullWarning() { return _core.consumeQueueFullWarning(); }
+    uint32_t getLastWaitUs() const { return _core.getLastWaitUs(); }
+    uint32_t getMaxWaitUs() const { return _core.getMaxWaitUs(); }
+    uint8_t  getInFlightCount() const { return _core.getInFlightCount(); }
 
 private:
-    enum Phase : uint8_t {
-        PHASE_IDLE = 0,
-        PHASE_TX_PREP_CONFIG,
-        PHASE_TX_PREP_STATUS,
-        PHASE_TX_PAYLOAD_PENDING,
-        PHASE_TX_AIR_WAIT,
-        PHASE_RX_SWITCH_WAIT,
-        PHASE_RX_LISTEN,
-        PHASE_RX_PAYLOAD_PENDING,
-        PHASE_TX_FAILED
-    };
+    static constexpr size_t  DMA_FRAME_BYTES = NrfDmaCore::DMA_FRAME_BYTES;
+    static constexpr uint8_t MAX_SLOTS       = NRF_SPI_QUEUE_SIZE;
+    static_assert(NRF_SPI_QUEUE_SIZE <= NrfDmaCore::MAX_SLOTS,
+                  "NRF_SPI_QUEUE_SIZE nem haladhatja meg az NrfDmaCore::MAX_SLOTS erteket!");
 
-    enum SlotOp : uint8_t {
-        OP_NONE = 0,
-        OP_IGNORE,
-        OP_TX_CONFIG,
-        OP_TX_STATUS_CLR,
-        OP_TX_PAYLOAD,
-        OP_POLL_TX_STATUS,
-        OP_RX_STATUS_CLR,
-        OP_RX_CONFIG,
-        OP_POLL_RX_STATUS,
-        OP_RX_PAYLOAD,
-        OP_FLUSH_TX
-    };
-
-    // 1 byte NRF SPI parancs + 32 byte NrfPacket = 33 byte; 4-byte DMA igazítással 36 byte
-    static constexpr size_t DMA_FRAME_BYTES = 36;
-    static constexpr uint8_t MAX_SLOTS      = NRF_SPI_QUEUE_SIZE;
-
-    struct DmaSlot {
-        bool              inUse      = false;
-        SlotOp            op         = OP_NONE;
-        uint32_t          queuedAtUs = 0;
+    struct EspSlot {
+        NrfDmaRadio*      owner   = nullptr;
+        uint8_t           slotIdx = 0;
         spi_transaction_t trans{};
-        uint8_t*          txBuf      = nullptr; // MALLOC_CAP_DMA (36 byte)
-        uint8_t*          rxBuf      = nullptr; // MALLOC_CAP_DMA (36 byte)
-        NrfDmaRadio*      owner      = nullptr;
+        uint8_t*          txBuf   = nullptr; // MALLOC_CAP_DMA (36 byte)
+        uint8_t*          rxBuf   = nullptr; // MALLOC_CAP_DMA (36 byte)
     };
 
-    spi_device_handle_t _handle        = nullptr;
-    uint8_t             _cePin         = PIN_NRF_CE;
-    uint8_t             _csnPin        = PIN_NRF_CSN;
-    uint8_t             _queueSize     = NRF_SPI_QUEUE_SIZE;
-    bool                _ready         = false;
-    bool                _isRxMode      = false;
-    Phase               _phase         = PHASE_IDLE;
-    NrfPacket           _pendingTxPkt{};
-    NrfPacket*          _dmaTxPacket   = nullptr; // 32 byte-os MALLOC_CAP_DMA tükörpuffer
-    NrfPacket*          _dmaRxPacket   = nullptr; // 32 byte-os MALLOC_CAP_DMA tükörpuffer
-    DmaSlot             _slots[MAX_SLOTS];
-    uint8_t             _inFlightCount = 0;
-    uint32_t            _lastPollUs    = 0;
-    uint32_t            _lastWaitUs    = 0;
-    uint32_t            _maxWaitUs     = 0;
-    bool                _queueFullWarn = false;
+    spi_device_handle_t _handle      = nullptr;
+    uint8_t             _cePin       = PIN_NRF_CE;
+    uint8_t             _csnPin      = PIN_NRF_CSN;
+    NrfPacket*          _dmaTxPacket = nullptr; // 32 byte-os MALLOC_CAP_DMA tükörpuffer
+    NrfPacket*          _dmaRxPacket = nullptr; // 32 byte-os MALLOC_CAP_DMA tükörpuffer
+    EspSlot             _espSlots[MAX_SLOTS]{};
+    NrfDmaCore          _core{};
 
     // ISR-ből CSAK ez a flag állítódik true-ra (Serial/MQTT/LCD tilos ISR-ben!)
-    volatile bool       _dmaDone       = false;
+    volatile bool       _dmaDone     = false;
 
     static void IRAM_ATTR onDmaPostTransfer(spi_transaction_t* trans);
 
-    bool syncTransfer(uint8_t cmd, const uint8_t* txData, uint8_t* rxData, size_t dataLen);
-    bool syncWriteReg(uint8_t reg, uint8_t val);
-    bool syncWriteRegBuf(uint8_t reg, const uint8_t* buf, size_t len);
-    uint8_t syncReadReg(uint8_t reg, bool* okOut = nullptr);
-
-    bool queueOp(SlotOp op, uint8_t cmd, const uint8_t* data, size_t dataLen);
-    bool drainOneCompleted(TickType_t waitTicks, DmaSlot** outSlot, uint32_t* accumWaitUs);
-    void recordWaitUs(uint32_t us);
+    static NrfDmaCore::HalStatus halQueueTrans(void* ctx, uint8_t slotIdx, size_t totalBytes);
+    static NrfDmaCore::HalStatus halGetTransResult(void* ctx, uint32_t waitTicks, uint8_t* outSlotIdx);
+    static bool                  halSyncTrans(void* ctx, uint8_t slotIdx, size_t totalBytes);
+    static void                  halSetCe(void* ctx, bool high);
+    static void                  halDelayUs(void* ctx, uint32_t us);
+    static uint32_t              halGetMicros(void* ctx);
+    static uint32_t              halMsToTicks(void* ctx, uint32_t ms);
 };
