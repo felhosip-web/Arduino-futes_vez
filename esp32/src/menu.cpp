@@ -870,6 +870,11 @@ void MenuController::handleInput(int8_t encSteps,
             if (_callbacks.onRequestSensorLearn) {
                 _callbacks.onRequestSensorLearn(_teachRole, _teachFoundAddr);
             }
+            if (!_state->learnInProgress && _state->learnCompletedSeq == _seenLearnSeq) {
+                showErrorBanner("MENTES HIBA!", "Ervenytelen/foglalt", 2000);
+                enterSubmenu(MENU_SENSOR_MENU, 1, now);
+                return;
+            }
             _menuDirty = true;
         }
         return;
@@ -1639,7 +1644,7 @@ void MenuController::drawSensorTeachViewer(uint32_t now) {
 }
 
 int8_t MenuController::findAssignedRoleForAddress(const uint8_t addr[8]) const {
-    if (!_state || !addr || !isDeviceAddressNonZero(addr)) return -1;
+    if (!_state || !addr || !isValidDs18b20Rom(addr)) return -1;
     for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
         if (_state->sensors[r].assigned && memcmp(_state->sensors[r].address, addr, 8) == 0) {
             return static_cast<int8_t>(r);

@@ -148,6 +148,7 @@ export interface HeatingStatusPayload {
   nanoLoopFault?: boolean;
   loopMaxMs?: number;
   loopLastMs?: number;
+  dmaWaitUs?: number;
   error: string | null;
   manualHeating?: boolean;
   nanoCounter?: number;
@@ -257,4 +258,27 @@ export interface CommandApiResponse {
   executedAt?: string;
   reason?: string;
   error?: string;
+}
+
+export type MqttSignalQuality = 'excellent' | 'good' | 'fair' | 'poor' | 'offline';
+
+export interface MqttBrokerStats {
+  connected: boolean;
+  configured: boolean;
+  quality: MqttSignalQuality;
+  signalLevel: 0 | 1 | 2 | 3 | 4;
+  latencyMs: number | null;
+  avgLatencyMs: number | null;
+  minLatencyMs: number | null;
+  maxLatencyMs: number | null;
+  reliabilityPct: number | null;
+  publishedCount: number;
+  pubAckedCount: number;
+  pubFailedCount: number;
+  cmdAckSuccessCount: number;
+  cmdAckFailCount: number;
+  reconnectCount: number;
+  lastMeasuredAt: number | null;
+  lastMessageAt: number | null;
+  lastError: string | null;
 }

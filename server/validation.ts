@@ -80,6 +80,69 @@ export function isOutputKey(key: unknown): key is OutputKey {
   return typeof key === 'string' && (OUTPUT_KEYS as readonly string[]).includes(key);
 }
 
+export const DS18B20_FAMILY_CODE = 0x28;
+const DS18B20_ADDR_REGEX = /^([0-9A-Fa-f]{2}:){7}[0-9A-Fa-f]{2}$/;
+
+export function computeOneWireCrc8(bytes: readonly number[]): number {
+  let crc = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    let inbyte = bytes[i] & 0xff;
+    for (let j = 0; j < 8; j++) {
+      const mix = (crc ^ inbyte) & 0x01;
+      crc >>= 1;
+      if (mix !== 0) {
+        crc ^= 0x8c;
+      }
+      inbyte >>= 1;
+    }
+  }
+  return crc & 0xff;
+}
+
+export function validateDs18b20RomAddress(
+  rawAddress: unknown
+): ValidationResult<string> | ValidationError {
+  if (typeof rawAddress !== 'string') {
+    return {
+      ok: false,
+      error: 'Érvénytelen DS18B20 cím formátum (elvárt: XX:XX:XX:XX:XX:XX:XX:XX).',
+    };
+  }
+
+  const normalized = rawAddress.trim().toUpperCase();
+  if (!DS18B20_ADDR_REGEX.test(normalized) || normalized === '00:00:00:00:00:00:00:00') {
+    return {
+      ok: false,
+      error: 'Érvénytelen DS18B20 cím formátum (elvárt: XX:XX:XX:XX:XX:XX:XX:XX).',
+    };
+  }
+
+  const bytes = normalized.split(':').map((part) => Number.parseInt(part, 16));
+  if (bytes.length !== 8 || bytes.some((b) => !Number.isInteger(b) || b < 0 || b > 255)) {
+    return {
+      ok: false,
+      error: 'Érvénytelen DS18B20 cím bájtok (elvárt: XX:XX:XX:XX:XX:XX:XX:XX).',
+    };
+  }
+
+  if (bytes[0] !== DS18B20_FAMILY_CODE) {
+    return {
+      ok: false,
+      error: `Érvénytelen DS18B20 family code: 0x${bytes[0].toString(16).toUpperCase().padStart(2, '0')} (elvárt: 0x28).`,
+    };
+  }
+
+  const expectedCrc = computeOneWireCrc8(bytes.slice(0, 7));
+  if (bytes[7] !== expectedCrc) {
+    return {
+      ok: false,
+      error: 'Érvénytelen DS18B20 ROM CRC8 ellenőrző összeg.',
+    };
+  }
+
+  return { ok: true, value: normalized };
+}
+
 export interface FreshCommandBase {
   targetTemp?: number;
   mode?: HeatingMode;

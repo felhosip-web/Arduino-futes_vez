@@ -81,6 +81,7 @@ async function startServer(): Promise<void> {
   mqttBridge.connect();
 
   io.on('connection', (socket) => {
+    socket.emit('mqtt-stats', mqttBridge.getMqttStats());
     // Új kliens csatlakozásakor átküldjük az ismert eszközök aktuális ESP státuszát
     for (const state of mqttBridge.getAllStates()) {
       const statusData = state.lastStatus ?? state.status;
@@ -101,6 +102,10 @@ async function startServer(): Promise<void> {
       ok: true,
       mqttConnected: mqttBridge.isConnected(),
     });
+  });
+
+  app.get('/api/mqtt/stats', (_req, res) => {
+    res.json(mqttBridge.getMqttStats());
   });
 
   app.use(

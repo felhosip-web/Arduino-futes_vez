@@ -11,13 +11,15 @@ import type {
   HeatingCommand,
   HeatingStatusPayload,
   HeatingUpdateEvent,
+  MqttBrokerStats,
+  MqttSignalQuality,
   PumpMode,
   PumpStartSensor,
   SensorScanItem,
   SensorStatusMap,
   StoredDeviceState,
 } from './types.ts';
-import { SAFETY_OVERHEAT_TEMP } from './validation.ts';
+import { SAFETY_OVERHEAT_TEMP, validateDs18b20RomAddress } from './validation.ts';
 
 const VALID_PUMP_MODES: readonly PumpMode[] = ['auto', 'manual_on', 'manual_off'];
 const VALID_PUMP_SENSORS: readonly PumpStartSensor[] = ['kazan', 'eloremeno', 'max'];
@@ -103,6 +105,11 @@ export function mergeHeatingStatus(
       ? { loopLastMs: parsed.loopLastMs }
       : typeof prevStatus.loopLastMs === 'number'
         ? { loopLastMs: prevStatus.loopLastMs }
+        : {}),
+    ...(typeof parsed.dmaWaitUs === 'number' && Number.isFinite(parsed.dmaWaitUs)
+      ? { dmaWaitUs: parsed.dmaWaitUs }
+      : typeof prevStatus.dmaWaitUs === 'number'
+        ? { dmaWaitUs: prevStatus.dmaWaitUs }
         : {}),
     ...(typeof parsed.sensorUnknown === 'boolean'
       ? { sensorUnknown: parsed.sensorUnknown }
@@ -210,10 +217,110 @@ export class HeatingMqttBridge {
   >();
   private cmdSeqCounter = 0;
   private connected = false;
+  private brokerConfigured = false;
+  private latencySamples: number[] = [];
+  private lastLatencyMs: number | null = null;
+  private minLatencyMs: number | null = null;
+  private maxLatencyMs: number | null = null;
+  private lastMeasuredAt: number | null = null;
+  private lastMessageAt: number | null = null;
+  private lastBrokerError: string | null = null;
+  private connectStartedAt: number | null = null;
+  private pendingPingSentAt: number | null = null;
+  private publishedCount = 0;
+  private pubAckedCount = 0;
+  private pubFailedCount = 0;
+  private cmdAckSuccessCount = 0;
+  private cmdAckFailCount = 0;
+  private reconnectCount = 0;
 
   constructor(io: SocketIOServer, logsStore: LogsStore = new LogsStore()) {
     this.io = io;
     this.logsStore = logsStore;
+  }
+
+  private recordLatencySample(rawMs: number): void {
+    const ms = Math.max(1, Math.round(rawMs));
+    this.lastLatencyMs = ms;
+    this.minLatencyMs = this.minLatencyMs === null ? ms : Math.min(this.minLatencyMs, ms);
+    this.maxLatencyMs = this.maxLatencyMs === null ? ms : Math.max(this.maxLatencyMs, ms);
+    this.lastMeasuredAt = Date.now();
+    this.latencySamples.push(ms);
+    if (this.latencySamples.length > 20) {
+      this.latencySamples.shift();
+    }
+  }
+
+  private emitMqttStats(): void {
+    this.io.emit('mqtt-stats', this.getMqttStats());
+  }
+
+  public getMqttStats(): MqttBrokerStats {
+    const avgLatencyMs =
+      this.latencySamples.length > 0
+        ? Math.round(
+            this.latencySamples.reduce((sum, val) => sum + val, 0) / this.latencySamples.length
+          )
+        : null;
+
+    const ackTotal = this.cmdAckSuccessCount + this.cmdAckFailCount;
+    let reliabilityPct: number | null;
+    if (!this.brokerConfigured) {
+      reliabilityPct = null;
+    } else if (this.publishedCount === 0 && ackTotal === 0) {
+      reliabilityPct = this.connected ? 100 : 0;
+    } else {
+      const brokerRate =
+        this.publishedCount > 0 ? this.pubAckedCount / this.publishedCount : 1;
+      const ackRate = ackTotal > 0 ? this.cmdAckSuccessCount / ackTotal : 1;
+      reliabilityPct = Math.round(brokerRate * ackRate * 100);
+    }
+
+    let signalLevel: 0 | 1 | 2 | 3 | 4;
+    let quality: MqttSignalQuality;
+    if (!this.connected) {
+      signalLevel = 0;
+      quality = 'offline';
+    } else if (
+      (reliabilityPct !== null && reliabilityPct < 80) ||
+      (this.lastLatencyMs !== null && this.lastLatencyMs >= 600)
+    ) {
+      signalLevel = 1;
+      quality = 'poor';
+    } else if (
+      (reliabilityPct !== null && reliabilityPct < 95) ||
+      (this.lastLatencyMs !== null && this.lastLatencyMs >= 250)
+    ) {
+      signalLevel = 2;
+      quality = 'fair';
+    } else if (this.lastLatencyMs !== null && this.lastLatencyMs >= 100) {
+      signalLevel = 3;
+      quality = 'good';
+    } else {
+      signalLevel = 4;
+      quality = 'excellent';
+    }
+
+    return {
+      connected: this.connected,
+      configured: this.brokerConfigured,
+      quality,
+      signalLevel,
+      latencyMs: this.lastLatencyMs,
+      avgLatencyMs,
+      minLatencyMs: this.minLatencyMs,
+      maxLatencyMs: this.maxLatencyMs,
+      reliabilityPct,
+      publishedCount: this.publishedCount,
+      pubAckedCount: this.pubAckedCount,
+      pubFailedCount: this.pubFailedCount,
+      cmdAckSuccessCount: this.cmdAckSuccessCount,
+      cmdAckFailCount: this.cmdAckFailCount,
+      reconnectCount: this.reconnectCount,
+      lastMeasuredAt: this.lastMeasuredAt,
+      lastMessageAt: this.lastMessageAt,
+      lastError: this.lastBrokerError,
+    };
   }
 
   public getLogsStore(): LogsStore {
@@ -244,10 +351,14 @@ export class HeatingMqttBridge {
     const clientId = process.env.MQTT_CLIENT_ID?.trim() || 'backend-futes';
 
     if (!brokerUrl || brokerUrl.includes('your-cluster-id')) {
+      this.brokerConfigured = false;
       console.warn('[MQTT] MQTT_HOST / MQTT_BROKER_URL nincs beállítva (.env) — az MQTT híd várakozik.');
+      this.emitMqttStats();
       return;
     }
 
+    this.brokerConfigured = true;
+    this.connectStartedAt = Date.now();
     console.log(`[MQTT] Csatlakozás HiveMQ Cloud-hoz (${brokerUrl}), clientId=${clientId}...`);
 
     this.client = mqtt.connect(brokerUrl, {
@@ -257,6 +368,7 @@ export class HeatingMqttBridge {
       protocol: 'mqtts',
       rejectUnauthorized: true,
       clean: true,
+      keepalive: 15,
       reconnectPeriod: 5000,
       connectTimeout: 10000,
     });
@@ -264,10 +376,16 @@ export class HeatingMqttBridge {
     this.client.on('connect', () => {
       const wasConnected = this.connected;
       this.connected = true;
+      this.lastBrokerError = null;
+      if (this.connectStartedAt !== null) {
+        this.recordLatencySample(Date.now() - this.connectStartedAt);
+        this.connectStartedAt = null;
+      }
       console.log('[MQTT] Sikeresen csatlakozva a HiveMQ Cloud brokerhez.');
       if (!wasConnected) {
         this.logBackendEvent('INFO', 'MQTT_CONNECT', 'HiveMQ Cloud broker csatlakozva');
       }
+      this.emitMqttStats();
       this.client?.subscribe(
         ['futes/+/status', 'futes/+/telemetry', 'futes/+/log', 'futes/+/ack', 'heating/+/ack'],
         { qos: 1 },
@@ -284,20 +402,42 @@ export class HeatingMqttBridge {
     });
 
     this.client.on('reconnect', () => {
+      this.reconnectCount++;
+      this.connectStartedAt = Date.now();
       console.log('[MQTT] Újracsatlakozás folyamatban...');
+      this.emitMqttStats();
     });
 
     this.client.on('close', () => {
       const wasConnected = this.connected;
       this.connected = false;
+      this.pendingPingSentAt = null;
       if (wasConnected) {
         this.logBackendEvent('WARN', 'MQTT_DISCONNECT', 'HiveMQ Cloud kapcsolat megszakadt');
       }
+      this.emitMqttStats();
     });
 
     this.client.on('error', (err) => {
       console.error('[MQTT] Hiba:', err.message);
+      this.lastBrokerError = err.message;
       this.logBackendEvent('ERROR', 'MQTT_DISCONNECT', `MQTT hiba: ${err.message}`);
+      this.emitMqttStats();
+    });
+
+    this.client.on('packetsend', (packet) => {
+      if (packet.cmd === 'pingreq') {
+        this.pendingPingSentAt = Date.now();
+      }
+    });
+
+    this.client.on('packetreceive', (packet) => {
+      if (packet.cmd === 'pingresp' && this.pendingPingSentAt !== null) {
+        const rttMs = Date.now() - this.pendingPingSentAt;
+        this.pendingPingSentAt = null;
+        this.recordLatencySample(rttMs);
+        this.emitMqttStats();
+      }
     });
 
     this.client.on('message', (topic, payloadBuffer) => {
@@ -306,6 +446,7 @@ export class HeatingMqttBridge {
   }
 
   private handleIncomingMessage(topic: string, payloadBuffer: Buffer): void {
+    this.lastMessageAt = Date.now();
     const ackMatch = /^(?:futes|heating)\/([^/]+)\/ack$/.exec(topic);
     if (ackMatch) {
       this.handleIncomingAckMessage(ackMatch[1], payloadBuffer);
@@ -545,16 +686,23 @@ export class HeatingMqttBridge {
     const found: SensorScanItem[] | undefined = Array.isArray(parsed.found)
       ? parsed.found
           .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
-          .map((item) => ({
-            address: typeof item.address === 'string' ? item.address : '',
-            temp: typeof item.temp === 'number' && Number.isFinite(item.temp) ? item.temp : null,
-          }))
+          .map((item) => {
+            const addrCheck = validateDs18b20RomAddress(item.address);
+            return {
+              address: addrCheck.ok ? addrCheck.value : '',
+              temp: typeof item.temp === 'number' && Number.isFinite(item.temp) ? item.temp : null,
+            };
+          })
           .filter((item) => item.address.length > 0)
       : undefined;
 
-    if (!ok) {
+    if (ok) {
+      this.cmdAckSuccessCount++;
+    } else {
+      this.cmdAckFailCount++;
       this.logBackendEvent('WARN', 'CMD_ACK_FAIL', `${deviceId} cmdId=${cmdId} reason=${reason}`);
     }
+    this.emitMqttStats();
 
     pending.resolve({
       cmdId,
@@ -588,7 +736,9 @@ export class HeatingMqttBridge {
         if (settled) return;
         settled = true;
         this.pendingAcks.delete(cmdId);
+        this.cmdAckFailCount++;
         this.logBackendEvent('WARN', 'CMD_ACK_TIMEOUT', `CMD_ACK_TIMEOUT cmdId=${cmdId}`);
+        this.emitMqttStats();
         resolve({
           cmdId,
           ok: false,
@@ -625,19 +775,31 @@ export class HeatingMqttBridge {
 
   public publishAction(deviceId: string, actionPayload: Record<string, unknown>): Promise<void> {
     return new Promise((resolve, reject) => {
+      this.publishedCount++;
       if (!this.client || !this.connected) {
-        reject(new Error('Az MQTT kliens jelenleg nincs csatlakozva a HiveMQ Cloud brokerhez.'));
+        this.pubFailedCount++;
+        this.lastBrokerError = 'Az MQTT kliens jelenleg nincs csatlakozva a HiveMQ Cloud brokerhez.';
+        this.emitMqttStats();
+        reject(new Error(this.lastBrokerError));
         return;
       }
 
       const topic = `futes/${deviceId}/cmd`;
       const payload = JSON.stringify(actionPayload);
+      const startMs = Date.now();
 
       this.client.publish(topic, payload, { qos: 1, retain: false }, (err) => {
         if (err) {
+          this.pubFailedCount++;
+          this.lastBrokerError = err.message;
+          this.emitMqttStats();
           reject(err);
           return;
         }
+        this.pubAckedCount++;
+        this.lastBrokerError = null;
+        this.recordLatencySample(Date.now() - startMs);
+        this.emitMqttStats();
         resolve();
       });
     });
@@ -649,21 +811,32 @@ export class HeatingMqttBridge {
     meta?: { cmdId: string; cmdSeq: number }
   ): Promise<void> {
     return new Promise((resolve, reject) => {
+      this.publishedCount++;
       if (!this.client || !this.connected) {
-        reject(new Error('Az MQTT kliens jelenleg nincs csatlakozva a HiveMQ Cloud brokerhez.'));
+        this.pubFailedCount++;
+        this.lastBrokerError = 'Az MQTT kliens jelenleg nincs csatlakozva a HiveMQ Cloud brokerhez.';
+        this.emitMqttStats();
+        reject(new Error(this.lastBrokerError));
         return;
       }
 
       const topic = `futes/${deviceId}/cmd`;
       const wirePayload = meta ? { ...command, cmdId: meta.cmdId, cmdSeq: meta.cmdSeq } : command;
       const payload = JSON.stringify(wirePayload);
+      const startMs = Date.now();
 
       // Fontos: a backend CSAK továbbítja a parancsot MQTT-re, nem módosítja a tárolt ESP státuszt.
       this.client.publish(topic, payload, { qos: 1, retain: false }, (err) => {
         if (err) {
+          this.pubFailedCount++;
+          this.lastBrokerError = err.message;
+          this.emitMqttStats();
           reject(err);
           return;
         }
+        this.pubAckedCount++;
+        this.lastBrokerError = null;
+        this.recordLatencySample(Date.now() - startMs);
         const sentAt = Date.now();
         this.lastCommands.set(deviceId, { command, sentAt });
         const existing = this.states.get(deviceId);
@@ -671,6 +844,7 @@ export class HeatingMqttBridge {
           existing.lastCommand = command;
           existing.lastCommandAt = sentAt;
         }
+        this.emitMqttStats();
         resolve();
       });
     });

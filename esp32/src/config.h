@@ -1,6 +1,8 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
+#include <driver/spi_master.h>
 
 // ============================================================================
 // ESP32-C3 KONFIGURÁCIÓ (V5 MASTER / GATEWAY): WIFI, MQTT, PIN-EK, LCD, LM35
@@ -34,7 +36,7 @@ constexpr uint32_t    NTP_RETRY_INTERVAL_MS  = 60000UL;    // 60 mp NTP újrapr�
 constexpr uint32_t    SYNC_RETRY_INTERVAL_MS = 3600000UL;  // 1 óra múlva újrapróba sikertelen Nano szinkronnál
 constexpr uint32_t    NANO_SYNC_STALE_SEC    = 46800UL;    // 13 óra (2x12h + 1h tűrés)
 
-// --- PIN-ek (ESP32-C3, ütközésmentes kiosztás) ---
+// --- PIN-ek (ESP32-C3, ütközésmentes kiosztás — BEKÖTÉS VÁLTOZATLAN) ---
 constexpr uint8_t PIN_LM35      = 2;  // ADC1_CH2
 
 constexpr uint8_t PIN_ENC_CLK   = 5;
@@ -54,6 +56,19 @@ constexpr uint8_t PIN_NRF_CSN   = 1;
 constexpr uint8_t PIN_NRF_MISO  = 3;
 constexpr uint8_t PIN_NRF_SCK   = 4;
 constexpr uint8_t PIN_NRF_MOSI  = 10;
+
+// --- NRF24 SPI + GDMA konfiguráció (ESP32-C3 SPI2_HOST) ---
+//  * SPI0/SPI1 kizárólag a Flash memóriáé — csak a szabad SPI2_HOST használható.
+//  * A GDMA nem látja a stack-et / flash-t -> DMA pufferek MALLOC_CAP_DMA memóriában.
+//  * NRF24L01+ maximális stabil SPI órajel: 10 MHz (10000000 Hz) — NE lépd túl!
+//  * Queue méret = 3: a 3 retry (NRF_MAX_ATTEMPTS) sorban állás nélkül elfér.
+//  * Az I2C 2x20 LCD és a WiFi DMA érintetlen marad.
+constexpr spi_host_device_t NRF_SPI_HOST        = SPI2_HOST;
+constexpr spi_dma_chan_t    NRF_SPI_DMA_CHANNEL = SPI_DMA_CH_AUTO;
+constexpr uint32_t          NRF_SPI_CLOCK_HZ    = 10000000UL; // 10 MHz
+constexpr uint8_t           NRF_SPI_QUEUE_SIZE  = 3;          // Max 3 függő DMA tranzakció
+constexpr size_t            NRF_DMA_BUFFER_BYTES = 32;        // V5 fix 32 byte-os NrfPacket
+constexpr int               NRF_SPI_MAX_XFER_SZ = 4096;       // Közös busz max átviteli méret (pl. jövőbeli SD/TFT)
 
 // --- Encoder és Menü beállítások ---
 // Állítsd 1-re, ha az encoder forgási iránya fordított a hardvereden

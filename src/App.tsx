@@ -1,14 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import {
-  AlertTriangle,
-  LayoutDashboard,
-  LineChart,
-  RefreshCw,
-  ScrollText,
-  Wifi,
-  WifiOff,
-} from 'lucide-react';
+import { AlertTriangle, LayoutDashboard, LineChart, ScrollText } from 'lucide-react';
 import { API_URL, DEVICE_ID } from './config';
 import {
   DEFAULT_ALARM_CONFIG,
@@ -25,10 +17,12 @@ import {
   type HeatingMode,
   type HeatingStatusPayload,
   type HeatingUpdateEvent,
+  type MqttBrokerStats,
   type OutputKey,
   type PumpConfig,
   type StoredDeviceState,
 } from './types/heating';
+import { Header } from './components/Header';
 import { HeatingControl } from './components/HeatingControl';
 import { Temperatures } from './components/Temperatures';
 import { EloremenoStats } from './components/EloremenoStats';
@@ -81,15 +75,6 @@ function isUsableStatus(
   );
 }
 
-function formatTimestamp(ms: number | null): string {
-  if (!ms) return 'Nincs adat';
-  return new Date(ms).toLocaleTimeString('hu-HU', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
-}
-
 export default function App() {
   const [activeView, setActiveView] = useState<ActiveView>('dashboard');
   const [logsRefreshSignal, setLogsRefreshSignal] = useState<number>(0);
@@ -97,6 +82,7 @@ export default function App() {
   const [status, setStatus] = useState<HeatingStatusPayload | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null);
   const [socketConnected, setSocketConnected] = useState<boolean>(false);
+  const [mqttStats, setMqttStats] = useState<MqttBrokerStats | null>(null);
   const [loadingInitial, setLoadingInitial] = useState<boolean>(true);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [sendingCommand, setSendingCommand] = useState<boolean>(false);
@@ -300,6 +286,11 @@ export default function App() {
       applyDeviceState(event.state);
       setLoadingInitial(false);
       setErrorMsg(null);
+    });
+
+    socket.on('mqtt-stats', (stats: MqttBrokerStats) => {
+      if (!stats || typeof stats.connected !== 'boolean') return;
+      setMqttStats(stats);
     });
 
     const pollTimer = window.setInterval(() => {
@@ -513,62 +504,24 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <div className="mx-auto max-w-5xl px-4 py-6 sm:px-6 lg:px-8">
-        {/* Fejléc */}
-        <header className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4">
-          <div>
-            <h1 className="text-xl font-bold tracking-tight text-slate-50 sm:text-2xl">
-              Fűtésvezérlés
-            </h1>
-            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-400">
-              <span className="inline-flex items-center gap-1.5">
-                {socketConnected ? (
-                  <Wifi className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
-                ) : (
-                  <WifiOff className="h-3.5 w-3.5 text-slate-500" aria-hidden="true" />
-                )}
-                <span>{socketConnected ? 'Élő kapcsolat' : 'Újracsatlakozás...'}</span>
-              </span>
-              <span aria-hidden="true">·</span>
-              <span className="tabular-nums">Frissítve: {formatTimestamp(lastUpdatedAt)}</span>
-              <span aria-hidden="true">·</span>
-              <span className="tabular-nums">
-                Ping: {status?.heartbeat?.intervalSec ?? DEFAULT_HEARTBEAT_CONFIG.intervalSec}s
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-3">
-            {status?.alarmState?.active && (
-              <div
-                role="alert"
-                className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-red-500 bg-red-950/80 px-3.5 py-2 text-xs font-bold text-red-100 whitespace-nowrap shrink-0 animate-pulse"
-              >
-                <span className="inline-block h-2.5 w-2.5 rounded-full bg-red-500" aria-hidden="true" />
-                <span>RIASZTÁS</span>
-              </div>
-            )}
-
-            <button
-              type="button"
-              onClick={() => {
-                void fetchInitialState();
-                if (activeView === 'logs') {
-                  setLogsRefreshSignal((prev) => prev + 1);
-                } else if (activeView === 'charts') {
-                  setChartsRefreshSignal((prev) => prev + 1);
-                }
-              }}
-              disabled={isRefreshing}
-              className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-sm font-medium text-slate-200 whitespace-nowrap shrink-0 transition-colors hover:bg-slate-800 disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
-            >
-              <RefreshCw
-                className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`}
-                aria-hidden="true"
-              />
-              <span>Frissítés</span>
-            </button>
-          </div>
-        </header>
+        <Header
+          socketConnected={socketConnected}
+          lastUpdatedAt={lastUpdatedAt}
+          heartbeatIntervalSec={
+            status?.heartbeat?.intervalSec ?? DEFAULT_HEARTBEAT_CONFIG.intervalSec
+          }
+          alarmActive={Boolean(status?.alarmState?.active)}
+          isRefreshing={isRefreshing}
+          mqttStats={mqttStats}
+          onRefresh={() => {
+            void fetchInitialState();
+            if (activeView === 'logs') {
+              setLogsRefreshSignal((prev) => prev + 1);
+            } else if (activeView === 'charts') {
+              setChartsRefreshSignal((prev) => prev + 1);
+            }
+          }}
+        />
 
         {/* Nézet választó */}
         <nav aria-label="Nézetek" className="mt-4 flex items-center justify-between gap-4">

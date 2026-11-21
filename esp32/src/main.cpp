@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -8,7 +7,6 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <RF24.h>
 #include <math.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
@@ -23,19 +21,21 @@
 #include "lcd.h"
 #include "log.h"
 #include "menu.h"
+#include "spi_dma.h"
 #include "../../nano/src/common.h"
 
 // ============================================================================
-// ESP32-C3 - SZOBA OLDALI MASTER / GATEWAY (V5 PROTOKOLL + MENÜ + NVS)
+// ESP32-C3 - SZOBA OLDALI MASTER / GATEWAY (V5 PROTOKOLL + GDMA SPI + MENÜ)
 // ============================================================================
 // - Master -> Slave REQUEST (0xA1) növekvő seq-el, nem-blokkoló állapotgéppel
-//   (NRF_IDLE / NRF_WAITING), max 500ms/próba, max 3 retry, AckPayload KI.
+//   (NRF_IDLE / NRF_WAITING), SPI2_HOST GDMA átvitellel (10 MHz, 32B DMA puffer),
+//   max 500ms/próba, max 3 retry, AckPayload KI.
 // - 2x20 I2C LCD menürendszer interrupt alapú rotary encoderrel (delay nélkül).
 // - Preferences (NVS, "futes" namespace) tartós tárolás + 3 mp gyári reset.
 // ============================================================================
 
-SPIClass spiNrf(FSPI);
-RF24 radio(PIN_NRF_CE, PIN_NRF_CSN);
+SpiDmaBus spiDmaBus;
+NrfDmaRadio nrfDma;
 HeatingLcd lcd;
 MenuController menu;
 Preferences prefs;
@@ -112,6 +112,7 @@ const uint32_t NRF_TIMEOUT_MS  = NRF_RESPONSE_TIMEOUT_MS; // 500 ms
 const uint8_t  NRF_MAX_RETRY   = NRF_MAX_ATTEMPTS;        // 3
 NrfPacket nrfTxPacket{};
 uint32_t  nrfTxSyncEpoch       = 0;
+bool      dmaQueueFullLogged   = false;
 
 // --- Végponttól végpontig tartó parancs-visszaigazolás (CMD_ACK) ---
 bool     pendingCmdActive            = false;
@@ -1193,12 +1194,14 @@ void buildNrfRequestPacket() {
 }
 
 void transmitCurrentNrfPacket() {
-    radio.stopListening();
-    radio.flush_rx();
-    bool writeOk = radio.write(&nrfTxPacket, sizeof(nrfTxPacket));
-    if (writeOk) {
-        nrfCycleAnyWriteOk = true;
-        radio.startListening();
+    bool queued = nrfDma.queueTransmitPacket(nrfTxPacket);
+    state.dmaWaitUs = nrfDma.getLastWaitUs();
+    if (nrfDma.consumeQueueFullWarning() && !dmaQueueFullLogged) {
+        dmaQueueFullLogged = true;
+        logEvent(LOG_WARN, "DMA_QUEUE_FULL", "NRF SPI DMA sor megtelt (3), legregebbi retry eldobva");
+    }
+    if (!queued) {
+        // Queue hiba vagy rádió nincs inicializálva: az 500 ms-os NRF timeout fogja kezelni
     }
 }
 
@@ -1354,7 +1357,7 @@ bool startSensorScanJob(const char* cmdId) {
 }
 
 bool startSensorLearnJob(uint8_t role, const uint8_t addr[8], const char* cmdId) {
-    if (role >= SENSOR_ROLE_COUNT || !addr || !isDeviceAddressNonZero(addr)) {
+    if (role >= SENSOR_ROLE_COUNT || !addr || !isValidDs18b20Rom(addr)) {
         return false;
     }
     if (sensorJobType == SJOB_SCAN || sensorJobType == SJOB_LEARN) {
@@ -1440,15 +1443,19 @@ void processSensorNrfResponse(const NrfPacket& rx, uint32_t now) {
             if (total > MAX_DISCOVERED_SENSORS) {
                 total = MAX_DISCOVERED_SENSORS;
             }
-            state.scanFoundCount = total;
             for (uint8_t slot = 0; slot < 2; slot++) {
                 uint8_t idx = static_cast<uint8_t>(rx.sensorRsp.startIndex + slot);
-                if (idx < total && (rx.sensorRsp.validEntryMask & (1U << slot)) != 0) {
+                if (idx < total &&
+                    (rx.sensorRsp.validEntryMask & (1U << slot)) != 0 &&
+                    isValidDs18b20Rom(rx.sensorRsp.entries[slot].address)) {
                     memcpy(state.scanFound[idx].address, rx.sensorRsp.entries[slot].address, 8);
                     int16_t deci = rx.sensorRsp.entries[slot].tempDeci;
                     state.scanFound[idx].temp = (deci <= -1200)
                                                     ? SENSOR_DISCONNECTED_VAL
                                                     : (static_cast<float>(deci) / 10.0f);
+                    if (idx + 1U > state.scanFoundCount) {
+                        state.scanFoundCount = static_cast<uint8_t>(idx + 1U);
+                    }
                 }
             }
             if (static_cast<uint8_t>(rx.sensorRsp.startIndex + 2U) < total) {
@@ -1475,10 +1482,16 @@ void processSensorNrfResponse(const NrfPacket& rx, uint32_t now) {
             for (uint8_t slot = 0; slot < 2; slot++) {
                 uint8_t r = static_cast<uint8_t>(rx.sensorRsp.startIndex + slot);
                 if (r < SENSOR_ROLE_COUNT) {
-                    memcpy(state.sensors[r].address, rx.sensorRsp.entries[slot].address, 8);
-                    state.sensors[r].assigned = isDeviceAddressNonZero(state.sensors[r].address);
-                    state.sensors[r].ok       = ((roleMask & (1U << r)) != 0) &&
-                                                ((rx.sensorRsp.validEntryMask & (1U << slot)) != 0);
+                    if (isValidDs18b20Rom(rx.sensorRsp.entries[slot].address)) {
+                        memcpy(state.sensors[r].address, rx.sensorRsp.entries[slot].address, 8);
+                        state.sensors[r].assigned = true;
+                        state.sensors[r].ok       = ((roleMask & (1U << r)) != 0) &&
+                                                    ((rx.sensorRsp.validEntryMask & (1U << slot)) != 0);
+                    } else {
+                        memset(state.sensors[r].address, 0, 8);
+                        state.sensors[r].assigned = false;
+                        state.sensors[r].ok       = false;
+                    }
                 }
             }
             if (sensorJobStep != SSTEP_FETCH_ROLES) {
@@ -1707,7 +1720,8 @@ void handleNrfTimeout(uint32_t now) {
     nrfFail  = true;
     nrfState = NRF_IDLE;
     nrfRetry = 0;
-    radio.stopListening();
+    state.dmaWaitUs = nrfDma.flushAndDrain();
+    dmaQueueFullLogged = false;
 
     if (nrfTxPacket.packetType == PKT_TYPE_SENSOR_CMD) {
         logEvent(LOG_WARN, "SENSOR_NRF_TIMEOUT", "Szenzor NRF parancs timeout");
@@ -1803,6 +1817,19 @@ void handleNrfTimeout(uint32_t now) {
 }
 
 void handleNrf(uint32_t now) {
+    NrfPacket rx{};
+    NrfDmaRadio::PollResult dmaRes = nrfDma.poll(&rx);
+    if (dmaRes.hasTimingUpdate) {
+        state.dmaWaitUs = dmaRes.dmaWaitUs;
+    }
+    if ((dmaRes.queueFullWarn || nrfDma.consumeQueueFullWarning()) && !dmaQueueFullLogged) {
+        dmaQueueFullLogged = true;
+        logEvent(LOG_WARN, "DMA_QUEUE_FULL", "NRF SPI DMA sor megtelt (3), legregebbi retry eldobva");
+    }
+    if (dmaRes.txAckedNow) {
+        nrfCycleAnyWriteOk = true;
+    }
+
     if (nrfState == NRF_IDLE) {
         uint32_t pingInterval = static_cast<uint32_t>(state.heartbeatIntervalSec) * 1000UL;
         // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
@@ -1827,26 +1854,26 @@ void handleNrf(uint32_t now) {
     }
 
     // nrfState == NRF_WAITING
-    if (radio.available()) {
-        NrfPacket rx{};
-        radio.read(&rx, sizeof(rx));
+    if (dmaRes.rxPacketReady) {
         if (nrfTxPacket.packetType == PKT_TYPE_REQUEST &&
             rx.packetType == PKT_TYPE_RESPONSE &&
             rx.nano.seq == nrfTxPacket.esp.seq) {
-            radio.stopListening();
-            nrfState = NRF_IDLE;
-            nrfRetry = 0;
-            nrfFail  = false;
+            nrfDma.stopListening();
+            nrfState           = NRF_IDLE;
+            nrfRetry           = 0;
+            nrfFail            = false;
+            dmaQueueFullLogged = false;
             processNrfResponsePacket(rx, now);
             return;
         }
         if (nrfTxPacket.packetType == PKT_TYPE_SENSOR_CMD &&
             rx.packetType == PKT_TYPE_SENSOR_RSP &&
             rx.sensorRsp.seq == nrfTxPacket.sensorCmd.seq) {
-            radio.stopListening();
-            nrfState = NRF_IDLE;
-            nrfRetry = 0;
-            nrfFail  = false;
+            nrfDma.stopListening();
+            nrfState           = NRF_IDLE;
+            nrfRetry           = 0;
+            nrfFail            = false;
+            dmaQueueFullLogged = false;
             processSensorNrfResponse(rx, now);
             return;
         }
@@ -1855,7 +1882,8 @@ void handleNrf(uint32_t now) {
     // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
     if (static_cast<uint32_t>(now - nrfSentAt) >= NRF_TIMEOUT_MS) {
         if (nrfRetry < NRF_MAX_RETRY) {
-            // UGYANAZT a csomagot küldjük újra, nem várunk a válaszra
+            // Függő DMA tranzakciók lezárása + FLUSH_TX/FLUSH_RX, majd UGYANAZ a csomag újraküldése nem-blokkolva
+            state.dmaWaitUs = nrfDma.flushAndDrain();
             transmitCurrentNrfPacket();
             nrfSentAt = now;
             nrfRetry++;
@@ -1990,6 +2018,7 @@ void buildStatusJson(JsonDocument& doc) {
     doc["nanoLoopFault"] = state.nanoLoopFault;
     doc["loopMaxMs"]     = state.loopMaxMs;
     doc["loopLastMs"]    = state.loopLastMs;
+    doc["dmaWaitUs"]     = state.dmaWaitUs;
 
     char espTimeBuf[24];
     formatEspCurrentTimeStr(espTimeBuf, sizeof(espTimeBuf), uptimeSec);
@@ -3117,21 +3146,20 @@ void setup() {
         onMenuRequestSensorLearn
     });
 
-    spiNrf.begin(PIN_NRF_SCK, PIN_NRF_MISO, PIN_NRF_MOSI, PIN_NRF_CSN);
-    if (!radio.begin(&spiNrf)) {
-        logEvent(LOG_ERROR, "NRF_INIT", "NRF24L01+ nem talalhato");
+    if (!spiDmaBus.begin(NRF_SPI_HOST,
+                         PIN_NRF_MOSI,
+                         PIN_NRF_MISO,
+                         PIN_NRF_SCK,
+                         NRF_SPI_DMA_CHANNEL,
+                         NRF_SPI_MAX_XFER_SZ) ||
+        !nrfDma.begin(spiDmaBus,
+                      PIN_NRF_CE,
+                      PIN_NRF_CSN,
+                      NRF_SPI_CLOCK_HZ,
+                      NRF_SPI_QUEUE_SIZE)) {
+        logEvent(LOG_ERROR, "NRF_INIT", "NRF24L01+ SPI2 DMA nem talalhato");
     } else {
-        radio.disableAckPayload();
-        radio.setPayloadSize(sizeof(NrfPacket));
-        radio.setAutoAck(true);
-        radio.setChannel(NRF_CHANNEL);
-        radio.setDataRate(RF24_250KBPS);
-        radio.setPALevel(RF24_PA_HIGH);
-        radio.setRetries(5, 15);
-        radio.openWritingPipe(NRF_ADDR_MASTER_TO_SLAVE);
-        radio.openReadingPipe(1, NRF_ADDR_SLAVE_TO_MASTER);
-        radio.stopListening();
-        logEvent(LOG_INFO, "NRF_INIT", "NRF24L01+ MASTER keszenletben");
+        logEvent(LOG_INFO, "NRF_INIT", "NRF24L01+ MASTER SPI2 GDMA (10MHz) keszenletben");
     }
 
     uint32_t now = millis();
@@ -3340,8 +3368,9 @@ void loop() {
 #if defined(DEBUG) || (defined(DEBUG_MODE) && DEBUG_MODE)
     uint32_t loopElapsedMs = static_cast<uint32_t>(millis() - loopStartMs);
     if (loopElapsedMs > 50UL) {
-        Serial.printf("[DEBUG] loop() ciklusido=%lums (nrfState=%u)\n",
+        Serial.printf("[DEBUG] loop() ciklusido=%lums dmaWaitUs=%lu (nrfState=%u)\n",
                       static_cast<unsigned long>(loopElapsedMs),
+                      static_cast<unsigned long>(state.dmaWaitUs),
                       static_cast<unsigned>(nrfState));
     }
 #endif

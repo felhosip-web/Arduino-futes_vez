@@ -74,8 +74,8 @@ A 4 db **DS18B20** hőmérséklet-szenzor közös **OneWire** buszon van a **D2*
 
 ### 2.2 DS18B20 tanítás (Auto-Discovery + EEPROM)
 
-- **Boot felderítés és ellenőrzés**: Induláskor a Nano betölti a 4 szerephez (`eloremeno`, `visszatero`, `kazan`, `kulteri`) tartozó ROM címeket az **EEPROM**-ból (magic + verzió + checksum ellenőrzéssel), majd OneWire kereséssel összeveti a buszon lévő érzékelőkkel.
-- **Szenzorhiba / csere biztonság**: Ha az EEPROM üres, `< 4` szenzor található, vagy egy elmentett cím már nem szerepel a buszon (pl. hibás szenzor cseréje után), a rendszer **SOHA nem tippel index alapján**. Az érintett szerep **`ISMERETLEN`** állapotba kerül (`-127.0 °C`), a Nano `SYNC_FLAG_SENSOR_UNKNOWN` jelzést és `sensor_fail` riasztást küld, a biztonsági logika pedig bekapcsolva tartja a szivattyút.
+- **Boot felderítés, ROM validálás és kétlépcsős tranzakciós EEPROM**: Induláskor a Nano betölti a 4 szerephez (`eloremeno`, `visszatero`, `kazan`, `kulteri`) tartozó ROM címeket az **EEPROM**-ból (magic + verzió + checksum + `0x28` family code + Maxim 1-Wire CRC8 + duplikáció-ellenőrzéssel). A visszafelé kompatibilis elsődleges slot (`0x0000`, 37 byte) mellett egy másodlagos árnyék/backup slot (`0x0040`, `64`-es byte cím) biztosítja a kétfázisú atomikus mentést és áramszünet utáni önhelyreállítást: tanításkor a Nano először **friss** OneWire kereséssel ellenőrzi a szenzor fizikai jelenlétét és `0x28` + CRC8 érvényességét, majd a változást először a backup (`64`), végül az elsődleges (`0`) slotba írja visszaolvasási ellenőrzéssel (sikertelen mentés esetén visszagörgetéssel; az élő RAM szerepkör-tábla csak sikeres ellenőrzött mentés után módosul).
+- **Szenzorhiba / csere biztonság**: Ha az EEPROM üres, `< 4` szenzor található, vagy egy elmentett cím már nem olvasható a buszon (boot-kor vagy futásidőben), a rendszer **SOHA nem tippel index alapján**. Az érintett szerep **`ISMERETLEN`** állapotba kerül (`-127.0 °C`), a Nano `SYNC_FLAG_SENSOR_UNKNOWN` jelzést és `sensor_fail` riasztást küld (ha `alarmEnabled == true`). A keringető szivattyút hardveres/biztonsági szinten a **kazán** szenzor hibája (`kazan == -127 °C`), a `95.0 °C` feletti túlmelegedés, a szervizkapcsoló (`D6`) és az NRF fail-safe kényszeríti BE (a többi csatorna — `eloremeno`, `visszatero`, `kulteri` — hibája önmagában riasztást vált ki, de nem kényszeríti BE a szivattyút, kivéve ha `pumpState == futes` mellett az `eloremeno` kiesik ESP oldalon).
 - **Tanítás 3 módon (`BEALLITAS -> Szenzor Tanitas` és `Szenzorok` kártya)**:
   1. **Melegítéses tanítás (ESP32 LCD menü — `TANITAS`)**: a `SZENZOR KERESES` kilistázza a buszon talált szenzorokat, a `TANITAS` varázsló pedig szerepenként végigvezeti a felhasználót (`> 2,0 °C` melegedés `10 mp` alatt → `[OK]` rövid gombnyomásra EEPROM mentés).
   2. **Kézi tanítás (ESP32 LCD menü — `KEZI TANITAS`, rotary encoderrel tekerve)**:
@@ -220,6 +220,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
   "nanoLoopFault": false,
   "loopMaxMs": 12,
   "loopLastMs": 2,
+  "dmaWaitUs": 18,
   "time": {
     "espNtpSynced": true,
     "espTime": "2026-11-17 12:00:00",
@@ -295,7 +296,7 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 - **`alarmState.reason`**:
   - `"none"` – nincs riasztás
   - `"overheat"` – a kazán elérte vagy meghaladta az `alarmTemp` értéket
-  - `"sensor_fail"` – a kazán DS18B20 szenzor nem olvasható (`-127 °C`)
+  - `"sensor_fail"` – a kazán DS18B20 szenzor nem olvasható (`-127 °C`) vagy valamelyik szerepkör `ISMERETLEN` / tanítatlan (`sensorUnknown == true`)
   - `"pump_fault"` – relé fizikai visszacsatolási hiba (`commandedPumpOn != relayFeedbackOn` >500 ms)
   - `"nrf_fail"` – az ESP32 és Nano közötti rádiós kapcsolat megszakadt
 - **LED jelzés**:
@@ -381,6 +382,17 @@ Mindkét mikrovezérlő ugyanazt a `common.h` fejlécet használja `__attribute_
 - **Hardveres Watchdog**:
   - **Arduino Nano (`<avr/wdt.h>`)**: `wdt_enable(WDTO_2S)` (2 mp timeout) a `setup()` végén, `wdt_reset()` minden `loop()` végén; boot-kor `MCUSR` ellenőrzés (`WDRF` esetén `WATCHDOG_RESET` soros napló).
   - **ESP32-C3 (`<esp_task_wdt.h>`)**: 5 mp task watchdog (`esp_task_wdt_init(5, true)` / IDF5 `esp_task_wdt_reconfigure` + `esp_task_wdt_add(nullptr)`), `esp_task_wdt_reset()` minden `loop()` végén; boot-kor `esp_reset_reason()` ellenőrzés (`ESP_RST_TASK_WDT` esetén `WDT_RESET` napló).
+
+### 6.5 DMA (ESP32-C3 SPI2_HOST GDMA)
+
+- **Hardveres SPI + GDMA busz (`esp32/src/spi_dma.h`, `esp32/src/spi_dma.cpp`)**: Az ESP32-C3 nem az Arduino blokkoló `SPI.h` (`transfer()`) hívásait használja az NRF24L01+ modulhoz, hanem közvetlenül az **ESP-IDF SPI Master drivert GDMA-val** (`SPI2_HOST`, `SPI_DMA_CH_AUTO`). A Flash memóriához fenntartott `SPI0/SPI1` érintetlen marad, és a GPIO bekötés (`PIN_NRF_CE = 20`, `PIN_NRF_CSN = 1`, `PIN_NRF_MISO = 3`, `PIN_NRF_SCK = 4`, `PIN_NRF_MOSI = 10`) sem változik.
+- **Órajel és sorba állítás**: `10 MHz` (`NRF_SPI_CLOCK_HZ = 10000000`, az NRF24L01+ maximális stabil sebessége), `queue_size = 3` (`NRF_SPI_QUEUE_SIZE = 3`), így mind a 3 újrapróbálkozás (`NRF_MAX_ATTEMPTS`) blokkolás és sorban állás nélkül elfér.
+- **32 byte-os DMA-képes pufferek**: Minden `NrfPacket` TX/RX átviteli keret `heap_caps_malloc(..., MALLOC_CAP_DMA)` memóriában foglalódik (soha nem stack-en, mivel a GDMA nem látja a stack-et / flash-t).
+- **Teljesen nem-blokkoló állapotgép + ISR**:
+  - Az `NRF_IDLE` → `NRF_WAITING` átmenetben a `spi_device_queue_trans()` sorba teszi az átvitelt, miközben a CPU szabadon futtatja az encodert, a 2×20 LCD-t, az MQTT/WiFi kezelést és az 500 ms-os riasztási LED villogást (cél: `loop() < 5 ms` NRF adás közben is).
+  - Az `IRAM_ATTR` `post_cb` megszakítási visszahívás **kizárólag** a `volatile bool _dmaDone = true` jelzőt állítja (Serial, MQTT, LCD vagy naplózás szigorúan tilos ISR-ben). A `loop()` nem-blokkolóan pollingolja a `_dmaDone` flag-et és `spi_device_get_trans_result(..., 0)` segítségével gyűjti be az eredményt.
+  - **Timeout és sor-telítődés védelem**: `500 ms` (`NRF_TIMEOUT_MS`) lejártakor a `flushAndDrain()` lezárja a függő DMA tranzakciókat és `FLUSH_TX`/`FLUSH_RX` parancsot ad ki, hogy ne maradjon beragadt elem a DMA sorban. Ha a 3 elemű DMA sor megtelik, a rendszer nem blokkol: egyszeri `WARN DMA_QUEUE_FULL` naplóbejegyzést ír, és eldobja a legrégebbi retry tranzakciót.
+- **Telemetria (`dmaWaitUs`) és jövőbeli bővíthetőség**: Az ESP32 méri a DMA várakozási időt mikroszekundumban (`dmaWaitUs`), amely megjelenik a `STATUS` JSON-ban, a soros `DEBUG` kimeneten és a webes `Rendszer ellenőrzés` (`Loop monitor`) kártyán. Az `SpiDmaBus::addDevice(...)` felületén keresztül később további eszközök (pl. SD kártya vagy SPI TFT kijelző) is könnyedén csatlakoztathatók ugyanahhoz az `SPI2_HOST` GDMA buszhoz külön CS lábbal. Az I2C LCD (`GPIO 8/9`) és a WiFi DMA nem használja ezt a csatornát.
 
 ---
 

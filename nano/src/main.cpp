@@ -6,6 +6,8 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include "common.h"
+#include "sensor_store.h"
+#include "safety_logic.h"
 
 // ============================================================================
 // ARDUINO NANO - KAZÁN OLDALI SLAVE VEZÉRLŐ (V5 MASTER-SLAVE PROTOKOLL)
@@ -82,19 +84,6 @@ constexpr float ALARM_OVERHEAT_DEFAULT = 85.0f;
 constexpr float ALARM_OVERHEAT_MIN     = 70.0f;
 constexpr float ALARM_OVERHEAT_MAX     = 90.0f;
 
-// --- EEPROM DS18B20 szerep-cím tárolás ---
-constexpr uint16_t SENSOR_EEPROM_MAGIC   = 0x4653U; // "FS"
-constexpr uint8_t  SENSOR_EEPROM_VERSION = 1U;
-constexpr int      SENSOR_EEPROM_ADDR    = 0;
-
-struct __attribute__((packed)) SensorEepromStore {
-    uint16_t magic;
-    uint8_t  version;
-    uint8_t  assignedMask; // bit0..3 = Eloremeno, Visszatero, Kazan, Kulteri
-    uint8_t  addr[SENSOR_ROLE_COUNT][8];
-    uint8_t  checksum;
-};
-
 OneWire oneWire(PIN_ONE_WIRE);
 DallasTemperature sensors(&oneWire);
 RF24 radio(PIN_NRF_CE, PIN_NRF_CSN);
@@ -167,27 +156,16 @@ bool     serviceRawReading    = false;
 uint32_t serviceDebounceMs    = 0;
 
 // --- Relé fizikai visszacsatolás (DPDT 2. pólus NC -> D7 INPUT_PULLUP, 50ms debounce) ---
-enum RelayStuckLogState : uint8_t {
-    STUCK_LOG_NONE = 0,
-    STUCK_LOG_ON   = 1,
-    STUCK_LOG_OFF  = 2
-};
-
 bool     relayFeedbackOn       = false;
 bool     relayFbRawReading     = false;
 uint32_t relayFbDebounceMs     = 0;
-bool     relayMismatchTiming   = false;
-uint32_t relayMismatchStartMs  = 0;
-bool     relayMismatchActive   = false;
-uint8_t  loggedStuckState      = STUCK_LOG_NONE;
 
 // --- Végponttól végpontig tartó parancs-visszaigazolás (CMD_ACK) ---
-bool     commandedPumpOn        = true; // Induláskor fail-safe szivattyú BE
-uint8_t  lastCmdSeq             = 0;
-bool     lastCmdAck             = false;
-bool     lastCmdRejectedService = false;
-bool     lastCmdMismatch        = false;
-bool     pendingCmdVerifyActive = false;
+bool               commandedPumpOn = true; // Induláskor fail-safe szivattyú BE
+uint8_t            lastCmdSeq      = 0;
+RelayMismatchState relayMismatch   = {
+    false, 0UL, false, STUCK_LOG_NONE, false, false, false, false
+};
 
 // --- ESP -> Nano időszinkron (49 napos millis() túlcsordulás-biztos) ---
 uint32_t syncEpoch            = 0;
@@ -254,45 +232,11 @@ void updateRelayFeedback(uint32_t now) {
 }
 
 void evaluateRelayMismatch(uint32_t now) {
-    if (commandedPumpOn == relayFeedbackOn) {
-        relayMismatchTiming = false;
-        relayMismatchActive = false;
-        loggedStuckState    = STUCK_LOG_NONE;
-        if (pendingCmdVerifyActive) {
-            pendingCmdVerifyActive = false;
-            lastCmdAck             = true;
-            lastCmdRejectedService = false;
-            lastCmdMismatch        = false;
-        }
-        return;
-    }
-
-    if (!relayMismatchTiming) {
-        relayMismatchTiming  = true;
-        relayMismatchStartMs = now;
-        return;
-    }
-
-    // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
-    if (static_cast<uint32_t>(now - relayMismatchStartMs) >= RELAY_MISMATCH_TIMEOUT_MS) {
-        relayMismatchActive = true;
-        if (!commandedPumpOn && relayFeedbackOn) {
-            if (loggedStuckState != STUCK_LOG_ON) {
-                loggedStuckState = STUCK_LOG_ON;
-                Serial.println(F("RELAY_STUCK_ON"));
-            }
-        } else if (commandedPumpOn && !relayFeedbackOn) {
-            if (loggedStuckState != STUCK_LOG_OFF) {
-                loggedStuckState = STUCK_LOG_OFF;
-                Serial.println(F("RELAY_STUCK_OFF"));
-            }
-        }
-        if (pendingCmdVerifyActive) {
-            pendingCmdVerifyActive = false;
-            lastCmdAck             = false;
-            lastCmdRejectedService = false;
-            lastCmdMismatch        = true;
-        }
+    RelayMismatchEvent evt = stepRelayMismatch(relayMismatch, commandedPumpOn, relayFeedbackOn, now);
+    if (evt == RELAY_EVT_STUCK_ON) {
+        Serial.println(F("RELAY_STUCK_ON"));
+    } else if (evt == RELAY_EVT_STUCK_OFF) {
+        Serial.println(F("RELAY_STUCK_OFF"));
     }
 }
 
@@ -328,80 +272,50 @@ void sanitizeAlarmConfig(AlarmConfigPacked& cfg) {
 }
 
 void evaluateLocalSafetyAndAlarm() {
-    bool kazanInvalid = isnan(latestKazan) || (latestKazan <= -120.0f) || (latestKazan > 125.0f);
-    bool alarmOverheat = !kazanInvalid && (latestKazan >= currentAlarmConfig.alarmTemp);
-
-    if (currentAlarmConfig.alarmEnabled == 0) {
-        currentAlarmState.active = 0;
-        currentAlarmState.reason = ALARM_REASON_NONE;
-    } else if (alarmOverheat) {
-        currentAlarmState.active = 1;
-        currentAlarmState.reason = ALARM_REASON_OVERHEAT;
-    } else if (kazanInvalid || sensorUnknown) {
-        currentAlarmState.active = 1;
-        currentAlarmState.reason = ALARM_REASON_SENSOR_FAIL;
-    } else if (!hasEspRequest || failsafeActive) {
-        currentAlarmState.active = 1;
-        currentAlarmState.reason = ALARM_REASON_NRF_FAIL;
-    } else {
-        currentAlarmState.active = 0;
-        currentAlarmState.reason = ALARM_REASON_NONE;
-    }
+    currentAlarmState = evaluateNanoAlarmState(
+        latestKazan,
+        sensorUnknown,
+        hasEspRequest,
+        failsafeActive,
+        currentAlarmConfig
+    );
 }
 
 void refreshHardwareOutputs(uint32_t now) {
-    bool kazanInvalid   = isnan(latestKazan) || (latestKazan <= -120.0f) || (latestKazan > 125.0f);
-    bool safetyOverheat = !kazanInvalid && (latestKazan >= SAFETY_OVERHEAT_TEMP);
-
-    uint8_t effectiveMask = 0;
-    if (!hasEspRequest || failsafeActive) {
-        setBit(effectiveMask, OUT_BIT_SZIVATTYU, true);
-    } else {
-        effectiveMask = lastEspOutputsMask;
-    }
-
-    // Biztonsági szabály: CSAK a fix SAFETY_OVERHEAT_TEMP (95.0C) vagy kazán szenzorhiba (-127) kapcsolja BE a szivattyút
-    // SAFETY: alarmEnabled nem kapcsolja ki a pumpavédelmet
-    if (safetyOverheat || kazanInvalid) {
-        setBit(effectiveMask, OUT_BIT_SZIVATTYU, true);
-    }
-
-    // Szerviz kapcsoló (D6 aktív LOW): szivattyú AZONNAL BE az ESP parancstól függetlenül, zöld LED folyamatos BE
-    if (serviceMode) {
-        setBit(effectiveMask, OUT_BIT_SZIVATTYU, true);
-        setBit(effectiveMask, OUT_BIT_LED_ZOLD, true);
-    }
-
-    // Loop hiba jelzése: a zöld LED (D5) gyorsan villog (100 ms)
     if (loopFault) {
         // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
         if (static_cast<uint32_t>(now - loopFaultBlinkMs) >= LOOP_FAULT_BLINK_MS) {
             loopFaultBlinkMs = now;
             loopFaultBlinkOn = !loopFaultBlinkOn;
         }
-        setBit(effectiveMask, OUT_BIT_LED_ZOLD, loopFaultBlinkOn);
     } else {
         loopFaultBlinkOn = false;
     }
 
-    // Piros LED (A2): 500ms villogás, ha riasztás aktív és alarmEnabled=true (szerviz módban is a riasztás szerint)
-    bool pirosOn = false;
-    if (currentAlarmConfig.alarmEnabled == 0) {
+    if (currentAlarmConfig.alarmEnabled == 0U) {
         alarmBlinkOn = false;
-        pirosOn = false;
-    } else if (currentAlarmState.active != 0 || !hasEspRequest || failsafeActive) {
+    } else if (currentAlarmState.active != 0U || !hasEspRequest || failsafeActive) {
         // OVERFLOW-SAFE: uint32_t kivonás, 49 napos millis túlcsorduláskor is helyes.
         if (static_cast<uint32_t>(now - lastAlarmBlinkMs) >= ALARM_BLINK_INTERVAL_MS) {
             lastAlarmBlinkMs = now;
             alarmBlinkOn = !alarmBlinkOn;
         }
-        pirosOn = alarmBlinkOn;
     } else {
         alarmBlinkOn = false;
-        pirosOn = getBit(effectiveMask, OUT_BIT_LED_PIROS);
     }
 
-    setBit(effectiveMask, OUT_BIT_LED_PIROS, pirosOn);
+    uint8_t effectiveMask = computeNanoEffectiveOutputs(
+        latestKazan,
+        hasEspRequest,
+        failsafeActive,
+        lastEspOutputsMask,
+        serviceMode,
+        loopFault,
+        loopFaultBlinkOn,
+        currentAlarmConfig,
+        currentAlarmState,
+        alarmBlinkOn
+    );
     commandedPumpOn = getBit(effectiveMask, OUT_BIT_SZIVATTYU);
     applyOutputs(effectiveMask);
 }
@@ -410,21 +324,50 @@ void refreshHardwareOutputs(uint32_t now) {
 // EEPROM + ONEWIRE AUTO-DISCOVERY + TANÍTÁS
 // ============================================================================
 inline void eepromCommit() {
-    // AVR <EEPROM.h> EEPROM.put() közvetlenül ír; ESP8266/ESP32 kompatibilitásért külön wrapper.
+    // AVR <EEPROM.h> EEPROM.update() közvetlenül ír; ESP8266/ESP32 kompatibilitásért külön wrapper.
 #if defined(ESP8266) || defined(ESP32)
     EEPROM.commit();
 #endif
 }
 
-uint8_t computeEepromChecksum(const SensorEepromStore& st) {
-    const uint8_t* raw = reinterpret_cast<const uint8_t*>(&st);
-    uint8_t sum = 0x5AU;
-    // Az utolsó checksum byte kivételével minden byte-on végigmegyünk
-    for (size_t i = 0; i < sizeof(SensorEepromStore) - 1U; i++) {
-        sum = static_cast<uint8_t>(sum ^ raw[i]);
-        sum = static_cast<uint8_t>(sum + (raw[i] * 3U));
+bool avrReadEepromBlock(void*, int addr, uint8_t* out, size_t len) {
+    if (!out || addr < 0) return false;
+    for (size_t i = 0; i < len; i++) {
+        out[i] = EEPROM.read(addr + static_cast<int>(i));
     }
-    return sum;
+    return true;
+}
+
+bool avrWriteEepromBlock(void*, int addr, const uint8_t* data, size_t len) {
+    if (!data || addr < 0) return false;
+    for (size_t i = 0; i < len; i++) {
+        EEPROM.update(addr + static_cast<int>(i), data[i]);
+    }
+    eepromCommit();
+    return true;
+}
+
+inline EepromStorageOps nanoEepromOps() {
+    EepromStorageOps ops = { nullptr, avrReadEepromBlock, avrWriteEepromBlock };
+    return ops;
+}
+
+bool nanoScanBusCallback(void*, uint8_t outAddrs[MAX_DISCOVERED_SENSORS][8], uint8_t* outCount) {
+    if (!outAddrs || !outCount) return false;
+    uint8_t count = 0;
+    uint8_t addr[8];
+    oneWire.reset_search();
+    delayMicroseconds(250);
+    while (count < MAX_DISCOVERED_SENSORS && oneWire.search(addr)) {
+        wdt_reset();
+        if (isValidDs18b20Rom(addr)) {
+            memcpy(outAddrs[count], addr, 8);
+            count++;
+        }
+    }
+    oneWire.reset_search();
+    *outCount = count;
+    return true;
 }
 
 void printSerialHexAddr(const uint8_t addr[8]) {
@@ -433,73 +376,72 @@ void printSerialHexAddr(const uint8_t addr[8]) {
     Serial.print(buf);
 }
 
-void loadSensorAddressesFromEeprom() {
-    SensorEepromStore store{};
-    EEPROM.get(SENSOR_EEPROM_ADDR, store);
+void setRoleTemperatureDisconnected(uint8_t role) {
+    if (role == SENSOR_ROLE_ELOREMENO)       latestEloremeno  = SENSOR_DISCONNECTED_VAL;
+    else if (role == SENSOR_ROLE_VISSZATERO) latestVisszatero = SENSOR_DISCONNECTED_VAL;
+    else if (role == SENSOR_ROLE_KAZAN)      latestKazan      = SENSOR_DISCONNECTED_VAL;
+    else if (role == SENSOR_ROLE_KULTERI)    latestKulteri    = SENSOR_DISCONNECTED_VAL;
+}
 
-    if (store.magic != SENSOR_EEPROM_MAGIC ||
-        store.version != SENSOR_EEPROM_VERSION ||
-        store.checksum != computeEepromChecksum(store)) {
-        roleAssignedMask = 0;
-        memset(sensorAddr, 0, sizeof(sensorAddr));
+void loadSensorAddressesFromEeprom() {
+    bool recovered = false;
+    if (!loadSensorStore(nanoEepromOps(), sensorAddr, roleAssignedMask, &recovered)) {
         Serial.println(F("[SENSOR] EEPROM ures vagy ervenytelen - szenzor tanitas szukseges."));
         return;
     }
-
-    roleAssignedMask = static_cast<uint8_t>(store.assignedMask & 0x0FU);
-    for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
-        if ((roleAssignedMask & (1U << r)) != 0 && isDeviceAddressNonZero(store.addr[r])) {
-            memcpy(sensorAddr[r], store.addr[r], 8);
-        } else {
-            roleAssignedMask &= static_cast<uint8_t>(~(1U << r));
-            memset(sensorAddr[r], 0, 8);
-        }
+    if (recovered) {
+        Serial.println(F("WARN EEPROM_RECOVERED_FROM_BACKUP"));
     }
     Serial.print(F("[SENSOR] EEPROM betoltve, assignedMask=0x"));
     Serial.println(roleAssignedMask, HEX);
 }
 
 bool saveSensorAddressToEeprom(uint8_t role, const uint8_t newAddr[8]) {
-    if (role >= SENSOR_ROLE_COUNT || !isDeviceAddressNonZero(newAddr)) {
-        return false;
-    }
+    int8_t clearedOldRole = -1;
+    uint8_t freshAddrs[MAX_DISCOVERED_SENSORS][8];
+    uint8_t freshCount = 0;
+    SensorLearnStatus st = learnSensorRoleTransactional(
+        role,
+        newAddr,
+        true,
+        nanoScanBusCallback,
+        nullptr,
+        nanoEepromOps(),
+        sensorAddr,
+        roleAssignedMask,
+        &clearedOldRole,
+        freshAddrs,
+        &freshCount
+    );
 
-    for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
-        if (r != role &&
-            (roleAssignedMask & (1U << r)) != 0 &&
-            memcmp(sensorAddr[r], newAddr, 8) == 0) {
-            memset(sensorAddr[r], 0, 8);
-            roleAssignedMask &= static_cast<uint8_t>(~(1U << r));
-            if (r == SENSOR_ROLE_ELOREMENO)       latestEloremeno  = SENSOR_DISCONNECTED_VAL;
-            else if (r == SENSOR_ROLE_VISSZATERO) latestVisszatero = SENSOR_DISCONNECTED_VAL;
-            else if (r == SENSOR_ROLE_KAZAN)      latestKazan      = SENSOR_DISCONNECTED_VAL;
-            else if (r == SENSOR_ROLE_KULTERI)    latestKulteri    = SENSOR_DISCONNECTED_VAL;
-            Serial.print(F("[SENSOR] Regi szerep torolve (csere): "));
-            Serial.println(sensorRoleToKey(r));
+    if (st != LEARN_OK) {
+        if (st == LEARN_ERR_INVALID_ROM) {
+            Serial.println(F("ERROR INVALID_DS18B20_ROM"));
+        } else if (st == LEARN_ERR_NOT_ON_BUS || st == LEARN_ERR_SCAN_FAILED) {
+            Serial.println(F("ERROR SENSOR_NOT_FOUND_ON_BUS"));
+        } else if (st == LEARN_ERR_EEPROM_WRITE || st == LEARN_ERR_EEPROM_VERIFY) {
+            Serial.println(F("ERROR EEPROM_VERIFY_FAIL"));
+        } else {
+            Serial.println(F("ERROR SENSOR_LEARN_REJECTED"));
         }
-    }
-
-    memcpy(sensorAddr[role], newAddr, 8);
-    roleAssignedMask |= static_cast<uint8_t>(1U << role);
-
-    SensorEepromStore store{};
-    store.magic        = SENSOR_EEPROM_MAGIC;
-    store.version      = SENSOR_EEPROM_VERSION;
-    store.assignedMask = roleAssignedMask;
-    for (uint8_t r = 0; r < SENSOR_ROLE_COUNT; r++) {
-        memcpy(store.addr[r], sensorAddr[r], 8);
-    }
-    store.checksum = computeEepromChecksum(store);
-
-    EEPROM.put(SENSOR_EEPROM_ADDR, store);
-    eepromCommit();
-
-    SensorEepromStore verify{};
-    EEPROM.get(SENSOR_EEPROM_ADDR, verify);
-    bool verified = (memcmp(&store, &verify, sizeof(SensorEepromStore)) == 0);
-    if (!verified) {
-        Serial.println(F("ERROR EEPROM_VERIFY_FAIL"));
         return false;
+    }
+
+    // Friss keresési lista átvétele (foundBusTempsDeci nullázása az újraolvasásig)
+    foundBusCount = freshCount;
+    memset(foundBusAddr, 0, sizeof(foundBusAddr));
+    for (uint8_t i = 0; i < MAX_DISCOVERED_SENSORS; i++) {
+        foundBusTempsDeci[i] = -1270;
+    }
+    for (uint8_t i = 0; i < foundBusCount; i++) {
+        memcpy(foundBusAddr[i], freshAddrs[i], 8);
+    }
+    scanReady = false;
+
+    if (clearedOldRole >= 0) {
+        setRoleTemperatureDisconnected(static_cast<uint8_t>(clearedOldRole));
+        Serial.print(F("[SENSOR] Regi szerep torolve (csere): "));
+        Serial.println(sensorRoleToKey(static_cast<uint8_t>(clearedOldRole)));
     }
 
     Serial.print(F("[SENSOR] Tanitva EEPROM-ba role="));
@@ -547,21 +489,9 @@ void discoverBusAddresses(bool logMissing) {
     for (uint8_t i = 0; i < MAX_DISCOVERED_SENSORS; i++) {
         foundBusTempsDeci[i] = -1270;
     }
+    scanReady = false;
 
-    uint8_t addr[8];
-    oneWire.reset_search();
-    delayMicroseconds(250);
-    while (foundBusCount < MAX_DISCOVERED_SENSORS && oneWire.search(addr)) {
-        wdt_reset();
-        if (OneWire::crc8(addr, 7) != addr[7]) {
-            continue;
-        }
-        if (isDeviceAddressNonZero(addr)) {
-            memcpy(foundBusAddr[foundBusCount], addr, 8);
-            foundBusCount++;
-        }
-    }
-    oneWire.reset_search();
+    nanoScanBusCallback(nullptr, foundBusAddr, &foundBusCount);
 
     sensors.begin();
     sensors.setResolution(12);
@@ -627,15 +557,18 @@ void runAddressScanner() {
 // DS18B20 OLVASÁS (-127 ESETÉN -127.0f)
 // ============================================================================
 float readSingleSensor(const DeviceAddress addr) {
+    if (!isValidDs18b20Rom(addr)) {
+        return SENSOR_DISCONNECTED_VAL;
+    }
     float t = sensors.getTempC(addr);
-    if (t <= -120.0f || isnan(t) || t > 125.0f) {
+    if (!isNanoTempValid(t)) {
         return SENSOR_DISCONNECTED_VAL;
     }
     return t;
 }
 
 float readRoleTemperature(uint8_t role) {
-    if (role >= SENSOR_ROLE_COUNT || (roleKnownMask & (1U << role)) == 0) {
+    if (role >= SENSOR_ROLE_COUNT || (roleAssignedMask & (1U << role)) == 0) {
         return SENSOR_DISCONNECTED_VAL;
     }
     return readSingleSensor(sensorAddr[role]);
@@ -643,11 +576,21 @@ float readRoleTemperature(uint8_t role) {
 
 void commitTemperatureResults() {
     uint8_t validMask = 0;
-    setBit(validMask, 0, ((roleKnownMask & (1U << SENSOR_ROLE_ELOREMENO))  != 0) && latestEloremeno  > -120.0f);
-    setBit(validMask, 1, ((roleKnownMask & (1U << SENSOR_ROLE_VISSZATERO)) != 0) && latestVisszatero > -120.0f);
-    setBit(validMask, 2, ((roleKnownMask & (1U << SENSOR_ROLE_KAZAN))      != 0) && latestKazan      > -120.0f);
-    setBit(validMask, 3, ((roleKnownMask & (1U << SENSOR_ROLE_KULTERI))    != 0) && latestKulteri    > -120.0f);
+    bool eloreOk  = ((roleAssignedMask & (1U << SENSOR_ROLE_ELOREMENO))  != 0) && isNanoTempValid(latestEloremeno);
+    bool visszaOk = ((roleAssignedMask & (1U << SENSOR_ROLE_VISSZATERO)) != 0) && isNanoTempValid(latestVisszatero);
+    bool kazanOk  = ((roleAssignedMask & (1U << SENSOR_ROLE_KAZAN))      != 0) && isNanoTempValid(latestKazan);
+    bool kulterOk = ((roleAssignedMask & (1U << SENSOR_ROLE_KULTERI))    != 0) && isNanoTempValid(latestKulteri);
+
+    setBit(validMask, 0, eloreOk);
+    setBit(validMask, 1, visszaOk);
+    setBit(validMask, 2, kazanOk);
+    setBit(validMask, 3, kulterOk);
     latestSensorValidMask = validMask;
+
+    // Futásidejű lecsatlakozás és visszatérés követése (Match ROM + 9-byte scratchpad CRC8 alapján)
+    rolePresentMask = validMask;
+    roleKnownMask   = static_cast<uint8_t>(roleAssignedMask & rolePresentMask);
+    sensorUnknown   = (roleKnownMask != 0x0FU);
 
     evaluateLocalSafetyAndAlarm();
 
@@ -739,14 +682,14 @@ void buildResponsePacket(uint32_t seq) {
     lastResponsePacket.nano.cmdSeq          = lastCmdSeq;
 
     uint8_t sFlags = 0;
-    if (hasTimeSync)            sFlags |= SYNC_FLAG_ACK;
-    if (syncStale)              sFlags |= SYNC_FLAG_STALE;
-    if (serviceMode)            sFlags |= SYNC_FLAG_SERVICE_MODE;
-    if (lastCmdAck)             sFlags |= SYNC_FLAG_CMD_ACK;
-    if (commandedPumpOn)        sFlags |= SYNC_FLAG_PUMP_ON;
-    if (lastCmdRejectedService) sFlags |= SYNC_FLAG_CMD_REJECTED_SERVICE;
-    if (relayFeedbackOn)        sFlags |= SYNC_FLAG_RELAY_FB_ON;
-    if (relayMismatchActive || lastCmdMismatch) sFlags |= SYNC_FLAG_RELAY_MISMATCH;
+    if (hasTimeSync)                         sFlags |= SYNC_FLAG_ACK;
+    if (syncStale)                           sFlags |= SYNC_FLAG_STALE;
+    if (serviceMode)                         sFlags |= SYNC_FLAG_SERVICE_MODE;
+    if (relayMismatch.lastCmdAck)             sFlags |= SYNC_FLAG_CMD_ACK;
+    if (commandedPumpOn)                     sFlags |= SYNC_FLAG_PUMP_ON;
+    if (relayMismatch.lastCmdRejectedService) sFlags |= SYNC_FLAG_CMD_REJECTED_SERVICE;
+    if (relayFeedbackOn)                     sFlags |= SYNC_FLAG_RELAY_FB_ON;
+    if (relayMismatch.relayMismatchActive || relayMismatch.lastCmdMismatch) sFlags |= SYNC_FLAG_RELAY_MISMATCH;
     lastResponsePacket.nano.syncFlags      = sFlags;
     lastResponsePacket.nano.syncEpochLow16 = hasTimeSync ? static_cast<uint16_t>(syncEpoch & 0xFFFFU) : 0U;
 }
@@ -846,17 +789,14 @@ void handleSensorCommandPacket(const NrfPacket& pkt, uint32_t now) {
             loopMonitorSuspend = true;
             ok = saveSensorAddressToEeprom(roleOrIndex, pkt.sensorCmd.address);
             if (ok) {
-                discoverBusAddresses(false);
-                // Azonnal próbáljuk beolvasni a frissen tanított szerep hőmérsékletét és új konverziót indítani
-                if (roleOrIndex == SENSOR_ROLE_ELOREMENO) {
-                    latestEloremeno = readRoleTemperature(SENSOR_ROLE_ELOREMENO);
-                } else if (roleOrIndex == SENSOR_ROLE_VISSZATERO) {
-                    latestVisszatero = readRoleTemperature(SENSOR_ROLE_VISSZATERO);
-                } else if (roleOrIndex == SENSOR_ROLE_KAZAN) {
-                    latestKazan = readRoleTemperature(SENSOR_ROLE_KAZAN);
-                } else if (roleOrIndex == SENSOR_ROLE_KULTERI) {
-                    latestKulteri = readRoleTemperature(SENSOR_ROLE_KULTERI);
-                }
+                recomputeRolePresence(false);
+                // Frissen tanított szerepnél új konverziót indítunk, elkerülve az unconverted 85.0°C power-on reset értéket
+                setRoleTemperatureDisconnected(roleOrIndex);
+                sensors.setWaitForConversion(false);
+                sensors.requestTemperatures();
+                conversionRequested = true;
+                conversionReqMs     = now;
+                dsReadPending       = false;
                 commitTemperatureResults();
                 refreshHardwareOutputs(now);
             }
@@ -1115,36 +1055,36 @@ void loop() {
                         (lastPumpConfig.pumpMode == PUMP_MODE_MANUAL_OFF);
                     if (serviceMode && requestedPumpOff) {
                         // A szerviz kapcsoló felülírja a szivattyú KI parancsot -> elutasítás SERVICE_MODE okkal
-                        lastCmdAck             = false;
-                        lastCmdRejectedService = true;
-                        lastCmdMismatch        = false;
-                        pendingCmdVerifyActive = false;
+                        relayMismatch.lastCmdAck             = false;
+                        relayMismatch.lastCmdRejectedService = true;
+                        relayMismatch.lastCmdMismatch        = false;
+                        relayMismatch.pendingCmdVerifyActive = false;
                         Serial.println(F("[NANO] CMD_REJECTED: SERVICE_MODE"));
                     } else if (commandedPumpOn == relayFeedbackOn) {
                         // D7 visszacsatolás már egyezik a parancsolt állapottal
-                        lastCmdAck             = true;
-                        lastCmdRejectedService = false;
-                        lastCmdMismatch        = false;
-                        pendingCmdVerifyActive = false;
-                    } else if (relayMismatchActive) {
+                        relayMismatch.lastCmdAck             = true;
+                        relayMismatch.lastCmdRejectedService = false;
+                        relayMismatch.lastCmdMismatch        = false;
+                        relayMismatch.pendingCmdVerifyActive = false;
+                    } else if (relayMismatch.relayMismatchActive) {
                         // >500ms eltelt és a D7 továbbra sem egyezik -> RELAY_MISMATCH
-                        lastCmdAck             = false;
-                        lastCmdRejectedService = false;
-                        lastCmdMismatch        = true;
-                        pendingCmdVerifyActive = false;
+                        relayMismatch.lastCmdAck             = false;
+                        relayMismatch.lastCmdRejectedService = false;
+                        relayMismatch.lastCmdMismatch        = true;
+                        relayMismatch.pendingCmdVerifyActive = false;
                     } else {
                         // A relé épp kapcsol (50ms debounce / <500ms ablak) -> várunk a következő lekérdezésre
-                        lastCmdAck             = false;
-                        lastCmdRejectedService = false;
-                        lastCmdMismatch        = false;
-                        pendingCmdVerifyActive = true;
+                        relayMismatch.lastCmdAck             = false;
+                        relayMismatch.lastCmdRejectedService = false;
+                        relayMismatch.lastCmdMismatch        = false;
+                        relayMismatch.pendingCmdVerifyActive = true;
                     }
                 } else {
-                    lastCmdSeq             = 0;
-                    lastCmdAck             = false;
-                    lastCmdRejectedService = false;
-                    lastCmdMismatch        = false;
-                    pendingCmdVerifyActive = false;
+                    lastCmdSeq                           = 0;
+                    relayMismatch.lastCmdAck             = false;
+                    relayMismatch.lastCmdRejectedService = false;
+                    relayMismatch.lastCmdMismatch        = false;
+                    relayMismatch.pendingCmdVerifyActive = false;
                 }
 
                 responseCounter++;

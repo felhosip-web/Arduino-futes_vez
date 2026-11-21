@@ -88,11 +88,12 @@ struct SystemState {
     char     eloremenoMinAt[6]   = { 0 };
     char     statsSinceStr[24]   = { 0 };
 
-    // Loop monitor állapot (ESP32 + Nano)
+    // Loop monitor állapot (ESP32 + Nano + SPI DMA)
     bool     loopFault           = false;
     bool     nanoLoopFault       = false;
     uint32_t loopMaxMs           = 0;
     uint32_t loopLastMs          = 0;
+    uint32_t dmaWaitUs           = 0;
 
     // DS18B20 Auto-Discovery és tanítás állapota
     struct SensorRoleState {

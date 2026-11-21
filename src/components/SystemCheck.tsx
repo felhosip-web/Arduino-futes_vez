@@ -68,6 +68,10 @@ export function SystemCheck({ status, lastUpdatedAt, onSyncTriggered }: SystemCh
     typeof status?.loopLastMs === 'number' && Number.isFinite(status.loopLastMs)
       ? status.loopLastMs
       : null;
+  const dmaWaitUs =
+    typeof status?.dmaWaitUs === 'number' && Number.isFinite(status.dmaWaitUs)
+      ? status.dmaWaitUs
+      : null;
 
   const sensorUnknown = Boolean(status?.sensorUnknown);
   const sensorsOkCount = status?.sensors
@@ -360,6 +364,7 @@ export function SystemCheck({ status, lastUpdatedAt, onSyncTriggered }: SystemCh
             <p className="mt-1 text-xs text-slate-400 tabular-nums">
               {loopMaxMs !== null ? `ESP max: ${loopMaxMs} ms` : 'ESP max: —'} · Nano:{' '}
               {nanoLoopFault ? 'LASSÚ' : 'OK'}
+              {dmaWaitUs !== null ? ` · DMA: ${dmaWaitUs} µs` : ''}
             </p>
           </div>
 

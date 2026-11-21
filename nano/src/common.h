@@ -280,6 +280,8 @@ inline const char* sensorRoleToLabel(uint8_t role) {
     }
 }
 
+constexpr uint8_t DS18B20_FAMILY_CODE = 0x28U;
+
 inline bool isDeviceAddressNonZero(const uint8_t addr[8]) {
     if (!addr) return false;
     uint8_t acc = 0;
@@ -287,6 +289,30 @@ inline bool isDeviceAddressNonZero(const uint8_t addr[8]) {
         acc |= addr[i];
     }
     return acc != 0;
+}
+
+inline uint8_t ds18b20Crc8(const uint8_t* data, uint8_t len) {
+    if (!data) return 0U;
+    uint8_t crc = 0U;
+    for (uint8_t i = 0; i < len; i++) {
+        uint8_t inbyte = data[i];
+        for (uint8_t j = 0; j < 8U; j++) {
+            uint8_t mix = static_cast<uint8_t>((crc ^ inbyte) & 0x01U);
+            crc >>= 1;
+            if (mix != 0U) {
+                crc ^= 0x8CU;
+            }
+            inbyte >>= 1;
+        }
+    }
+    return crc;
+}
+
+inline bool isValidDs18b20Rom(const uint8_t addr[8]) {
+    if (!addr) return false;
+    if (!isDeviceAddressNonZero(addr)) return false;
+    if (addr[0] != DS18B20_FAMILY_CODE) return false;
+    return ds18b20Crc8(addr, 7U) == addr[7];
 }
 
 inline char hexNibbleUpper(uint8_t v) {
@@ -352,8 +378,9 @@ inline bool parseDeviceAddressHex(const char* str, uint8_t out[8]) {
         }
     }
     if (str[idx] != '\0') return false;
+    if (!isValidDs18b20Rom(tmp)) return false;
     for (uint8_t b = 0; b < 8; b++) {
         out[b] = tmp[b];
     }
-    return isDeviceAddressNonZero(out);
+    return true;
 }

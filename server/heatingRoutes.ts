@@ -17,6 +17,7 @@ import {
   buildPumpUpdateCommand,
   buildSingleOutputCommand,
   hasValidEspStatus,
+  validateDs18b20RomAddress,
   validateHeatingCommand,
   validateSingleOutputBody,
 } from './validation.ts';
@@ -274,7 +275,6 @@ export function createHeatingRouter(
     const { id } = req.params;
     const body = req.body as Record<string, unknown> | undefined;
     const rawRole = typeof body?.role === 'string' ? body.role.trim() : '';
-    const rawAddress = typeof body?.address === 'string' ? body.address.trim() : '';
     const allowReassign = body?.allowReassign === true;
 
     if (!(VALID_SENSOR_ROLES as readonly string[]).includes(rawRole)) {
@@ -284,14 +284,14 @@ export function createHeatingRouter(
       return;
     }
 
-    const addrRegex = /^([0-9A-Fa-f]{2}:){7}[0-9A-Fa-f]{2}$/;
-    const normalizedAddr = rawAddress.toUpperCase();
-    if (!addrRegex.test(normalizedAddr) || normalizedAddr === '00:00:00:00:00:00:00:00') {
+    const addrValidation = validateDs18b20RomAddress(body?.address);
+    if (!addrValidation.ok) {
       res.status(400).json({
-        error: 'Érvénytelen DS18B20 cím formátum (elvárt: XX:XX:XX:XX:XX:XX:XX:XX).',
+        error: addrValidation.error,
       });
       return;
     }
+    const normalizedAddr = addrValidation.value;
 
     const role = rawRole as SensorRoleKey;
 
@@ -450,6 +450,11 @@ export function createHeatingRouter(
     });
 
     res.json(result);
+  });
+
+  // GET /api/heating/mqtt-stats - aktuális MQTT broker késleltetés és kézbesítési megbízhatóság
+  router.get('/mqtt-stats', requireGetAuth, (_req, res) => {
+    res.json(bridge.getMqttStats());
   });
 
   // Összes ismert eszköz állapota
